@@ -26,6 +26,11 @@ cd "$REPO_ROOT"
 # vs-admin is not built by `cargo test`; make sure the binary is current.
 cargo build -p vs-admin --quiet
 
+# Compile the harness's test binary now, so the 120 s wait for harness.json
+# below times the server start only. On a cold CI cache the compile alone can
+# exceed it (seen on macOS after a Cargo.lock change).
+cargo test -p vs --bin vs --no-run --quiet
+
 HARNESS_DIR=$(mktemp -d)
 HARNESS_PID=""
 
