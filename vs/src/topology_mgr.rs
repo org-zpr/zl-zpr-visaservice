@@ -666,6 +666,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(crate::db::ActorRepo::new(db)),
             None,
+            crate::config::VSConfig::default().get_vs_addr(),
         )
         .await
         .unwrap()
