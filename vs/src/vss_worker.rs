@@ -119,7 +119,7 @@ pub async fn vss_worker_loop(
     // Open connect to VSS.
     info!(target: VSS, "connecting to VSS at {}", node_addr);
 
-    let vss_handle = match vss_connect(node_addr).await {
+    let vss_handle = match vss_connect(asm.config.get_vs_addr(), node_addr).await {
         Ok(h) => h,
         Err(e) => {
             error!(target: VSS, "failed to connect to VSS at {}: {}", node_addr, e);
@@ -248,12 +248,35 @@ pub async fn vss_worker_loop(
     }
 }
 
-/// Perform TCP connect, TLS handshake, Cap'n Proto RPC bootstrap, and the initial
-/// connect RPC, returning a ready-to-use VSS handle client.
-async fn vss_connect(node_addr: SocketAddr) -> Result<v1::v_s_s_handle::Client, VssSyncError> {
-    let sock = tokio::net::TcpStream::connect(node_addr)
+/// Open a TCP connection to `remote` from the local address `local`.
+///
+/// The visa service must originate VSS traffic from its own ZPR address
+/// (`vs_addr`). On a relay Zode the TUN also carries the relay's own address,
+/// and the kernel's source-address choice could pick that one instead; the
+/// relay grants the visa service's visas only for `vs_addr`, so such a
+/// connection would be dropped. Binding first removes the choice. A `local`
+/// that is not a local address, or of a different family than `remote`, is
+/// an error — never a silent fallback to a kernel-chosen source.
+async fn connect_from(local: IpAddr, remote: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+    let sock = if local.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    sock.bind(SocketAddr::new(local, 0))?;
+    sock.connect(remote).await
+}
+
+/// Perform TCP connect (from `local`, see [connect_from]), TLS handshake,
+/// Cap'n Proto RPC bootstrap, and the initial connect RPC, returning a
+/// ready-to-use VSS handle client.
+async fn vss_connect(
+    local: IpAddr,
+    node_addr: SocketAddr,
+) -> Result<v1::v_s_s_handle::Client, VssSyncError> {
+    let sock = connect_from(local, node_addr)
         .await
-        .map_err(|e| VssSyncError::Internal(format!("TCP connect: {e}")))?;
+        .map_err(|e| VssSyncError::Internal(format!("TCP connect from {local}: {e}")))?;
 
     let tls = tls_connect()
         .connect(node_addr.ip().into(), sock)
@@ -979,5 +1002,53 @@ mod tests {
                 }
             })
             .await;
+    }
+
+    /// The VSS connection must leave from the visa service's own address
+    /// (`vs_addr`), not whichever local address the kernel would pick. On
+    /// Linux the whole of 127/8 is local, so 127.0.0.2 is a second address on
+    /// the same interface — the relay Zode's two-addresses-on-one-TUN case.
+    /// The listener does not speak TLS, so the connect itself fails after
+    /// the TCP handshake; only the source address the listener saw matters.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn vss_connect_originates_from_vs_addr() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move {
+            let (_sock, peer) = listener.accept().await.unwrap();
+            peer.ip()
+        });
+
+        let vs_addr: IpAddr = "127.0.0.2".parse().unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(5), vss_connect(vs_addr, listen_addr))
+            .await
+            .expect("vss_connect hung");
+        assert!(
+            res.is_err(),
+            "the listener does not speak TLS, so connect must fail"
+        );
+
+        let peer_ip = accepted.await.unwrap();
+        assert_eq!(
+            peer_ip, vs_addr,
+            "VSS connection must originate from vs_addr"
+        );
+    }
+
+    /// A source address that is not local cannot be bound: the connect must
+    /// fail rather than silently fall back to a kernel-chosen source.
+    #[tokio::test]
+    async fn connect_from_reports_unbindable_source() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737): never assigned to a host.
+        let not_local: IpAddr = "192.0.2.1".parse().unwrap();
+        let res = connect_from(not_local, listen_addr).await;
+        assert!(
+            res.is_err(),
+            "binding a non-local source must fail, got {res:?}"
+        );
     }
 }

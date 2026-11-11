@@ -432,6 +432,9 @@ async fn main() -> std::process::ExitCode {
     js.spawn_local(signal_worker::launch(asm.clone()));
     js.spawn_local(event_mgr::launch(asm.clone(), event_rx));
 
+    // The visa service's own ZPR address (`vs_addr`) is used both ways: the
+    // VS-API and admin listeners bind it here, and every outbound VSS
+    // connection binds it as its source (`vss_worker::connect_from`).
     js.spawn_local(vsapi_worker::launch(
         asm.clone(),
         SocketAddr::new(
