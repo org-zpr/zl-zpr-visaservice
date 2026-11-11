@@ -1427,11 +1427,16 @@ async fn add_revoke(
 }
 
 /// Stringify a substrate address as a parseable `host:port`. IPv6 hosts get bracketed
-/// (`[fd5a:5052::1]:5000`); IPv4 and hostname forms are left plain.
-fn stringify_netaddr(addr: &NetAddr) -> String {
-    match &addr.host {
-        NetworkHost::Ip(ip) => SocketAddr::new(*ip, addr.port).to_string(),
-        NetworkHost::Hostname(h) => format!("{}:{}", h, addr.port),
+/// (`[fd5a:5052::1]:5000`); IPv4 and hostname forms are left plain. An address that policy
+/// does not give (`None`: the node reports its own, zl-zipline#225) is the empty string,
+/// which no parser of this API can mistake for an address.
+fn stringify_netaddr(addr: Option<&NetAddr>) -> String {
+    match addr {
+        None => String::new(),
+        Some(addr) => match &addr.host {
+            NetworkHost::Ip(ip) => SocketAddr::new(*ip, addr.port).to_string(),
+            NetworkHost::Hostname(h) => format!("{}:{}", h, addr.port),
+        },
     }
 }
 
@@ -1473,8 +1478,8 @@ async fn get_network(
                 let mut bldr =
                     NodeConnection::builder(node_addr.clone(), peer.remote_zpr_addr.clone())
                         .link_id(peer.link_id.clone())
-                        .node_a_substrate(stringify_netaddr(&peer.local_substrate))
-                        .node_b_substrate(stringify_netaddr(&peer.remote_substrate));
+                        .node_a_substrate(stringify_netaddr(peer.local_substrate.as_ref()))
+                        .node_b_substrate(stringify_netaddr(peer.remote_substrate.as_ref()));
 
                 if let Ok(link_desc) = psnap
                     .policy()
