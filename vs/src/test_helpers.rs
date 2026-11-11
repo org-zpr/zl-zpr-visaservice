@@ -627,6 +627,16 @@ pub fn make_peering(node_a: IpAddr, node_b: IpAddr, link_id: &str, attrs: Vec<At
 /// Build the container bytes of a policy whose topology is the given peerings
 /// (an empty slice gives a valid policy with no topology).
 pub fn policy_with_peerings(peerings: &[Peering]) -> Vec<u8> {
+    policy_with_peerings_and_node_cns(peerings, &[])
+}
+
+/// As [policy_with_peerings], plus one node join policy per `(zpr_addr, cn)`, in the shape
+/// the compiler emits for a node: match `device.zpr.adapter.cn eq <cn>` and
+/// `zpr.addr eq <zpr_addr>`, flagged `node`. This is what `Policy::node_cn_for_addr` reads.
+pub fn policy_with_peerings_and_node_cns(
+    peerings: &[Peering],
+    node_cns: &[(IpAddr, &str)],
+) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
     {
         let mut policy = msg.init_root::<capnp_policy::policy::Builder>();
@@ -635,6 +645,24 @@ pub fn policy_with_peerings(peerings: &[Peering]) -> Vec<u8> {
             let mut topo = policy.reborrow().init_topology(peerings.len() as u32);
             for (i, p) in peerings.iter().enumerate() {
                 p.write_to(&mut topo.reborrow().get(i as u32));
+            }
+        }
+        if !node_cns.is_empty() {
+            let mut jps = policy.reborrow().init_join_policies(node_cns.len() as u32);
+            for (i, (addr, cn)) in node_cns.iter().enumerate() {
+                let mut jp = jps.reborrow().get(i as u32);
+                {
+                    let mut matches = jp.reborrow().init_match(2);
+                    let mut cn_cond = matches.reborrow().get(0);
+                    cn_cond.set_key(key::CN);
+                    cn_cond.set_op(capnp_policy::AttrOp::Eq);
+                    cn_cond.init_value(1).set(0, cn);
+                    let mut addr_cond = matches.reborrow().get(1);
+                    addr_cond.set_key(key::ZPR_ADDR);
+                    addr_cond.set_op(capnp_policy::AttrOp::Eq);
+                    addr_cond.init_value(1).set(0, addr.to_string());
+                }
+                jp.init_flags(1).set(0, capnp_policy::JoinFlag::Node);
             }
         }
     }
