@@ -241,10 +241,18 @@ impl PolicySnapshot {
     /// names a file or attribute-service store, which no OIDC declaration matches, so no user
     /// blob is demanded — or accepted — for it.
     pub fn declares_oidc_service(&self, id: &str) -> bool {
+        self.oidc_service_by_id(id).is_some()
+    }
+
+    /// The OIDC trusted service with id `id` in this snapshot, if its policy
+    /// declares one. A node's logout (zl-zipline#232) uses it to forget the
+    /// session anchors the dropped `user.zpr.authority` named.
+    pub fn oidc_service_by_id(&self, id: &str) -> Option<Arc<OidcTrustedService>> {
         self.0
             .oidc_services
             .iter()
-            .any(|service| service.id() == id)
+            .find(|service| service.id() == id)
+            .cloned()
     }
 
     /// Build a snapshot directly from a policy and its stores, for unit tests

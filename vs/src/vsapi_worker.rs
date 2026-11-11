@@ -1635,7 +1635,8 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             let dt: DateTime<Utc> = auth_expires.into();
             info!(
                 target: API,
-                "reauthorized adapter {:?} at address {zpr_addr} (expires {})",
+                "reauthorized {} {:?} at address {zpr_addr} (expires {})",
+                if actor.is_node() { "node" } else { "adapter" },
                 actor.get_cn(),
                 dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
             );
