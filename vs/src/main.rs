@@ -31,6 +31,7 @@ mod deny_log;
 mod error;
 mod event_mgr;
 mod http_util;
+mod link_state;
 mod loaded_policy;
 mod logging;
 mod net_mgr;

@@ -141,6 +141,45 @@ pub(crate) async fn revalidate_visas(
     );
 }
 
+/// Revoke every live visa whose path crosses the link between nodes `a` and `b` (either
+/// direction), because link-state reports say that link is down (zl-zipline#224).
+///
+/// A visa crosses the link when `a` and `b` are adjacent in its recorded node path
+/// (`VisaMetadata.path`). Each such visa is marked `PendingRevoke` on all its nodes
+/// through the ungated [VisaMgr::mark_visa_revoked] -- the same path the attribute
+/// sweep uses -- so VSS housekeeping revokes it and the flow re-requests, getting a
+/// route that avoids the link. A visa with no path (both actors on one node) never
+/// crosses a link. Returns how many visas were marked.
+///
+/// [VisaMgr::mark_visa_revoked]: crate::visa_mgr::VisaMgr::mark_visa_revoked
+pub(crate) async fn revoke_visas_over_link(
+    asm: &Arc<Assembly>,
+    a: &std::net::IpAddr,
+    b: &std::net::IpAddr,
+) -> usize {
+    let mut revoked = 0;
+    for (visa_id, metadata) in asm.visa_mgr.list_visa_metadata().await {
+        let Some(path) = &metadata.path else {
+            continue;
+        };
+        let crosses = path
+            .windows(2)
+            .any(|hop| (hop[0] == *a && hop[1] == *b) || (hop[0] == *b && hop[1] == *a));
+        if !crosses {
+            continue;
+        }
+        match asm.visa_mgr.mark_visa_revoked(visa_id).await {
+            Ok(true) => revoked += 1,
+            Ok(false) => {} // already being revoked
+            Err(e) => {
+                warn!(target: VISA, "link {a} <-> {b} down: failed to revoke visa {visa_id}: {e}")
+            }
+        }
+    }
+    info!(target: VISA, "link {a} <-> {b} down: revoked {revoked} visa(s) crossing it");
+    revoked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +375,54 @@ mod tests {
         assert!(
             asm.visa_mgr
                 .get_pending_revoke_visa_ids_for_node(&node)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // --- Revoke on link down (zl-zipline#224) ---
+
+    /// A visa whose path crosses the downed link is marked PendingRevoke; a visa that
+    /// does not cross it is left alone.
+    #[tokio::test]
+    async fn test_revoke_visas_over_link_hits_only_crossing_visas() {
+        use crate::test_helpers::create_routed_sweep_visa;
+        let (asm, node_a) = build_sweep_asm(true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let crossing = create_routed_sweep_visa(&asm, &node_a, 0).await;
+        let local = create_sweep_visa(&asm, &node_a, 0).await; // direct, no path
+
+        // Either argument order names the same undirected link.
+        let n = revoke_visas_over_link(&asm, &node_b, &node_a).await;
+        assert_eq!(n, 1);
+
+        let revoked = asm
+            .visa_mgr
+            .get_pending_revoke_visa_ids_for_node(&node_a)
+            .await
+            .unwrap();
+        assert_eq!(revoked, vec![crossing]);
+        let pending = asm
+            .visa_mgr
+            .get_pending_visa_ids_for_node(&node_a)
+            .await
+            .unwrap();
+        assert!(pending.contains(&local), "a visa off the link stays");
+    }
+
+    /// A link between two other nodes revokes nothing.
+    #[tokio::test]
+    async fn test_revoke_visas_over_unrelated_link_revokes_nothing() {
+        use crate::test_helpers::create_routed_sweep_visa;
+        let (asm, node_a) = build_sweep_asm(true).await;
+        create_routed_sweep_visa(&asm, &node_a, 0).await;
+        let x: IpAddr = "fd5a:5052:3000::8".parse().unwrap();
+        let y: IpAddr = "fd5a:5052:3000::9".parse().unwrap();
+        assert_eq!(revoke_visas_over_link(&asm, &x, &y).await, 0);
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
                 .await
                 .unwrap()
                 .is_empty()

@@ -15,8 +15,8 @@ use ::zpr::vsapi::v1 as vsapi;
 use libeval::actor::Actor;
 use libeval::attribute::{Attribute, key};
 use zpr::vsapi_types::{
-    ConnectRequest, ConnectType, Connection, PacketDesc, Param, ParamValue, PublicKey,
-    ReauthRequest, SockAddr, VSConnectRequest, VisaOp, pname,
+    ConnectRequest, ConnectType, Connection, LinkStateReport, PacketDesc, Param, ParamValue,
+    PublicKey, ReauthRequest, SockAddr, VSConnectRequest, VisaOp, pname,
 };
 use zpr::write_to::WriteTo;
 
@@ -25,10 +25,12 @@ use crate::config;
 use crate::counters::CounterType;
 use crate::error::ServiceError;
 use crate::event_mgr::VsEvent;
+use crate::link_state::validate_snapshot;
 use crate::logging::targets::API;
 use crate::net_mgr;
 use crate::packet::describe_five_tuple;
 use crate::topology_mgr::{AddLinkedNodeError, TopologyMgr};
+use crate::visa_reconciler::revoke_visas_over_link;
 use crate::visareq_worker::{VisaDecision, request_visa_wait_response};
 
 // During node authentication we keep track in here of what state we have
@@ -1762,6 +1764,98 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         Ok(())
     }
 
+    /// A node reports which of its links are up (zl-zipline#224). The call carries a
+    /// snapshot: every link the node has, by peer CN, replacing its previous report.
+    /// The visa service routes over a link only while both ends report it up; a link
+    /// that goes down has the visas crossing it revoked, so their flows re-request and
+    /// get a route around it. A link coming up affects new visas only.
+    ///
+    /// Errors: `authRequired` on a dead handle; `paramError` for more entries than the
+    /// node's policy-declared links, an empty peerCn, or a peerCn listed twice.
+    async fn report_link_states(
+        self: Rc<Self>,
+        params: vsapi::v_s_handle::ReportLinkStatesParams,
+        mut results: vsapi::v_s_handle::ReportLinkStatesResults,
+    ) -> Result<(), capnp::Error> {
+        /// Answer with an error and log why.
+        fn refuse(
+            results: &mut vsapi::v_s_handle::ReportLinkStatesResults,
+            code: vsapi::ErrorCode,
+            msg: &str,
+        ) {
+            let mut err_builder = results.get().init_res().init_error();
+            write_error(&mut err_builder, code, msg);
+        }
+
+        if !self.node_is_live().await {
+            warn!(target: API, "report_link_states from disconnected node {:?}: refused", self.node.get_cn());
+            refuse(
+                &mut results,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
+        let Some(reporter) = self.node.get_zpr_addr().cloned() else {
+            refuse(
+                &mut results,
+                vsapi::ErrorCode::InvalidOperation,
+                "node has no ZPR address assigned",
+            );
+            return Ok(());
+        };
+
+        // Decode, then validate at the trust boundary before storing anything.
+        let mut entries = Vec::new();
+        for reader in params.get()?.get_links()?.iter() {
+            match LinkStateReport::try_from(reader) {
+                Ok(e) => entries.push(e),
+                Err(e) => {
+                    warn!(target: API, "report_link_states from {reporter}: undecodable entry: {e}");
+                    refuse(
+                        &mut results,
+                        vsapi::ErrorCode::ParamError,
+                        "undecodable link-state entry",
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        let psnap = self.asm.policy_mgr.get_current_snapshot();
+        let declared_peers = psnap.policy().get_peers_for_node(&reporter).unwrap_or(&[]);
+        let entries = match validate_snapshot(entries, declared_peers.len()) {
+            Ok(entries) => entries,
+            Err(why) => {
+                warn!(target: API, "report_link_states from {reporter}: {why}");
+                refuse(&mut results, vsapi::ErrorCode::ParamError, &why);
+                return Ok(());
+            }
+        };
+
+        // Entries that match no declared peer's CN are kept (they are harmless and may
+        // race a policy change) but can never make a link usable; note them.
+        let cn_of = TopologyMgr::policy_cn_lookup(&psnap);
+        for e in &entries {
+            let known = declared_peers
+                .iter()
+                .any(|p| cn_of(&p.remote_zpr_addr).as_deref() == Some(e.peer_cn.as_str()));
+            if !known {
+                debug!(target: API, "report_link_states from {reporter}: peerCn '{}' matches no declared peer", e.peer_cn);
+            }
+        }
+
+        let went_down = self
+            .asm
+            .topo_mgr
+            .record_link_states(&reporter, entries, &cn_of);
+        for (a, b) in went_down {
+            revoke_visas_over_link(&self.asm, &a, &b).await;
+        }
+
+        results.get().init_res().set_ok(());
+        Ok(())
+    }
+
     async fn visa_request(
         self: Rc<Self>,
         args: vsapi::v_s_handle::VisaRequestParams,
@@ -3134,6 +3228,184 @@ mod tests {
                     assert!(
                         event_rx.try_recv().is_err(),
                         "no ActorLeaves event may be recorded for a refused disconnect"
+                    );
+                })
+                .await;
+        }
+    }
+
+    /// zl-zipline#224: `reportLinkStates` validates the snapshot, refuses a dead
+    /// handle, and drives the router's link flag.
+    mod link_state_reports {
+        use super::*;
+        use crate::assembly::tests::new_assembly_for_tests;
+        use crate::db::PolicyRepo;
+        use crate::policy_mgr::PolicyMgr;
+        use crate::test_helpers::{
+            FakeResolver, make_node_actor_defexp, make_peering, policy_with_peerings,
+        };
+        use crate::trusted_services::TrustedServicesMgr;
+        use libeval::route::LinkId;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use zpr::vsapi::v1::DisconnectReason;
+        use zpr::vsapi_types::LinkState;
+        use zpr::write_to::WriteTo;
+
+        const NODE_A: &str = "fd5a:5052:3000::1";
+        const NODE_B: &str = "fd5a:5052:3000::2";
+        const NODE_C: &str = "fd5a:5052:3000::3";
+
+        /// Policy declares A-B and A-C (C never connects). A and B are connected nodes
+        /// with their A-B link in the router. Returns node A's capnp handle.
+        async fn build() -> (Arc<Assembly>, vsapi::v_s_handle::Client) {
+            let (a, b, c): (IpAddr, IpAddr, IpAddr) = (
+                NODE_A.parse().unwrap(),
+                NODE_B.parse().unwrap(),
+                NODE_C.parse().unwrap(),
+            );
+            let mut asm = new_assembly_for_tests(None).await;
+            asm.policy_mgr = PolicyMgr::new_with_initial_policy(
+                policy_with_peerings(&[
+                    make_peering(a, b, "link-ab", vec![]),
+                    make_peering(a, c, "link-ac", vec![]),
+                ]),
+                PolicyRepo::new(asm.state_db.clone()),
+                Arc::new(FakeResolver::ip_only()),
+                Arc::new(TrustedServicesMgr::new()),
+                PathBuf::from("."),
+                PathBuf::from("."),
+                Arc::new(crate::db::ActorRepo::new(asm.state_db.clone())),
+                None,
+            )
+            .await
+            .unwrap();
+            let node_a = make_node_actor_defexp(NODE_A, "node-a", "[fd5a:5052::101]:1234");
+            for actor in [
+                node_a.clone(),
+                make_node_actor_defexp(NODE_B, "node-b", "[fd5a:5052::102]:1234"),
+            ] {
+                asm.actor_mgr
+                    .add_node(&actor, false, &Default::default())
+                    .await
+                    .unwrap();
+            }
+            asm.topo_mgr.add_node(a).unwrap();
+            asm.topo_mgr.add_node(b).unwrap();
+            asm.topo_mgr
+                .add_link(a, b, LinkId("link-ab".into()), vec![], 1)
+                .unwrap();
+            let asm = Arc::new(asm);
+            let handle = capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), node_a));
+            (asm, handle)
+        }
+
+        /// Send a snapshot and return Ok(()) or the error code the VS answered with.
+        async fn send_report(
+            handle: &vsapi::v_s_handle::Client,
+            entries: &[LinkStateReport],
+        ) -> Result<(), vsapi::ErrorCode> {
+            let mut req = handle.report_link_states_request();
+            {
+                let mut list = req.get().init_links(entries.len() as u32);
+                for (i, e) in entries.iter().enumerate() {
+                    e.write_to(&mut list.reborrow().get(i as u32));
+                }
+            }
+            let resp = req.send().promise.await.unwrap();
+            let res = resp.get().unwrap().get_res().unwrap();
+            match res.which().unwrap() {
+                vsapi::ok_or_error::Which::Ok(_) => Ok(()),
+                vsapi::ok_or_error::Which::Error(err) => Err(err.unwrap().get_code().unwrap()),
+            }
+        }
+
+        fn entry(cn: &str, state: LinkState) -> LinkStateReport {
+            LinkStateReport {
+                peer_cn: cn.to_string(),
+                state,
+            }
+        }
+
+        fn ab_route_exists(asm: &Assembly) -> bool {
+            asm.topo_mgr
+                .get_best_route(&NODE_A.parse().unwrap(), &NODE_B.parse().unwrap())
+                .is_some()
+        }
+
+        /// An empty snapshot says "no link is up": A's link to B goes down.
+        #[tokio::test]
+        async fn empty_snapshot_takes_the_link_down() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build().await;
+                    assert!(ab_route_exists(&asm));
+                    assert_eq!(send_report(&handle, &[]).await, Ok(()));
+                    assert!(!ab_route_exists(&asm));
+                })
+                .await;
+        }
+
+        /// More entries than the node's declared links: paramError, nothing stored.
+        #[tokio::test]
+        async fn too_many_entries_is_param_error() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build().await;
+                    let three = [
+                        entry("b.zpr", LinkState::Up),
+                        entry("c.zpr", LinkState::Up),
+                        entry("d.zpr", LinkState::Up),
+                    ];
+                    assert_eq!(
+                        send_report(&handle, &three).await,
+                        Err(vsapi::ErrorCode::ParamError)
+                    );
+                    assert!(ab_route_exists(&asm), "a rejected report changes nothing");
+                })
+                .await;
+        }
+
+        /// A duplicate or empty peerCn: paramError, nothing stored.
+        #[tokio::test]
+        async fn duplicate_or_empty_cn_is_param_error() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build().await;
+                    let dup = [
+                        entry("b.zpr", LinkState::Up),
+                        entry("b.zpr", LinkState::Down),
+                    ];
+                    assert_eq!(
+                        send_report(&handle, &dup).await,
+                        Err(vsapi::ErrorCode::ParamError)
+                    );
+                    assert_eq!(
+                        send_report(&handle, &[entry("", LinkState::Up)]).await,
+                        Err(vsapi::ErrorCode::ParamError)
+                    );
+                    assert!(ab_route_exists(&asm));
+                })
+                .await;
+        }
+
+        /// A disconnected node's handle is refused with authRequired.
+        #[tokio::test]
+        async fn dead_handle_is_auth_required() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build().await;
+                    asm.cc
+                        .disconnect(
+                            asm.clone(),
+                            NODE_A.parse().unwrap(),
+                            DisconnectReason::Admin,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        send_report(&handle, &[]).await,
+                        Err(vsapi::ErrorCode::AuthRequired)
                     );
                 })
                 .await;

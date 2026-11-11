@@ -383,9 +383,6 @@ impl Router {
     ///
     /// Returns true if the flag changed. An unknown link id, or a flag that already
     /// has the requested value, is a no-op that returns false.
-    // Called by the reportLinkStates handler, which lands in the next task of
-    // zl-zipline#224; remove this allow then.
-    #[allow(dead_code)]
     pub fn set_link_up(&self, id: &LinkId, up: bool) -> bool {
         let mut inner = self.inner.write().unwrap();
         if !inner.topology.set_link_up(id, up) {
