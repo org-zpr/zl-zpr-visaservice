@@ -153,10 +153,10 @@ fn is_self_renewal(actor: &Actor, zpr_addr: &IpAddr, connect_via: &IpAddr) -> bo
 ///   blob is present exactly when the actor's user authority is
 ///   credential-backed;
 /// - a node renewing its own actor may also gain the user namespace (OIDC
-///   blob, no user authority at all) or drop it (no OIDC blob, credential-
-///   backed user authority). A gain on an actor whose user authority was
-///   synthesized by trusted-service enrichment is refused: one user
-///   authority per actor.
+///   blob, no user authority at all) or drop it (no OIDC blob, any user
+///   authority -- including one whose OIDC provider policy no longer
+///   declares). A gain on an actor whose user authority was synthesized by
+///   trusted-service enrichment is refused: one user authority per actor.
 fn classify_user_namespace_change(
     has_ss_blob: bool,
     has_oidc_blob: bool,
@@ -169,11 +169,19 @@ fn classify_user_namespace_change(
         return None;
     }
     match (has_oidc_blob, user_credential_backed) {
+        // A node's own device-only renewal drops ANY user authority it holds
+        // (#63 review): an OIDC authority whose provider policy no longer
+        // declares is not credential-backed any more, yet its attributes must
+        // not survive. An authority synthesized by trusted-service enrichment
+        // from the device identity is re-derived by the policy re-run, so
+        // dropping it costs nothing but the visa sweep.
+        (false, _) if self_renewal && actor_has_device && actor_has_user_authority => {
+            Some(UserNamespaceChange::Drop)
+        }
         (true, true) | (false, false) => Some(UserNamespaceChange::Keep),
         (true, false) if self_renewal && actor_has_device && !actor_has_user_authority => {
             Some(UserNamespaceChange::Gain)
         }
-        (false, true) if self_renewal && actor_has_device => Some(UserNamespaceChange::Drop),
         _ => None,
     }
 }
@@ -232,6 +240,12 @@ pub struct ConnectionControl {
     /// Outstanding visa-service-minted OIDC login nonces (`getLoginNonce`):
     /// a node's own login on `reauthorize` must spend one (zl-zipline#232).
     pub(crate) login_nonces: LoginNonceStore,
+    /// Serializes a node's reauthorizations of its OWN actor across load ->
+    /// classify -> persist -> record anchors, so two concurrent logins cannot
+    /// both classify as a gain and silently switch users (#63 review).
+    /// ponytail: one global lock; a per-address lock if self-renewals become
+    /// frequent (today only a Zode's login and logout use them).
+    pub(crate) self_reauth_lock: tokio::sync::Mutex<()>,
 }
 
 /// What one `reauthorize` request does to the actor's `user` namespace
@@ -266,6 +280,7 @@ impl ConnectionControl {
             authority: format!("vs.zpr/{}", &vs_ident),
             jwt_key,
             login_nonces: LoginNonceStore::default(),
+            self_reauth_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1181,6 +1196,16 @@ impl ConnectionControl {
                 }
             }
         }
+
+        // A node renewing its own actor holds the self-renewal lock for the
+        // whole operation, from loading the actor to recording the OIDC
+        // anchors (#63 review): the namespace classification below must still
+        // describe the actor that gets persisted.
+        let _self_reauth_guard = if zpr_addr == *connect_via {
+            Some(self.self_reauth_lock.lock().await)
+        } else {
+            None
+        };
 
         // The renewal target must be a live actor admitted through the
         // calling node. An unknown address or one behind a different node is
@@ -8196,6 +8221,115 @@ mod tests {
         assert_eq!(session_of(&stored).as_deref(), Some(ZODE_SESSION));
     }
 
+    /// Review fix (#63, Codex P1): a logged-in node whose OIDC provider was
+    /// removed from policy must still lose its user namespace on a
+    /// device-only self-renewal; the stale `user.*` attributes must not
+    /// survive and the user visa must be revoked.
+    #[tokio::test]
+    async fn test_reauthorize_node_drop_after_provider_removed() {
+        let cn = "zode-q.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let id = create_zode_files_visa(&asm, addr).await;
+
+        // A new policy: same bootstrap key and node join, no OIDC service.
+        let pubkey_der = privkey.public_key_to_der().unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .await
+            .expect("policy without the provider installs");
+
+        let renewed = zode_logout(&asm, &cc, addr, &privkey, cn).await;
+        assert!(
+            !has_user_attrs(&renewed),
+            "a stale OIDC user namespace must be dropped"
+        );
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&addr)
+                .await
+                .unwrap(),
+            vec![id],
+            "the stale user's visa must be revoked"
+        );
+    }
+
+    /// Review fix (#63, Codex P1): two concurrent logins on the same
+    /// device-only node must not both succeed (the second would silently
+    /// switch users); the persisted subject must match the recorded anchors.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_node_logins_serialize() {
+        let cn = "zode-r.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        let cc = Arc::new(cc);
+        let login_as = |sub: &'static str| {
+            let (asm, cc, privkey) = (asm.clone(), cc.clone(), privkey.clone());
+            async move {
+                let nonce = mint_zode_nonce(&cc, addr);
+                let mut claims = oidc_base_claims();
+                claims["sub"] = json!(sub);
+                let blobs = zode_login_blobs(&privkey, cn, &nonce, claims);
+                cc.reauthorize_actor(asm, addr, blobs, &addr).await
+            }
+        };
+        let (a, b) = tokio::join!(
+            tokio::spawn(login_as("user-a")),
+            tokio::spawn(login_as("user-b"))
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(
+            a.is_ok() as u8 + b.is_ok() as u8,
+            1,
+            "exactly one concurrent login may succeed: a={:?} b={:?}",
+            a.as_ref().err(),
+            b.as_ref().err()
+        );
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_sub = stored
+            .get_attribute("user.oidc-subject")
+            .unwrap()
+            .get_single_value()
+            .unwrap()
+            .to_string();
+        let svc = asm
+            .policy_mgr
+            .get_current_snapshot()
+            .oidc_service_by_id("google")
+            .unwrap();
+        assert_eq!(
+            svc.session_anchors(&addr.to_string()).unwrap().sub,
+            stored_sub,
+            "the recorded anchors must belong to the persisted user"
+        );
+    }
+
+    /// Review fix (#63, Codex P1), deterministic half: a node's
+    /// self-renewal does not start while another one holds the
+    /// self-renewal lock, and completes once it is released.
+    #[tokio::test]
+    async fn test_self_reauth_waits_for_serialization_lock() {
+        let cn = "zode-s.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        let cc = Arc::new(cc);
+        let guard = cc.self_reauth_lock.lock().await;
+        let task = tokio::spawn({
+            let (asm, cc) = (asm.clone(), cc.clone());
+            let blobs = vec![make_fresh_ss_blob(&privkey, cn)];
+            async move { cc.reauthorize_actor(asm, addr, blobs, &addr).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!task.is_finished(), "a self-renewal must wait for the lock");
+        drop(guard);
+        task.await
+            .unwrap()
+            .expect("the renewal completes once the lock is free");
+    }
+
     /// The namespace-change decision table (vs.capnp "Re-Authorization").
     #[test]
     fn test_classify_user_namespace_change() {
@@ -8208,10 +8342,12 @@ mod tests {
             ((true, false, true, true, true, false), None),  // adapter drop
             ((true, true, true, false, false, true), Some(Gain)),
             ((true, false, true, true, true, true), Some(Drop)),
-            ((false, true, true, false, false, true), None), // no device blob
-            ((true, true, true, false, true, true), None),   // TS-derived authority
+            ((true, false, true, false, true, true), Some(Drop)), // stale or TS-derived authority
+            ((true, false, true, false, true, false), Some(Keep)), // adapter: TS-derived kept
+            ((false, true, true, false, false, true), None),      // no device blob
+            ((true, true, true, false, true, true), None),        // TS-derived authority
             ((false, true, false, true, true, false), Some(Keep)), // OIDC-only adapter renewal
-            ((true, true, false, true, true, false), None),  // device never gained
+            ((true, true, false, true, true, false), None),       // device never gained
         ];
         for ((ss, oidc, dev, backed, any_user, self_r), want) in cases {
             assert_eq!(
