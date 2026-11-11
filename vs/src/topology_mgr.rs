@@ -355,6 +355,9 @@ impl TopologyMgr {
             persisted: bool,
             desc: LinkDescription,
             action: Action,
+            /// Current up/down flag of the router link (true if absent). Link state
+            /// comes from link-state reports, not policy, so a rebuild keeps it.
+            up: bool,
         }
         struct Removal {
             a: IpAddr,
@@ -376,6 +379,7 @@ impl TopologyMgr {
                     old_id: router_link.map(|rl| rl.id),
                 }),
                 EdgeDecision::Install(desc) => {
+                    let up = router_link.as_ref().map_or(true, |rl| rl.up);
                     let action = match &router_link {
                         None => Action::Fresh,
                         Some(rl) => {
@@ -395,6 +399,7 @@ impl TopologyMgr {
                         persisted,
                         desc,
                         action,
+                        up,
                     });
                 }
             }
@@ -446,6 +451,7 @@ impl TopologyMgr {
                 id: e.desc.link_id.into(),
                 attributes: e.desc.attrs,
                 cost: e.desc.cost,
+                up: e.up,
             };
             match e.action {
                 Action::Keep => {}

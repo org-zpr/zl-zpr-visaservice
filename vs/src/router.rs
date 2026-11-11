@@ -130,6 +130,8 @@ pub struct RouterLink {
     pub id: LinkId,
     pub attributes: Vec<Attribute>,
     pub cost: u32,
+    /// False while link-state reports say the link is down; see [Router::set_link_up].
+    pub up: bool,
 }
 
 /// One link to install as part of an [Router::apply_link_batch] reconciliation.
@@ -139,6 +141,10 @@ pub struct LinkSpec {
     pub id: LinkId,
     pub attributes: Vec<Attribute>,
     pub cost: u32,
+    /// Up/down flag for the installed link. A reconcile that rebuilds an existing
+    /// link carries its current flag over, so a policy change cannot bring up a link
+    /// that link-state reports say is down.
+    pub up: bool,
 }
 
 pub struct Router {
@@ -265,11 +271,17 @@ impl Router {
         }
         let mut added: Vec<LinkId> = Vec::with_capacity(additions.len());
         for spec in additions {
-            if let Err(e) =
-                inner
-                    .topology
-                    .add_link(spec.a, spec.b, spec.id.clone(), spec.attributes, spec.cost)
-            {
+            let added_result = inner.topology.add_link(
+                spec.a,
+                spec.b,
+                spec.id.clone(),
+                spec.attributes,
+                spec.cost,
+            );
+            if added_result.is_ok() && !spec.up {
+                inner.topology.set_link_up(&spec.id, false);
+            }
+            if let Err(e) = added_result {
                 for done in added.iter().rev() {
                     inner.topology.remove_link(done);
                 }
@@ -364,6 +376,29 @@ impl Router {
         inner.topo_generation += 1;
     }
 
+    /// Mark a link usable (`up`) or not. A down link stays in the graph -- its id,
+    /// attributes and cost are kept, and so is its persisted adjacency -- but neither
+    /// route query uses it. Link-state reports drive this (zl-zipline#224): the edge
+    /// is up only while both ends report it up.
+    ///
+    /// Returns true if the flag changed. An unknown link id, or a flag that already
+    /// has the requested value, is a no-op that returns false.
+    // Called by the reportLinkStates handler, which lands in the next task of
+    // zl-zipline#224; remove this allow then.
+    #[allow(dead_code)]
+    pub fn set_link_up(&self, id: &LinkId, up: bool) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if !inner.topology.set_link_up(id, up) {
+            return false;
+        }
+        // Down removes routes and up can create routes between pairs that never
+        // touched this link, so flush the whole cache, as add_link does.
+        inner.route_cache.clear();
+        inner.link_to_cache_keys.clear();
+        inner.topo_generation += 1;
+        true
+    }
+
     /// Current link between two node addrs, in either order (edges are undirected).
     /// Returns `None` if no link connects them.
     pub fn link_between(&self, a: &IpAddr, b: &IpAddr) -> Option<RouterLink> {
@@ -378,6 +413,7 @@ impl Router {
             id,
             attributes: link.attributes.clone(),
             cost: link.cost,
+            up: link.up,
         })
     }
 
@@ -394,6 +430,7 @@ impl Router {
                 id: id.clone(),
                 attributes: link.attributes.clone(),
                 cost: link.cost,
+                up: link.up,
             })
             .collect()
     }
@@ -450,7 +487,8 @@ impl Router {
             .collect()
     }
 
-    /// "Best" route is defined as the route with the lowest cost. If there is a tie, one is picked arbitrarily.
+    /// "Best" route is defined as the route with the lowest cost. A tie goes to the
+    /// route with fewer hops, then to the smaller last-link id (see `dijkstra_from`).
     /// These routes are cached and only updated when topology changes.
     ///
     /// Note `addr_a` and `addr_b` are NODE addresses (not adapters).
@@ -572,6 +610,8 @@ struct Link {
     b: NodeId,
     attributes: Vec<Attribute>,
     cost: u32,
+    /// Route queries skip a link that is not up. New links start up.
+    up: bool,
 }
 
 #[derive(Debug, Default)]
@@ -650,6 +690,7 @@ impl Graph {
                 b: b.clone(),
                 attributes,
                 cost,
+                up: true,
             },
         );
 
@@ -720,8 +761,9 @@ impl Graph {
             return Err(TopologyError::LinkExists(new_id.0));
         }
 
-        // Validated: swap the edge in place, then recompute once.
-        self.remove_link_impl(&old_id);
+        // Validated: swap the edge in place, then recompute once. The up/down flag
+        // comes from link-state reports, not policy, so the new edge keeps it.
+        let was_up = self.remove_link_impl(&old_id).map_or(true, |old| old.up);
         self.edges.insert(
             new_id.clone(),
             Link {
@@ -729,6 +771,7 @@ impl Graph {
                 b: b.clone(),
                 attributes,
                 cost,
+                up: was_up,
             },
         );
         self.nodes.get_mut(a).unwrap().edges.insert(new_id.clone());
@@ -741,6 +784,17 @@ impl Graph {
     #[allow(dead_code)]
     fn link_mut(&mut self, id: &LinkId) -> Option<&mut Link> {
         self.edges.get_mut(id)
+    }
+
+    /// Set a link's up flag and recompute best routes if it changed. Returns true if
+    /// the flag changed; false for an unknown link or an unchanged flag.
+    fn set_link_up(&mut self, id: &LinkId, up: bool) -> bool {
+        match self.edges.get_mut(id) {
+            Some(link) if link.up != up => link.up = up,
+            _ => return false,
+        }
+        self.recompute();
+        true
     }
 
     /// Returns all nodes directly connected to `node_id` by a single link, or `None` if the node does not exist.
@@ -793,7 +847,7 @@ impl Graph {
         result
     }
 
-    /// Get the lowest cost path from a to b. If there are multiple this should return one of them.
+    /// Get the lowest cost path from a to b, with ties broken as in `dijkstra_from`.
     fn get_low_cost_path(&self, a: &NodeId, b: &NodeId) -> Option<(Vec<LinkId>, u32)> {
         self.best_routes.get(&(a.clone(), b.clone())).cloned()
     }
@@ -857,6 +911,9 @@ impl Graph {
             let Some(link) = self.edges.get(&link_id) else {
                 continue;
             };
+            if !link.up {
+                continue;
+            }
             let neighbor = if &link.a == &current {
                 &link.b
             } else {
@@ -909,16 +966,25 @@ impl Graph {
 
     /// Run Dijkstra from `start` and return, for each reachable destination, the
     /// ordered sequence of link ids on the shortest path and its total cost.
+    ///
+    /// Ties are broken deterministically (zl-zipline#224), in this order:
+    /// 1. lower total cost;
+    /// 2. fewer hops -- so a direct link beats a multi-hop path of equal cost;
+    /// 3. the lexicographically smaller id of the last link into the node.
+    ///
+    /// Without (2) and (3) the winner of a tie would depend on heap pop order and on
+    /// `HashSet` iteration order, so the same graph could route differently.
     fn dijkstra_from(&self, start: &NodeId) -> HashMap<NodeId, (Vec<LinkId>, u32)> {
-        let mut dist: HashMap<NodeId, u64> = HashMap::new();
+        // Best known (cost, hops) per node.
+        let mut dist: HashMap<NodeId, (u64, u32)> = HashMap::new();
         let mut prev: HashMap<NodeId, LinkId> = HashMap::new();
-        let mut heap: BinaryHeap<Reverse<(u64, NodeId)>> = BinaryHeap::new();
+        let mut heap: BinaryHeap<Reverse<(u64, u32, NodeId)>> = BinaryHeap::new();
 
-        dist.insert(start.clone(), 0);
-        heap.push(Reverse((0, start.clone())));
+        dist.insert(start.clone(), (0, 0));
+        heap.push(Reverse((0, 0, start.clone())));
 
-        while let Some(Reverse((cost, node))) = heap.pop() {
-            if cost > *dist.get(&node).unwrap_or(&u64::MAX) {
+        while let Some(Reverse((cost, hops, node))) = heap.pop() {
+            if (cost, hops) > *dist.get(&node).unwrap_or(&(u64::MAX, u32::MAX)) {
                 continue;
             }
 
@@ -929,12 +995,21 @@ impl Graph {
                 let Some(link) = self.edges.get(link_id) else {
                     continue;
                 };
+                if !link.up {
+                    continue;
+                }
                 let neighbor = if link.a == node { &link.b } else { &link.a };
-                let next_cost = cost + link.cost as u64;
-                if next_cost < *dist.get(neighbor).unwrap_or(&u64::MAX) {
-                    dist.insert(neighbor.clone(), next_cost);
+                let candidate = (cost + link.cost as u64, hops + 1);
+                let best = *dist.get(neighbor).unwrap_or(&(u64::MAX, u32::MAX));
+                if candidate < best {
+                    dist.insert(neighbor.clone(), candidate);
                     prev.insert(neighbor.clone(), link_id.clone());
-                    heap.push(Reverse((next_cost, neighbor.clone())));
+                    heap.push(Reverse((candidate.0, candidate.1, neighbor.clone())));
+                } else if candidate == best && prev.get(neighbor).is_some_and(|p| link_id.0 < p.0) {
+                    // Same cost and hops: keep the smaller last-link id. The node's
+                    // distance is unchanged, so nothing needs re-queueing; paths
+                    // through it are rebuilt from `prev` at the end.
+                    prev.insert(neighbor.clone(), link_id.clone());
                 }
             }
         }
@@ -957,7 +1032,10 @@ impl Graph {
             }
             debug_assert_eq!(&cur, start, "prev chain must terminate at start");
             path.reverse();
-            result.insert(dest.clone(), (path, dist[dest].min(u32::MAX as u64) as u32));
+            result.insert(
+                dest.clone(),
+                (path, dist[dest].0.min(u32::MAX as u64) as u32),
+            );
         }
         result
     }
@@ -1834,5 +1912,183 @@ mod tests {
         assert!(paths.contains(&vec![lid("ab"), lid("bc")]));
         assert!(paths.contains(&vec![lid("ac")]));
         assert!(paths.contains(&vec![lid("da"), lid("cd")]));
+    }
+
+    // --- Link up/down flag and deterministic tie-break (zl-zipline#224) ---
+
+    /// Triangle a-b, b-c, a-c, all cost 1, for the link-state tests.
+    fn make_triangle() -> (Router, IpAddr, IpAddr, IpAddr) {
+        let (r, a, b, c) = make_router_abc();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(b, c, LinkId("bc".into()), vec![], 1).unwrap();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        (r, a, b, c)
+    }
+
+    #[test]
+    fn test_down_link_is_skipped_by_best_route_and_all_routes() {
+        let (r, a, _b, c) = make_triangle();
+        assert_eq!(
+            r.get_best_route(&a, &c).unwrap().links,
+            vec![LinkId("ac".into())]
+        );
+
+        assert!(r.set_link_up(&LinkId("ac".into()), false));
+
+        let best = r.get_best_route(&a, &c).unwrap();
+        assert_eq!(best.links, vec![LinkId("ab".into()), LinkId("bc".into())]);
+        assert_eq!(best.cost, 2);
+        let all = r.get_routes(&a, &c, Some(&no_hint()));
+        assert!(
+            all.iter()
+                .all(|rt| !rt.links.contains(&LinkId("ac".into())))
+        );
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_link_back_up_restores_the_direct_route() {
+        let (r, a, _b, c) = make_triangle();
+        // Warm the all-routes cache so the flag change must invalidate it.
+        assert_eq!(r.get_routes(&a, &c, Some(&no_hint())).len(), 2);
+        r.set_link_up(&LinkId("ac".into()), false);
+        assert_eq!(r.get_routes(&a, &c, Some(&no_hint())).len(), 1);
+        assert!(r.set_link_up(&LinkId("ac".into()), true));
+        assert_eq!(
+            r.get_best_route(&a, &c).unwrap().links,
+            vec![LinkId("ac".into())]
+        );
+        assert_eq!(r.get_routes(&a, &c, Some(&no_hint())).len(), 2);
+    }
+
+    #[test]
+    fn test_set_link_up_reports_change_only() {
+        let (r, _a, _b, _c) = make_triangle();
+        assert!(
+            !r.set_link_up(&LinkId("ac".into()), true),
+            "already up: no change"
+        );
+        assert!(r.set_link_up(&LinkId("ac".into()), false));
+        assert!(
+            !r.set_link_up(&LinkId("ac".into()), false),
+            "already down: no change"
+        );
+        assert!(
+            !r.set_link_up(&LinkId("nope".into()), false),
+            "unknown link: no change"
+        );
+    }
+
+    #[test]
+    fn test_link_flag_visible_and_kept_across_replace() {
+        let (r, a, _b, c) = make_triangle();
+        r.set_link_up(&LinkId("ac".into()), false);
+        assert!(!r.link_between(&a, &c).unwrap().up);
+        r.replace_link_between(&a, &c, LinkId("ac".into()), vec![], 7)
+            .unwrap();
+        let link = r.link_between(&a, &c).unwrap();
+        assert!(!link.up, "replacing a link's cost must not bring it up");
+        assert_eq!(link.cost, 7);
+        let snap = r.link_snapshot();
+        assert!(snap.iter().any(|l| l.id == LinkId("ac".into()) && !l.up));
+        assert!(snap.iter().any(|l| l.id == LinkId("ab".into()) && l.up));
+    }
+
+    #[test]
+    fn test_default_costs_prefer_direct_link_over_two_hops() {
+        // Direct endpoint link vs the two-hop path through a relay, all at the
+        // default cost 1: the direct link wins on cost alone.
+        let (r, a, _b, c) = make_triangle();
+        assert_eq!(
+            r.get_best_route(&a, &c).unwrap().links,
+            vec![LinkId("ac".into())]
+        );
+    }
+
+    #[test]
+    fn test_equal_cost_tie_prefers_fewer_hops() {
+        // Direct link cost 2 vs two hops of cost 1: equal cost, the direct link wins.
+        let (r, a, b, c) = make_router_abc();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(b, c, LinkId("bc".into()), vec![], 1).unwrap();
+        r.add_link(a, c, LinkId("zz-direct".into()), vec![], 2)
+            .unwrap();
+        let best = r.get_best_route(&a, &c).unwrap();
+        assert_eq!(best.links, vec![LinkId("zz-direct".into())]);
+        assert_eq!(best.cost, 2);
+    }
+
+    #[test]
+    fn test_equal_cost_tie_prefers_fewer_hops_regardless_of_node_order() {
+        // a-b-d-c (3 hops, cost 3) vs a-e-c (2 hops, cost 3). d and e both reach
+        // distance 2; d sorts before e, so plain Dijkstra settles c through d. The
+        // tie-break must pick the 2-hop path.
+        let a = ip("10.0.0.1");
+        let b = ip("10.0.0.2");
+        let c = ip("10.0.0.3");
+        let d = ip("10.0.0.4");
+        let e = ip("10.0.0.5");
+        let r = Router::new();
+        for n in [a, b, c, d, e] {
+            r.add_node(n).unwrap();
+        }
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(b, d, LinkId("bd".into()), vec![], 1).unwrap();
+        r.add_link(d, c, LinkId("dc".into()), vec![], 1).unwrap();
+        r.add_link(a, e, LinkId("ae".into()), vec![], 2).unwrap();
+        r.add_link(e, c, LinkId("ec".into()), vec![], 1).unwrap();
+        let best = r.get_best_route(&a, &c).unwrap();
+        assert_eq!(best.cost, 3);
+        assert_eq!(best.links, vec![LinkId("ae".into()), LinkId("ec".into())]);
+    }
+
+    #[test]
+    fn test_equal_cost_equal_hops_tie_is_deterministic() {
+        // Two two-hop paths a-x-b and a-y-b of equal cost: the one whose last link
+        // id is smaller wins, every time the graph is rebuilt (HashSet order varies).
+        let a = ip("10.0.0.1");
+        let b = ip("10.0.0.2");
+        let x = ip("10.0.0.3");
+        let y = ip("10.0.0.4");
+        for _ in 0..100 {
+            let r = Router::new();
+            for n in [a, b, x, y] {
+                r.add_node(n).unwrap();
+            }
+            r.add_link(a, x, LinkId("ax".into()), vec![], 1).unwrap();
+            r.add_link(x, b, LinkId("xb".into()), vec![], 1).unwrap();
+            r.add_link(a, y, LinkId("ay".into()), vec![], 1).unwrap();
+            r.add_link(y, b, LinkId("yb".into()), vec![], 1).unwrap();
+            let best = r.get_best_route(&a, &b).unwrap();
+            assert_eq!(best.links, vec![LinkId("ax".into()), LinkId("xb".into())]);
+        }
+    }
+
+    #[test]
+    fn test_apply_link_batch_keeps_spec_down_flag() {
+        // A reconcile that rebuilds a down link (e.g. its policy cost changed) must
+        // install it down, not silently bring it back up.
+        let (r, a, _b, c) = make_triangle();
+        r.set_link_up(&LinkId("ac".into()), false);
+        r.apply_link_batch(
+            &[LinkId("ac".into())],
+            vec![LinkSpec {
+                a,
+                b: c,
+                id: LinkId("ac".into()),
+                attributes: vec![],
+                cost: 5,
+                up: false,
+            }],
+        )
+        .unwrap();
+        let link = r.link_between(&a, &c).unwrap();
+        assert!(!link.up);
+        assert_eq!(link.cost, 5);
+        assert_eq!(
+            r.get_best_route(&a, &c).unwrap().cost,
+            2,
+            "route avoids the down link"
+        );
     }
 }
