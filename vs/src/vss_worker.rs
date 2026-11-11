@@ -838,6 +838,10 @@ async fn vss_do_set_topology(
             },
             visas: Vec::new(),
             zpr_addr: peer.remote_zpr_addr,
+            // Empty is the value zl-zpr-common documents for a sender that predates
+            // `peerCn`. zl-zipline#221 fills it from policy; zl-zipline#220 (ph) is what
+            // starts enforcing it, so nothing changes until both land.
+            peer_cn: String::new(),
         };
         // The link is between `node_addr` and `peer.remote_zpr_addr`. Fail the whole call rather
         // than sending the link bare: without the visas the peer cannot reach VSAPI, so the link

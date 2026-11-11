@@ -612,9 +612,9 @@ mod tests {
         Peering {
             link_id: link_id.to_string(),
             node_a,
-            substrate_a: NetAddr::new_for_ip_or_host(&node_a.to_string(), 0),
+            substrate_a: Some(NetAddr::new_for_ip_or_host(&node_a.to_string(), 0)),
             node_b,
-            substrate_b: NetAddr::new_for_ip_or_host(&node_b.to_string(), 0),
+            substrate_b: Some(NetAddr::new_for_ip_or_host(&node_b.to_string(), 0)),
             attributes,
         }
     }

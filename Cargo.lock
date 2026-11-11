@@ -4341,8 +4341,8 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zpr"
-version = "0.31.2"
-source = "git+https://github.com/org-zpr/zl-zpr-common.git?tag=zl-v0.31.2#07252e8edd6cc1f5e11f2977d6d11ada16977f16"
+version = "0.32.0-zodes.1"
+source = "git+https://github.com/org-zpr/zl-zpr-common.git?tag=zl-v0.32.0-zodes.1#6f9c159b0ad9e008af5a915a56d662bcb7867b24"
 dependencies = [
  "base64 0.22.1",
  "bytes",

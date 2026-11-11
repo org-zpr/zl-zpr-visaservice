@@ -728,13 +728,25 @@ impl PolicyResolver {
     /// DNS lookup, pairing each peer's link id with its concrete socket address.
     /// Returns an error if any peer's address fails to resolve. Building the wire-level
     /// vsapi `Link` struct is deliberately deferred to the topology-message send path.
+    ///
+    /// A peer whose remote substrate address is not in policy (the node reports its own,
+    /// zl-zipline#225) is skipped with a warning: no link can be sent without an address
+    /// yet. zl-zipline#227 fills it in from the address the node reports.
     async fn resolve_peers(&self, peers: &[Peer]) -> Result<Vec<ResolvedPeer>, ResolverError> {
+        let addressed = peers.iter().filter_map(|peer| match &peer.remote_substrate {
+            Some(naddr) => Some((peer, naddr)),
+            None => {
+                warn!(
+                    target: MAIN,
+                    "link {}: no substrate address in policy for peer {}; skipping it until the node reports one",
+                    peer.link_id, peer.remote_zpr_addr
+                );
+                None
+            }
+        });
         // Parallelize the DNS lookups then check for the first error.
-        let futs = peers.iter().map(|peer| async move {
-            (
-                peer,
-                resolve_netaddr(&peer.remote_substrate, self.resolver.as_ref()).await,
-            )
+        let futs = addressed.map(|(peer, naddr)| async move {
+            (peer, resolve_netaddr(naddr, self.resolver.as_ref()).await)
         });
 
         futures::future::join_all(futs)
@@ -1573,9 +1585,9 @@ mod tests {
         Peering {
             link_id: link_id.to_string(),
             node_a,
-            substrate_a: NetAddr::new_for_ip_or_host(&node_a.to_string(), 0),
+            substrate_a: Some(NetAddr::new_for_ip_or_host(&node_a.to_string(), 0)),
             node_b,
-            substrate_b: NetAddr::new_for_ip_or_host("unresolvable.invalid", 5000),
+            substrate_b: Some(NetAddr::new_for_ip_or_host("unresolvable.invalid", 5000)),
             attributes: vec![],
         }
     }
@@ -1758,8 +1770,8 @@ mod tests {
             link_id: link_id.to_string(),
             remote_zpr_addr: "fd5a:5052::1".parse().unwrap(),
             // local end is irrelevant to resolve_peers, so reuse the remote one.
-            local_substrate: substrate.clone(),
-            remote_substrate: substrate,
+            local_substrate: Some(substrate.clone()),
+            remote_substrate: Some(substrate),
         }
     }
 
@@ -1802,6 +1814,22 @@ mod tests {
         assert_eq!(resolved[1].1.ip(), ip_b);
     }
 
+    /// A peer whose remote substrate address is not in policy (the node reports its own,
+    /// zl-zipline#225) is skipped, not an error: the other peers still resolve.
+    #[tokio::test]
+    async fn test_resolve_peers_skips_unset_substrate() {
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let good = ip_peer("link-good", ip, 4000);
+        let mut reported = ip_peer("link-reported", ip, 4001);
+        reported.remote_substrate = None;
+        let presolver = PolicyResolver::new(Arc::new(FakeResolver::ip_only()));
+
+        let resolved = presolver.resolve_peers(&[good, reported]).await.unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, "link-good");
+    }
+
     /// A peer with an unresolvable hostname causes resolve_peers to return an error.
     /// FakeResolver has no entries, so any hostname lookup returns NoAddresses.
     #[tokio::test]
@@ -1811,14 +1839,14 @@ mod tests {
         let bad = Peer {
             link_id: "link-bad".to_string(),
             remote_zpr_addr: "fd5a:5052::2".parse().unwrap(),
-            remote_substrate: NetAddr {
+            remote_substrate: Some(NetAddr {
                 host: NetworkHost::Hostname("some.unresolvable.host".to_string()),
                 port: 4000,
-            },
-            local_substrate: NetAddr {
+            }),
+            local_substrate: Some(NetAddr {
                 host: NetworkHost::Ip(ip),
                 port: 4000,
-            },
+            }),
         };
         let presolver = PolicyResolver::new(Arc::new(FakeResolver::ip_only()));
 
@@ -1960,14 +1988,14 @@ mod tests {
         let peer = Peer {
             link_id: "link-h".to_string(),
             remote_zpr_addr: "fd5a:5052::10".parse().unwrap(),
-            remote_substrate: NetAddr {
+            remote_substrate: Some(NetAddr {
                 host: NetworkHost::Hostname("peer.example.com".to_string()),
                 port: 5000,
-            },
-            local_substrate: NetAddr {
+            }),
+            local_substrate: Some(NetAddr {
                 host: NetworkHost::Ip("192.0.2.1".parse().unwrap()),
                 port: 5000,
-            },
+            }),
         };
         let mut entries = HashMap::new();
         entries.insert(

@@ -87,12 +87,14 @@ pub struct Peer {
     /// ZPR address of the remote peer on this link.
     pub remote_zpr_addr: IpAddr,
 
-    /// Substrate (physical/underlay) address used to reach the remote peer.
-    pub remote_substrate: NetAddr,
+    /// Substrate (physical/underlay) address used to reach the remote peer. `None` when
+    /// policy gives no address for that end: the node reports its own when it
+    /// authenticates (zpr-core#1381, zl-zipline#225); zl-zipline#227 fills it in.
+    pub remote_substrate: Option<NetAddr>,
 
     /// Substrate (physical/underlay) address of *this* node (the node this peer list is
-    /// keyed under) on this link.
-    pub local_substrate: NetAddr,
+    /// keyed under) on this link. `None` as for `remote_substrate`.
+    pub local_substrate: Option<NetAddr>,
 }
 
 #[derive(Debug, Clone)]
@@ -1019,11 +1021,44 @@ mod test {
         Peering {
             link_id: link_id.to_string(),
             node_a,
-            substrate_a: NetAddr::new_for_ip_or_host(sub_a, 5000),
+            substrate_a: Some(NetAddr::new_for_ip_or_host(sub_a, 5000)),
             node_b,
-            substrate_b: NetAddr::new_for_ip_or_host(sub_b, 5001),
+            substrate_b: Some(NetAddr::new_for_ip_or_host(sub_b, 5001)),
             attributes: attrs,
         }
+    }
+
+    #[test]
+    /// A peering end with no substrate address in policy (the node reports its own,
+    /// zl-zipline#225) survives the policy round trip as `None` on both peer entries
+    /// that refer to it, and building the peer table does not panic.
+    fn test_get_peers_for_node_unset_substrate_is_none() {
+        let mut peering = make_peering_full(
+            ip("fd5a:5052::1"),
+            "10.0.0.1",
+            ip("fd5a:5052::2"),
+            "unused",
+            "link-reported",
+            vec![],
+        );
+        peering.substrate_b = None;
+        let policy = policy_with_peerings(&[peering]);
+
+        // node_a reaches node_b at an address node_b will report: remote is None.
+        let peers_a = policy.get_peers_for_node(&ip("fd5a:5052::1")).unwrap();
+        assert_eq!(peers_a[0].remote_substrate, None);
+        assert_eq!(
+            peers_a[0].local_substrate,
+            Some(NetAddr::new_for_ip_or_host("10.0.0.1", 5000))
+        );
+
+        // node_b's own end is the unset one: local is None, remote is node_a's address.
+        let peers_b = policy.get_peers_for_node(&ip("fd5a:5052::2")).unwrap();
+        assert_eq!(peers_b[0].local_substrate, None);
+        assert_eq!(
+            peers_b[0].remote_substrate,
+            Some(NetAddr::new_for_ip_or_host("10.0.0.1", 5000))
+        );
     }
 
     // --- get_peers_for_node ---
@@ -1070,11 +1105,11 @@ mod test {
         assert_eq!(p.remote_zpr_addr, ip("fd5a:5052::2"));
         assert_eq!(
             p.remote_substrate,
-            NetAddr::new_for_ip_or_host("10.0.0.2", 5001)
+            Some(NetAddr::new_for_ip_or_host("10.0.0.2", 5001))
         );
         assert_eq!(
             p.local_substrate,
-            NetAddr::new_for_ip_or_host("10.0.0.1", 5000)
+            Some(NetAddr::new_for_ip_or_host("10.0.0.1", 5000))
         );
     }
 
@@ -1100,11 +1135,11 @@ mod test {
         assert_eq!(p.remote_zpr_addr, ip("fd5a:5052::1"));
         assert_eq!(
             p.remote_substrate,
-            NetAddr::new_for_ip_or_host("10.0.0.1", 5000)
+            Some(NetAddr::new_for_ip_or_host("10.0.0.1", 5000))
         );
         assert_eq!(
             p.local_substrate,
-            NetAddr::new_for_ip_or_host("10.0.0.2", 5001)
+            Some(NetAddr::new_for_ip_or_host("10.0.0.2", 5001))
         );
     }
 
