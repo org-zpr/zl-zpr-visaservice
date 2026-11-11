@@ -306,6 +306,7 @@ async fn main() -> std::process::ExitCode {
                     ts_secrets_dir,
                     actor_repo,
                     oidc_refresh,
+                    cfg.get_vs_addr(),
                 )
                 .await
             }
@@ -318,6 +319,7 @@ async fn main() -> std::process::ExitCode {
                     ts_secrets_dir,
                     actor_repo,
                     oidc_refresh,
+                    cfg.get_vs_addr(),
                 )
                 .await
             }
