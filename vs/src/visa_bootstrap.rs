@@ -305,15 +305,28 @@ mod tests {
     /// peering, and `via_node` is connected and docks the visa service. The peer is left
     /// unconnected (no actor, no route) -- callers that want it connected add its actor.
     async fn build_bootstrap_test_asm(via_node: IpAddr, future_peer: IpAddr) -> Assembly {
+        build_bootstrap_test_asm_with_cns(via_node, future_peer, &[]).await
+    }
+
+    /// As [build_bootstrap_test_asm], with node join policies declaring the given node CNs
+    /// (what `Policy::node_cn_for_addr` reads).
+    async fn build_bootstrap_test_asm_with_cns(
+        via_node: IpAddr,
+        future_peer: IpAddr,
+        node_cns: &[(IpAddr, &str)],
+    ) -> Assembly {
         use crate::db::PolicyRepo;
         use crate::policy_mgr::PolicyMgr;
-        use crate::test_helpers::{FakeResolver, make_peering, policy_with_peerings};
+        use crate::test_helpers::{FakeResolver, make_peering, policy_with_peerings_and_node_cns};
         use crate::trusted_services::TrustedServicesMgr;
         use std::path::PathBuf;
 
         let mut asm = new_assembly_for_tests(None).await;
         asm.policy_mgr = PolicyMgr::new_with_initial_policy(
-            policy_with_peerings(&[make_peering(via_node, future_peer, "link-vp", vec![])]),
+            policy_with_peerings_and_node_cns(
+                &[make_peering(via_node, future_peer, "link-vp", vec![])],
+                node_cns,
+            ),
             PolicyRepo::new(asm.state_db.clone()),
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
@@ -616,6 +629,66 @@ mod tests {
                 VisaDecision::Deny(_)
             ),
             "a connected peer must not get a bootstrap visa"
+        );
+    }
+
+    /// The `(link_id, substrate)` pairs `send_topology` would resolve for `node`, read the same
+    /// way: from the current snapshot.
+    fn resolved_peers(asm: &Assembly, node: &IpAddr) -> Vec<crate::policy_mgr::ResolvedPeer> {
+        asm.policy_mgr
+            .get_current_snapshot()
+            .resolved_peers_for_node(node)
+    }
+
+    /// Every link of a topology send names its peer's CN, read from the peer's node join
+    /// policy (zl-zipline#221): the CN the peer's link certificate must carry.
+    #[tokio::test]
+    async fn topology_links_carry_the_peer_cn_from_policy() {
+        let via_node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let future_peer: IpAddr = "fd5a:5052:3000::7".parse().unwrap();
+        let asm = Arc::new(
+            build_bootstrap_test_asm_with_cns(
+                via_node,
+                future_peer,
+                &[(via_node, "relay.zpr"), (future_peer, "laptop-a.zpr")],
+            )
+            .await,
+        );
+        let links = crate::vss_worker::topology_links(
+            &asm,
+            &asm.policy_mgr.get_current(),
+            &via_node,
+            resolved_peers(&asm, &via_node),
+        )
+        .await
+        .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].zpr_addr, future_peer);
+        assert_eq!(links[0].peer_cn, "laptop-a.zpr");
+    }
+
+    /// A peer whose CN policy does not declare is left out of the topology send (operator,
+    /// pd g44 q2): its node would refuse an unnamed peer anyway (zl-zipline#220), and its
+    /// bootstrap visas would have no CN to be bound to.
+    #[tokio::test]
+    async fn topology_links_skip_a_peer_without_a_cn() {
+        let via_node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let future_peer: IpAddr = "fd5a:5052:3000::7".parse().unwrap();
+        let asm = Arc::new(
+            build_bootstrap_test_asm_with_cns(via_node, future_peer, &[(via_node, "relay.zpr")])
+                .await,
+        );
+        let links = crate::vss_worker::topology_links(
+            &asm,
+            &asm.policy_mgr.get_current(),
+            &via_node,
+            resolved_peers(&asm, &via_node),
+        )
+        .await
+        .unwrap();
+        assert!(
+            links.is_empty(),
+            "no CN for {future_peer}: link skipped, got {links:?}"
         );
     }
 }
