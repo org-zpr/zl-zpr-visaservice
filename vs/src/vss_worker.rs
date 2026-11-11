@@ -803,20 +803,10 @@ async fn vss_do_set_topology(
     policy: Arc<Policy>,
     peers: Vec<ResolvedPeer>,
 ) -> Result<(), VssSyncError> {
-    // HACK -> This hack here is to support our intial MULTINODE implementation.
-    // We create "bootstrap" visas for each peer in the topology message, every
-    // time we send it: one for the peer's own SYN to VSAPI, one for the visa
-    // service's reply to it.
-    //
-    // The visas belong to the peer, not to the node to whom we are sending the
-    // message: that node holds them and hands them off when the peer connects.
-    //
-    // Minting bypasses policy evaluation entirely -- see
-    // [crate::visa_bootstrap], which is where all of this lives and where it
-    // gets deleted from.
-    //
-    // TODO: Reevaluate this.
-
+    // Each link names its peer's ZPR address and CN and, on the relay only, carries the
+    // joining peer's bootstrap visas: one for the peer's own SYN to VSAPI, one for the visa
+    // service's reply. They belong to the peer, not to `node_addr`, which holds them and hands
+    // them off when the peer connects. See [crate::visa_bootstrap] for the rules.
     let links = topology_links(&asm, &policy, node_addr, peers).await?;
 
     let mut req = vss_handle.set_topology_request();
