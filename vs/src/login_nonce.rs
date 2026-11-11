@@ -38,7 +38,6 @@ const NONCE_LEN: usize = 32;
 
 /// Why a nonce could not be minted.
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum MintError {
     /// The actor session already holds the maximum number of unexpired nonces.
     QuotaExceeded,
@@ -46,7 +45,6 @@ pub(crate) enum MintError {
     Random(String),
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 /// One outstanding nonce: whom it was issued to and until when it is usable.
 struct Entry {
     /// ZPR address of the node actor the nonce was issued to.
@@ -58,14 +56,12 @@ struct Entry {
 }
 
 /// The set of outstanding login nonces, keyed by the nonce text.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct LoginNonceStore {
     entries: Mutex<HashMap<String, Entry>>,
     ttl: Duration,
     max_per_actor: usize,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Default for LoginNonceStore {
     /// A store with the production lifetime and per-actor limit.
     fn default() -> Self {
@@ -76,10 +72,6 @@ impl Default for LoginNonceStore {
     }
 }
 
-// The production callers (reauthorize's login arm and the getLoginNonce
-// handler) land in the next tasks of zl-zipline#232; until then only the tests
-// use the store.
-#[cfg_attr(not(test), allow(dead_code))]
 impl LoginNonceStore {
     /// A store with an explicit lifetime and per-actor limit (tests use small values).
     pub(crate) fn new(ttl: Duration, max_per_actor: usize) -> Self {
@@ -169,7 +161,6 @@ impl LoginNonceStore {
 }
 
 /// Truncate `t` to whole seconds since the unix epoch.
-#[cfg_attr(not(test), allow(dead_code))]
 fn whole_seconds(t: SystemTime) -> SystemTime {
     let secs = t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     UNIX_EPOCH + Duration::from_secs(secs)

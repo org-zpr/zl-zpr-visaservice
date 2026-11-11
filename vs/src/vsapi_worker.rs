@@ -26,6 +26,7 @@ use crate::counters::CounterType;
 use crate::error::ServiceError;
 use crate::event_mgr::VsEvent;
 use crate::logging::targets::API;
+use crate::login_nonce::MintError;
 use crate::net_mgr;
 use crate::packet::describe_five_tuple;
 use crate::topology_mgr::{AddLinkedNodeError, TopologyMgr};
@@ -1882,6 +1883,68 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         Ok(())
     }
 
+    /// `getLoginNonce` (zl-zipline#232): mint a visa-service OIDC login nonce
+    /// for the calling node's OWN login. The nonce is bound, in the
+    /// [crate::login_nonce::LoginNonceStore], to this node's actor address and
+    /// to the VS-API session generation this handle was minted under, so only
+    /// this node, in this session, can spend it on a `reauthorize` that gains
+    /// its user namespace. Errors (vs.capnp): `authRequired` on a dead handle,
+    /// `quotaExceeded` when the node already holds the maximum number of
+    /// outstanding nonces.
+    async fn get_login_nonce(
+        self: Rc<Self>,
+        _params: vsapi::v_s_handle::GetLoginNonceParams,
+        mut results: vsapi::v_s_handle::GetLoginNonceResults,
+    ) -> Result<(), capnp::Error> {
+        debug!(target: API, "get_login_nonce from {:?}", self.node.get_cn());
+        let addr_and_session = self.node.get_zpr_addr().copied().zip(self.session.clone());
+        let (true, Some((node_addr, session))) = (self.node_is_live().await, addr_and_session)
+        else {
+            warn!(target: API, "get_login_nonce from disconnected node {:?}: refused", self.node.get_cn());
+            write_error(
+                &mut results.get().init_res().init_error(),
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        };
+        self.update_last_seen_time(&node_addr).await;
+
+        match self
+            .asm
+            .cc
+            .login_nonces
+            .mint(node_addr, &session, SystemTime::now())
+        {
+            Ok((nonce, expires)) => {
+                let expires_at = expires
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let mut ok = results.get().init_res().init_ok();
+                ok.set_nonce(&nonce);
+                ok.set_expires_at(expires_at);
+            }
+            Err(MintError::QuotaExceeded) => {
+                info!(target: API, "get_login_nonce from {:?}: outstanding nonce limit reached", self.node.get_cn());
+                write_error(
+                    &mut results.get().init_res().init_error(),
+                    vsapi::ErrorCode::QuotaExceeded,
+                    "too many outstanding login nonces",
+                );
+            }
+            Err(MintError::Random(e)) => {
+                error!(target: API, "get_login_nonce: random source failed: {e}");
+                write_error(
+                    &mut results.get().init_res().init_error(),
+                    vsapi::ErrorCode::Internal,
+                    "internal error",
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn visa_ids_request(
         self: Rc<Self>,
         _req: vsapi::v_s_handle::VisaIdsRequestParams,
@@ -3135,6 +3198,132 @@ mod tests {
                     assert!(
                         event_rx.try_recv().is_err(),
                         "no ActorLeaves event may be recorded for a refused disconnect"
+                    );
+                })
+                .await;
+        }
+    }
+
+    /// `getLoginNonce` (zl-zipline#232), driven through a real capnp client.
+    mod login_nonce {
+        use super::*;
+        use crate::assembly::tests::new_assembly_for_tests;
+        use crate::test_helpers::make_node_actor_defexp;
+        use std::sync::Arc;
+        use zpr::vsapi::v1::DisconnectReason;
+
+        const NODE: &str = "fd5a:5052:3000::1";
+
+        /// Persist a live node with a fresh session and return its handle.
+        async fn live_node(asm: &Arc<Assembly>) -> vsapi::v_s_handle::Client {
+            let mut node = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
+            VSHandleImpl::stamp_new_session(&mut node);
+            asm.actor_mgr
+                .add_node(&node, false, &Default::default())
+                .await
+                .unwrap();
+            capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), node))
+        }
+
+        /// One `getLoginNonce` call: `Ok((nonce, expiresAt))` or the error code.
+        async fn get_nonce(
+            handle: &vsapi::v_s_handle::Client,
+        ) -> Result<(String, u64), vsapi::ErrorCode> {
+            let resp = handle
+                .get_login_nonce_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            let res = resp.get().unwrap().get_res().unwrap();
+            match res.which().unwrap() {
+                vsapi::result::Which::Ok(ok) => {
+                    let ok = ok.unwrap();
+                    Ok((
+                        ok.get_nonce().unwrap().to_string().unwrap(),
+                        ok.get_expires_at(),
+                    ))
+                }
+                vsapi::result::Which::Error(err) => Err(err.unwrap().get_code().unwrap()),
+            }
+        }
+
+        /// Test 19: a live node gets a nonce that the store accepts for that
+        /// node and session, with `expiresAt` one TTL ahead.
+        #[tokio::test]
+        async fn test_get_login_nonce_live_node_gets_bound_nonce() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let asm = Arc::new(new_assembly_for_tests(None).await);
+                    let handle = live_node(&asm).await;
+                    let before = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let (nonce, expires_at) =
+                        get_nonce(&handle).await.expect("live node gets a nonce");
+                    assert!(
+                        expires_at >= before + config::LOGIN_NONCE_TTL_SECS
+                            && expires_at <= before + config::LOGIN_NONCE_TTL_SECS + 2,
+                        "expiresAt must be one TTL ahead"
+                    );
+                    let stored = asm
+                        .actor_mgr
+                        .get_actor_by_zpr_addr(&NODE.parse().unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let session = stored
+                        .get_attribute(key::SESSION)
+                        .unwrap()
+                        .get_single_value()
+                        .unwrap()
+                        .to_string();
+                    assert!(
+                        asm.cc.login_nonces.consume(
+                            &nonce,
+                            NODE.parse().unwrap(),
+                            &session,
+                            SystemTime::now()
+                        ),
+                        "the nonce must be bound to this node and its session"
+                    );
+                })
+                .await;
+        }
+
+        /// Test 19: past the per-node limit the call answers `quotaExceeded`.
+        #[tokio::test]
+        async fn test_get_login_nonce_quota_exceeded() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let asm = Arc::new(new_assembly_for_tests(None).await);
+                    let handle = live_node(&asm).await;
+                    for _ in 0..config::LOGIN_NONCE_MAX_PER_ACTOR {
+                        get_nonce(&handle).await.expect("within the limit");
+                    }
+                    assert_eq!(
+                        get_nonce(&handle).await,
+                        Err(vsapi::ErrorCode::QuotaExceeded)
+                    );
+                })
+                .await;
+        }
+
+        /// Test 19: a dead handle (node disconnected) gets `authRequired`.
+        #[tokio::test]
+        async fn test_get_login_nonce_dead_handle_auth_required() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let asm = Arc::new(new_assembly_for_tests(None).await);
+                    let handle = live_node(&asm).await;
+                    asm.cc
+                        .disconnect(asm.clone(), NODE.parse().unwrap(), DisconnectReason::Admin)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        get_nonce(&handle).await,
+                        Err(vsapi::ErrorCode::AuthRequired)
                     );
                 })
                 .await;
