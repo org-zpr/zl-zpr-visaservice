@@ -76,6 +76,14 @@ pub const VS_ZPR_ADDR: Ipv6Addr = Ipv6Addr::new(
 /// Maximum allowed clock skew allowed during node authentication, in seconds.
 pub const MAX_CLOCK_SKEW_SECS: u64 = 180;
 
+/// Lifetime of a visa-service-minted OIDC login nonce (`getLoginNonce`,
+/// zl-zipline#232), in seconds. Long enough for an interactive browser login.
+pub const LOGIN_NONCE_TTL_SECS: u64 = 300;
+
+/// Maximum number of unexpired outstanding login nonces one node actor session
+/// may hold; minting past it is refused with `quotaExceeded` (zl-zipline#232).
+pub const LOGIN_NONCE_MAX_PER_ACTOR: usize = 4;
+
 pub const MAX_VISA_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
 /// A visa must be valid for at least this long to be worth issuing. Below this the node

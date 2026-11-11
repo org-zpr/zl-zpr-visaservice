@@ -33,6 +33,7 @@ mod event_mgr;
 mod http_util;
 mod loaded_policy;
 mod logging;
+mod login_nonce;
 mod net_mgr;
 /// Offline OIDC id_token validation (consumed by the connect path in
 /// OIDC-C4/C5; until then only its own tests exercise it).
