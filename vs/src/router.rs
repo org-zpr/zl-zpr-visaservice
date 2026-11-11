@@ -243,6 +243,21 @@ impl Router {
         attributes: Vec<Attribute>,
         cost: u32,
     ) -> Result<(), TopologyError> {
+        self.add_link_with_state(zpr_addr_a, zpr_addr_b, id, attributes, cost, true)
+    }
+
+    /// As [Router::add_link], but installs the link with the given up/down flag under
+    /// the same write lock, so a link that link-state reports already veto is never
+    /// usable, not even between the install and a later [Router::set_link_up].
+    pub fn add_link_with_state(
+        &self,
+        zpr_addr_a: IpAddr,
+        zpr_addr_b: IpAddr,
+        id: LinkId,
+        attributes: Vec<Attribute>,
+        cost: u32,
+        up: bool,
+    ) -> Result<(), TopologyError> {
         let mut inner = self.inner.write().unwrap();
         let a: NodeId = zpr_addr_a.into();
         let b: NodeId = zpr_addr_b.into();
@@ -253,7 +268,12 @@ impl Router {
         inner.route_cache.clear();
         inner.link_to_cache_keys.clear();
 
-        inner.topology.add_link(a, b, id, attributes, cost)?;
+        inner
+            .topology
+            .add_link(a, b, id.clone(), attributes, cost)?;
+        if !up {
+            inner.topology.set_link_up(&id, false);
+        }
         inner.topo_generation += 1;
         Ok(())
     }
@@ -394,6 +414,15 @@ impl Router {
         inner.link_to_cache_keys.clear();
         inner.topo_generation += 1;
         true
+    }
+
+    /// True if every link in `ids` exists and is up. An empty list (a route that
+    /// stays on one node) is trivially up. Used to check, when a visa is committed,
+    /// that its route has not lost a link since it was chosen.
+    pub fn links_up(&self, ids: &[LinkId]) -> bool {
+        let inner = self.inner.read().unwrap();
+        ids.iter()
+            .all(|id| inner.topology.edges.get(id).is_some_and(|l| l.up))
     }
 
     /// Current link between two node addrs, in either order (edges are undirected).
@@ -2087,5 +2116,33 @@ mod tests {
             2,
             "route avoids the down link"
         );
+    }
+
+    #[test]
+    fn test_add_link_with_state_installs_down_atomically() {
+        // A link installed down is never usable, not even briefly.
+        let (r, a, _b, c) = make_router_abc();
+        r.add_link_with_state(a, c, LinkId("ac".into()), vec![], 1, false)
+            .unwrap();
+        assert!(!r.link_between(&a, &c).unwrap().up);
+        assert!(r.get_best_route(&a, &c).is_none());
+        r.add_link_with_state(a, ip("10.0.0.2"), LinkId("ab".into()), vec![], 1, true)
+            .unwrap();
+        assert!(r.link_between(&a, &ip("10.0.0.2")).unwrap().up);
+    }
+
+    #[test]
+    fn test_links_up_requires_every_link_present_and_up() {
+        let (r, _a, _b, _c) = make_triangle();
+        let ab = LinkId("ab".into());
+        let bc = LinkId("bc".into());
+        assert!(r.links_up(&[ab.clone(), bc.clone()]));
+        r.set_link_up(&bc, false);
+        assert!(!r.links_up(&[ab.clone(), bc]));
+        assert!(
+            !r.links_up(&[ab, LinkId("gone".into())]),
+            "a missing link is not up"
+        );
+        assert!(r.links_up(&[]), "no links (direct route) is trivially up");
     }
 }

@@ -517,18 +517,33 @@ impl VisaMgr {
         expiration_time: SystemTime,
     ) -> Result<VisaWithMetadata, ServiceError> {
         let path = path_for_flow(asm, &pdesc.five_tuple.source_addr, route).await?;
-        self.create_visa_with_path(
-            asm,
-            requesting_node,
-            pdesc,
-            hit,
-            path,
-            source_zpl,
-            policy_version,
-            vinst,
-            expiration_time,
-        )
-        .await
+        let vwmd = self
+            .create_visa_with_path(
+                asm,
+                requesting_node,
+                pdesc,
+                hit,
+                path,
+                source_zpl,
+                policy_version,
+                vinst,
+                expiration_time,
+            )
+            .await?;
+
+        // A link on the route may have gone down after the route was chosen and before
+        // the visa was stored (zl-zipline#224). The link-down revocation pass lists the
+        // visas that were stored when it ran, so it can miss this one. Check now that
+        // the visa is committed: if the link went down before this check, the check
+        // catches it; if it goes down after, the revocation pass finds the visa stored.
+        if !asm.topo_mgr.route_links_up(&route.links) {
+            let visa_id = vwmd.visa.issuer_id;
+            warn!(target: VISA, "visa {visa_id}: a link on its route went down while it was issued; revoking it");
+            if let Err(e) = self.mark_visa_revoked(visa_id).await {
+                warn!(target: VISA, "visa {visa_id}: failed to revoke after its route went down: {e}");
+            }
+        }
+        Ok(vwmd)
     }
 
     /// As [VisaMgr::create_visa], but with the node path supplied rather than derived from

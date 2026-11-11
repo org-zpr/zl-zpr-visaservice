@@ -33,6 +33,10 @@ pub struct TopologyMgr {
     /// router link's up/down flag together with policy CNs; see [Self::refresh_link].
     /// In memory only; a std mutex because no critical section awaits.
     link_state: Mutex<LinkStateTable>,
+    /// Links that went down but whose visa revocation failed (a state-DB write error),
+    /// as canonical address pairs. Retried on the next report from either end; see
+    /// [Self::links_to_revoke].
+    failed_revocations: Mutex<HashSet<(IpAddr, IpAddr)>>,
 }
 
 /// The fate of a persisted/live edge when validated against the current policy.
@@ -90,6 +94,7 @@ impl TopologyMgr {
             router: Router::new(),
             link_repo,
             link_state: Mutex::new(LinkStateTable::new()),
+            failed_revocations: Mutex::new(HashSet::new()),
         }
     }
 
@@ -133,6 +138,70 @@ impl TopologyMgr {
             .collect()
     }
 
+    /// Whether the link between `a` and `b` may carry routes according to the current
+    /// link-state reports (`LinkStateTable::edge_usable`).
+    fn usable_now(
+        &self,
+        a: &IpAddr,
+        b: &IpAddr,
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
+    ) -> bool {
+        let (a_cn, b_cn) = (cn_of(a), cn_of(b));
+        self.link_state
+            .lock()
+            .unwrap()
+            .edge_usable(a, a_cn.as_deref(), b, b_cn.as_deref())
+    }
+
+    /// True if every link of a route still exists and is up. See [Router::links_up].
+    pub fn route_links_up(&self, links: &[LinkId]) -> bool {
+        self.router.links_up(links)
+    }
+
+    /// The links whose visas must be revoked after a report from `node`: the ones that
+    /// just went down (`went_down`, from [Self::record_link_states]) plus any link
+    /// incident to `node` whose earlier revocation failed and that is still down.
+    /// Earlier failures for links that are up again, or gone, are dropped: nothing
+    /// crosses them that needs revoking. Pairs are `(node, peer)`.
+    pub fn links_to_revoke(
+        &self,
+        node: &IpAddr,
+        mut went_down: Vec<(IpAddr, IpAddr)>,
+    ) -> Vec<(IpAddr, IpAddr)> {
+        let mut failed = self.failed_revocations.lock().unwrap();
+        let incident: Vec<(IpAddr, IpAddr)> = failed
+            .iter()
+            .filter(|(x, y)| x == node || y == node)
+            .copied()
+            .collect();
+        for pair in incident {
+            let peer = if pair.0 == *node { pair.1 } else { pair.0 };
+            match self.router.link_between(node, &peer) {
+                Some(link) if !link.up => {
+                    if !went_down.contains(&(*node, peer)) {
+                        went_down.push((*node, peer));
+                    }
+                }
+                _ => {
+                    failed.remove(&pair);
+                }
+            }
+        }
+        went_down
+    }
+
+    /// Record the outcome of revoking the visas over the link between `a` and `b`. A
+    /// failure is kept for retry (see [Self::links_to_revoke]); a success clears it.
+    pub fn note_revocation(&self, a: &IpAddr, b: &IpAddr, succeeded: bool) {
+        let pair = Self::canonical_pair(*a, *b);
+        let mut failed = self.failed_revocations.lock().unwrap();
+        if succeeded {
+            failed.remove(&pair);
+        } else {
+            failed.insert(pair);
+        }
+    }
+
     /// The one place that decides a router link's up/down flag: usable only while both
     /// ends agree it is up (`LinkStateTable::edge_usable`). Returns true if the link went
     /// from up to down. A missing link is a no-op.
@@ -145,12 +214,7 @@ impl TopologyMgr {
         let Some(link) = self.router.link_between(a, b) else {
             return false;
         };
-        let (a_cn, b_cn) = (cn_of(a), cn_of(b));
-        let usable =
-            self.link_state
-                .lock()
-                .unwrap()
-                .edge_usable(a, a_cn.as_deref(), b, b_cn.as_deref());
+        let usable = self.usable_now(a, b, cn_of);
         let changed = self.router.set_link_up(&link.id, usable);
         if changed {
             info!(target: TOPO, "link {} between {} and {} is now {}", link.id.0, a, b, if usable { "up" } else { "down" });
@@ -162,18 +226,24 @@ impl TopologyMgr {
     /// persisting it. Used by both `add_linked_node` (which persists separately) and
     /// `restore_from_state` (which must not re-persist). The router error is returned
     /// unchanged so callers can decide how to treat [TopologyError::LinkExists].
+    ///
+    /// The link is installed with the up/down flag its link-state reports call for,
+    /// atomically, so a link one end already vetoes is never usable in between.
     fn install_router_link(
         &self,
         a: &IpAddr,
         b: &IpAddr,
         link_desc: LinkDescription,
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
     ) -> Result<(), TopologyError> {
-        self.router.add_link(
+        let up = self.usable_now(a, b, cn_of);
+        self.router.add_link_with_state(
             a.clone(),
             b.clone(),
             link_desc.link_id.into(),
             link_desc.attrs,
             link_desc.cost,
+            up,
         )
     }
 
@@ -262,7 +332,12 @@ impl TopologyMgr {
         // Add the link to the router. LinkExists is tolerated (repair / re-auth): in
         // that case we did NOT add a link, so the rollback below must not remove it.
         let mut added_new_link = false;
-        match self.install_router_link(connect_via, new_node_addr, link_desc) {
+        match self.install_router_link(
+            connect_via,
+            new_node_addr,
+            link_desc,
+            &Self::policy_cn_lookup(snapshot),
+        ) {
             Ok(()) => added_new_link = true,
             Err(TopologyError::LinkExists(_)) => {}
             Err(e) => {
@@ -288,14 +363,6 @@ impl TopologyMgr {
             }
             return Err(AddLinkedNodeError::new(preexisting_node, e));
         }
-
-        // A link starts up; apply any link-state reports its ends already sent. It
-        // carries no visas yet, so a "went down" here needs no revocation.
-        self.refresh_link(
-            connect_via,
-            new_node_addr,
-            &Self::policy_cn_lookup(snapshot),
-        );
 
         Ok(())
     }
@@ -330,7 +397,12 @@ impl TopologyMgr {
             // transient policy/DB problem fails startup rather than deleting valid edges.
             match Self::decide_edge(snapshot, &known, &a, &b)? {
                 EdgeDecision::Install(link_desc) => {
-                    match self.install_router_link(&a, &b, link_desc) {
+                    match self.install_router_link(
+                        &a,
+                        &b,
+                        link_desc,
+                        &Self::policy_cn_lookup(snapshot),
+                    ) {
                         Ok(()) | Err(TopologyError::LinkExists(_)) => {}
                         Err(e) => return Err(e.into()),
                     }
@@ -436,9 +508,6 @@ impl TopologyMgr {
             persisted: bool,
             desc: LinkDescription,
             action: Action,
-            /// Current up/down flag of the router link (true if absent). Link state
-            /// comes from link-state reports, not policy, so a rebuild keeps it.
-            up: bool,
         }
         struct Removal {
             a: IpAddr,
@@ -460,7 +529,6 @@ impl TopologyMgr {
                     old_id: router_link.map(|rl| rl.id),
                 }),
                 EdgeDecision::Install(desc) => {
-                    let up = router_link.as_ref().map_or(true, |rl| rl.up);
                     let action = match &router_link {
                         None => Action::Fresh,
                         Some(rl) => {
@@ -480,7 +548,6 @@ impl TopologyMgr {
                         persisted,
                         desc,
                         action,
-                        up,
                     });
                 }
             }
@@ -525,6 +592,9 @@ impl TopologyMgr {
         let mut removal_ids: Vec<LinkId> =
             removals.iter().filter_map(|r| r.old_id.clone()).collect();
         let mut additions: Vec<LinkSpec> = Vec::new();
+        // Link state comes from link-state reports, not policy: every installed or
+        // rebuilt link gets the flag its reports call for, inside the atomic batch.
+        let cn_of = Self::policy_cn_lookup(snapshot);
         for e in surviving {
             let spec = LinkSpec {
                 a: e.a,
@@ -532,7 +602,7 @@ impl TopologyMgr {
                 id: e.desc.link_id.into(),
                 attributes: e.desc.attrs,
                 cost: e.desc.cost,
-                up: e.up,
+                up: self.usable_now(&e.a, &e.b, &cn_of),
             };
             match e.action {
                 Action::Keep => {}
@@ -548,13 +618,6 @@ impl TopologyMgr {
             }
         }
         self.router.apply_link_batch(&removal_ids, additions)?;
-        // A drift-repaired (Fresh) link is installed up; apply link-state reports to it.
-        // Rebuilt links kept their flag above. Nothing that went down here carried
-        // visas over a link the router had, so no revocation is needed.
-        let cn_of = Self::policy_cn_lookup(snapshot);
-        for link in self.router.link_snapshot() {
-            self.refresh_link(&link.a, &link.b, &cn_of);
-        }
 
         // Detect + report orphans. An orphan node is a legitimate state and stays in the
         // topology so long as it remains a known node; removing it belongs to the
@@ -1523,6 +1586,48 @@ mod tests {
         assert!(
             topo.router.link_between(&a, &b).unwrap().up,
             "a re-joined node is a non-reporter until it reports again"
+        );
+    }
+
+    #[test]
+    fn test_failed_revocations_are_retried_until_they_succeed() {
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let topo = TopologyMgr::new(LinkRepo::new(Arc::new(FakeDb::new())));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        let down = topo.record_link_states(&b, vec![report("a.zpr", LinkState::Down)], &cn_of);
+        assert_eq!(topo.links_to_revoke(&b, down), vec![(b, a)]);
+
+        // Revocation failed: a later report from EITHER end retries it, even though
+        // the link does not transition again.
+        topo.note_revocation(&b, &a, false);
+        assert_eq!(topo.links_to_revoke(&a, vec![]), vec![(a, b)]);
+        assert_eq!(topo.links_to_revoke(&b, vec![]), vec![(b, a)]);
+
+        // It succeeded: nothing left to retry.
+        topo.note_revocation(&a, &b, true);
+        assert!(topo.links_to_revoke(&a, vec![]).is_empty());
+        assert!(topo.links_to_revoke(&b, vec![]).is_empty());
+    }
+
+    #[test]
+    fn test_failed_revocation_is_dropped_once_the_link_is_back_up() {
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let topo = TopologyMgr::new(LinkRepo::new(Arc::new(FakeDb::new())));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        topo.record_link_states(&b, vec![report("a.zpr", LinkState::Down)], &cn_of);
+        topo.note_revocation(&b, &a, false);
+        topo.record_link_states(&b, vec![report("a.zpr", LinkState::Up)], &cn_of);
+        assert!(
+            topo.links_to_revoke(&b, vec![]).is_empty(),
+            "a link that is up again needs no revocation"
         );
     }
 }

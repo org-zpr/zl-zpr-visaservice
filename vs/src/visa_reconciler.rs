@@ -149,15 +149,21 @@ pub(crate) async fn revalidate_visas(
 /// through the ungated [VisaMgr::mark_visa_revoked] -- the same path the attribute
 /// sweep uses -- so VSS housekeeping revokes it and the flow re-requests, getting a
 /// route that avoids the link. A visa with no path (both actors on one node) never
-/// crosses a link. Returns how many visas were marked.
+/// crosses a link.
+///
+/// Every crossing visa is attempted even if some writes fail. Returns `Ok(marked)`
+/// when every write succeeded, or `Err(failed)` with the number of visas whose state
+/// write failed, so the caller can retry the whole link later (marking a visa that is
+/// already `PendingRevoke` again is harmless).
 ///
 /// [VisaMgr::mark_visa_revoked]: crate::visa_mgr::VisaMgr::mark_visa_revoked
 pub(crate) async fn revoke_visas_over_link(
     asm: &Arc<Assembly>,
     a: &std::net::IpAddr,
     b: &std::net::IpAddr,
-) -> usize {
+) -> Result<usize, usize> {
     let mut revoked = 0;
+    let mut failed = 0;
     for (visa_id, metadata) in asm.visa_mgr.list_visa_metadata().await {
         let Some(path) = &metadata.path else {
             continue;
@@ -172,12 +178,17 @@ pub(crate) async fn revoke_visas_over_link(
             Ok(true) => revoked += 1,
             Ok(false) => {} // already being revoked
             Err(e) => {
+                failed += 1;
                 warn!(target: VISA, "link {a} <-> {b} down: failed to revoke visa {visa_id}: {e}")
             }
         }
     }
-    info!(target: VISA, "link {a} <-> {b} down: revoked {revoked} visa(s) crossing it");
-    revoked
+    info!(target: VISA, "link {a} <-> {b} down: revoked {revoked} visa(s) crossing it, {failed} failed");
+    if failed == 0 {
+        Ok(revoked)
+    } else {
+        Err(failed)
+    }
 }
 
 #[cfg(test)]
@@ -394,8 +405,7 @@ mod tests {
         let local = create_sweep_visa(&asm, &node_a, 0).await; // direct, no path
 
         // Either argument order names the same undirected link.
-        let n = revoke_visas_over_link(&asm, &node_b, &node_a).await;
-        assert_eq!(n, 1);
+        assert_eq!(revoke_visas_over_link(&asm, &node_b, &node_a).await, Ok(1));
 
         let revoked = asm
             .visa_mgr
@@ -419,13 +429,60 @@ mod tests {
         create_routed_sweep_visa(&asm, &node_a, 0).await;
         let x: IpAddr = "fd5a:5052:3000::8".parse().unwrap();
         let y: IpAddr = "fd5a:5052:3000::9".parse().unwrap();
-        assert_eq!(revoke_visas_over_link(&asm, &x, &y).await, 0);
+        assert_eq!(revoke_visas_over_link(&asm, &x, &y).await, Ok(0));
         assert!(
             asm.visa_mgr
                 .get_pending_revoke_visa_ids_for_node(&node_a)
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// A visa issued on a route whose link went down after the route was chosen is
+    /// revoked as it is committed, not left for a sweep that already ran.
+    #[tokio::test]
+    async fn test_visa_on_a_route_that_went_down_is_revoked_at_commit() {
+        use crate::test_helpers::create_sweep_visa_on_route;
+        let (asm, node_a) = build_sweep_asm(true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let route = asm.topo_mgr.get_best_route(&node_a, &node_b).unwrap();
+
+        // The link goes down between route selection and commit.
+        let down = asm
+            .topo_mgr
+            .record_link_states(&node_a, vec![], &|_: &IpAddr| None);
+        assert_eq!(down, vec![(node_a, node_b)]);
+        let id = create_sweep_visa_on_route(&asm, &node_a, 0, &route).await;
+
+        let revoked = asm
+            .visa_mgr
+            .get_pending_revoke_visa_ids_for_node(&node_a)
+            .await
+            .unwrap();
+        assert_eq!(revoked, vec![id]);
+    }
+
+    /// A revocation whose state write fails is reported as failed, so the caller can
+    /// retry it; once the write works again the retry succeeds.
+    #[tokio::test]
+    async fn test_revoke_visas_over_link_reports_failed_writes() {
+        use crate::db::FaultMode;
+        use crate::test_helpers::{build_sweep_asm_with_db, create_routed_sweep_visa};
+        let (asm, node_a, db) = build_sweep_asm_with_db(true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
+
+        db.set_set_ex_fault(FaultMode::Reject);
+        assert_eq!(revoke_visas_over_link(&asm, &node_a, &node_b).await, Err(1));
+        db.set_set_ex_fault(FaultMode::None);
+        assert_eq!(revoke_visas_over_link(&asm, &node_a, &node_b).await, Ok(1));
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap(),
+            vec![id]
         );
     }
 }
