@@ -14,7 +14,7 @@ use tracing::warn;
 
 use zpr::policy::v1 as policy_capnp;
 use zpr::policy_types::{
-    AttrExp, NetAddr, Peering, PolicyTypeError, Service, ServiceType, TrustedService,
+    AttrExp, AttrOp, NetAddr, Peering, PolicyTypeError, Service, ServiceType, TrustedService,
 };
 
 /// The default and the minimum.
@@ -72,6 +72,9 @@ pub struct Policy {
     serialized: Bytes,
     peer_table: Option<HashMap<IpAddr, Vec<Peer>>>, // zpr_addr -> peers
     link_attrs: Option<HashMap<String, Vec<AttrExp>>>, // link_id -> attributes
+    /// Node ZPR address -> the CN that node authenticates with, read from the node join
+    /// policies at load. See [Policy::node_cn_for_addr].
+    node_cn_by_addr: HashMap<IpAddr, String>,
 }
 
 /// A "Peer" is a one-way view of a link from the perspective of one endpoint.
@@ -125,6 +128,7 @@ impl Policy {
 
         let bootstrap_keys = load_bootstrap_keys(&policy)?;
         let join_policies = load_join_policies(&policy)?;
+        let node_cn_by_addr = index_node_cns(&join_policies);
         let services = load_services(&policy)?;
         let trusted_services = load_trusted_services(&policy)?;
         let identity_attr_keys = resolve_identity_attr_keys(&trusted_services);
@@ -156,6 +160,7 @@ impl Policy {
             serialized,
             peer_table,
             link_attrs,
+            node_cn_by_addr,
             ..Default::default()
         })
     }
@@ -414,6 +419,20 @@ impl Policy {
         self.peer_table.iter().flat_map(|table| table.keys())
     }
 
+    /// The CN of the node whose ZPR address is `node_zpr_addr`, as policy declares it.
+    ///
+    /// Policy has no node-to-CN field. The compiler emits one node join policy per node,
+    /// matching the node's provider attributes plus `zpr.addr eq <zpr_address>`, and a node's
+    /// provider names its CN (`device.zpr.adapter.cn`, the attribute `authenticate_node`
+    /// asserts). This is the CN a node's link certificate must carry (`Link.peerCn`,
+    /// zl-zipline#221) and the name it reports link state under (zl-zipline#224).
+    ///
+    /// `None` when no node join policy pins the address with a CN, or when two of them pin it
+    /// with different CNs (ambiguous, so treated as unknown).
+    pub fn node_cn_for_addr(&self, node_zpr_addr: &IpAddr) -> Option<&str> {
+        self.node_cn_by_addr.get(node_zpr_addr).map(String::as_str)
+    }
+
     /// A link may have attributes on it, this returns them.
     pub fn get_link_attrs(&self, link_id: &str) -> Option<&[AttrExp]> {
         self.link_attrs.as_ref()?.get(link_id).map(|v| v.as_slice())
@@ -449,6 +468,53 @@ impl Policy {
         }
         Err(PolicyError::LinkNotFound(format!("{node_a} <-> {node_b}")))
     }
+}
+
+/// Build the node ZPR address -> CN index behind [Policy::node_cn_for_addr].
+///
+/// A node join policy contributes `A -> C` when its match has exactly one `zpr.addr eq A`
+/// (one value, a valid address) and exactly one `device.zpr.adapter.cn eq C` (one value).
+/// Anything else is skipped. An address that two policies pin under different CNs is
+/// dropped and stays dropped: picking one would let policy order decide a peer's identity.
+fn index_node_cns(join_policies: &[JPolicy]) -> HashMap<IpAddr, String> {
+    /// The single value of the single `Eq` condition on `k`, if there is exactly one.
+    fn single_eq<'a>(conds: &'a [AttrExp], k: &str) -> Option<&'a str> {
+        let mut found = conds.iter().filter(|c| c.key == k);
+        let cond = found.next()?;
+        if found.next().is_some() || cond.op != AttrOp::Eq || cond.value.len() != 1 {
+            return None;
+        }
+        Some(cond.value[0].as_str())
+    }
+
+    let mut index: HashMap<IpAddr, String> = HashMap::new();
+    let mut ambiguous: HashSet<IpAddr> = HashSet::new();
+    for jp in join_policies
+        .iter()
+        .filter(|jp| jp.flags.contains(JFlag::IsNode))
+    {
+        let (Some(addr), Some(cn)) = (
+            single_eq(&jp.matches, key::ZPR_ADDR).and_then(|a| a.parse::<IpAddr>().ok()),
+            single_eq(&jp.matches, key::CN),
+        ) else {
+            continue;
+        };
+        if ambiguous.contains(&addr) {
+            continue;
+        }
+        match index.get(&addr) {
+            Some(existing) if existing != cn => {
+                warn!(target: EVAL, "node address {addr} is pinned under two CNs ({existing}, {cn}); treating its CN as unknown");
+                index.remove(&addr);
+                ambiguous.insert(addr);
+            }
+            Some(_) => {}
+            None => {
+                index.insert(addr, cn.to_string());
+            }
+        }
+    }
+    index
 }
 
 fn load_peer_table(peerings: &[Peering]) -> Option<HashMap<IpAddr, Vec<Peer>>> {
@@ -1177,6 +1243,122 @@ mod test {
     fn test_get_link_attrs_no_topology() {
         let policy = Policy::new_empty();
         assert!(policy.get_link_attrs("link-1").is_none());
+    }
+
+    /// An `Eq` condition on `key` with one value, as the compiler emits in a node join policy.
+    fn eq_cond(key: &str, value: &str) -> AttrExp {
+        AttrExp {
+            key: key.to_string(),
+            op: AttrOp::Eq,
+            value: vec![value.to_string()],
+        }
+    }
+
+    /// A node join policy (`IsNode`) matching `conds`.
+    fn node_jpolicy(conds: Vec<AttrExp>) -> JPolicy {
+        JPolicy {
+            matches: conds,
+            flags: JFlag::IsNode.into(),
+            services: None,
+        }
+    }
+
+    #[test]
+    /// A node join policy pinning `zpr.addr` and naming the CN maps the address to that CN.
+    fn test_node_cn_index_finds_cn_for_pinned_addr() {
+        let jps = vec![node_jpolicy(vec![
+            eq_cond(key::CN, "relay.zpr"),
+            eq_cond(key::ZPR_ADDR, "fd5a:5052::1"),
+        ])];
+        let index = index_node_cns(&jps);
+        assert_eq!(
+            index.get(&ip("fd5a:5052::1")).map(String::as_str),
+            Some("relay.zpr")
+        );
+    }
+
+    #[test]
+    /// No index entry for an address no node join policy pins, for a node policy without a
+    /// CN condition, or for a CN/address pair that is not on a node policy.
+    fn test_node_cn_index_skips_incomplete_or_non_node_policies() {
+        let not_a_node = JPolicy {
+            matches: vec![
+                eq_cond(key::CN, "adapter.zpr"),
+                eq_cond(key::ZPR_ADDR, "fd5a:5052::3"),
+            ],
+            flags: Default::default(),
+            services: None,
+        };
+        let jps = vec![
+            node_jpolicy(vec![eq_cond(key::ZPR_ADDR, "fd5a:5052::2")]),
+            not_a_node,
+        ];
+        let index = index_node_cns(&jps);
+        assert!(index.get(&ip("fd5a:5052::2")).is_none(), "no CN condition");
+        assert!(
+            index.get(&ip("fd5a:5052::3")).is_none(),
+            "not a node policy"
+        );
+        assert!(index.get(&ip("fd5a:5052::9")).is_none(), "no policy at all");
+    }
+
+    #[test]
+    /// An address pinned under two different CNs is ambiguous: it is left out of the index
+    /// (fail closed), even if a third policy repeats one of the CNs.
+    fn test_node_cn_index_drops_ambiguous_addr() {
+        let jps = vec![
+            node_jpolicy(vec![
+                eq_cond(key::CN, "a.zpr"),
+                eq_cond(key::ZPR_ADDR, "fd5a:5052::4"),
+            ]),
+            node_jpolicy(vec![
+                eq_cond(key::CN, "b.zpr"),
+                eq_cond(key::ZPR_ADDR, "fd5a:5052::4"),
+            ]),
+            node_jpolicy(vec![
+                eq_cond(key::CN, "a.zpr"),
+                eq_cond(key::ZPR_ADDR, "fd5a:5052::4"),
+            ]),
+        ];
+        assert!(index_node_cns(&jps).get(&ip("fd5a:5052::4")).is_none());
+    }
+
+    #[test]
+    /// The same pair repeated is not a conflict.
+    fn test_node_cn_index_tolerates_duplicate_pair() {
+        let jps = vec![
+            node_jpolicy(vec![
+                eq_cond(key::CN, "a.zpr"),
+                eq_cond(key::ZPR_ADDR, "fd5a:5052::5"),
+            ]),
+            node_jpolicy(vec![
+                eq_cond(key::CN, "a.zpr"),
+                eq_cond(key::ZPR_ADDR, "fd5a:5052::5"),
+            ]),
+        ];
+        assert_eq!(
+            index_node_cns(&jps)
+                .get(&ip("fd5a:5052::5"))
+                .map(String::as_str),
+            Some("a.zpr")
+        );
+    }
+
+    #[test]
+    /// `Policy::node_cn_for_addr` reads the index built at load.
+    fn test_policy_node_cn_for_addr() {
+        let policy = Policy {
+            node_cn_by_addr: index_node_cns(&[node_jpolicy(vec![
+                eq_cond(key::CN, "relay.zpr"),
+                eq_cond(key::ZPR_ADDR, "fd5a:5052::1"),
+            ])]),
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.node_cn_for_addr(&ip("fd5a:5052::1")),
+            Some("relay.zpr")
+        );
+        assert_eq!(policy.node_cn_for_addr(&ip("fd5a:5052::2")), None);
     }
 
     #[test]
