@@ -246,9 +246,12 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // existing links are still allowed, and send out peer messages.
     if !valid_node_addrs.is_empty() {
         info!(target: EVENT, "policy updated vinst={vinst}: revalidating topology ({} nodes)", valid_node_addrs.len());
+        // Topology operation: one TopoOps guard spans the reconciliation and the
+        // revocations it calls for below (TopoOps invariant).
+        let ops = asm.topo_mgr.ops().await;
         let report = asm
             .topo_mgr
-            .revalidate_against_policy(&psnap, &valid_node_addrs, &|| {
+            .revalidate_against_policy(&ops, &psnap, &valid_node_addrs, &|| {
                 asm.policy_mgr.get_current_snapshot()
             })
             .await?;
@@ -269,6 +272,7 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         for (a, b) in &report.links_down {
             let _ = crate::visa_reconciler::revoke_visas_over_link(asm, a, b).await;
         }
+        drop(ops);
 
         // Queue up setTopology messages in parallel.
         let futs = valid_node_addrs.iter().filter_map(|naddr| {
@@ -710,6 +714,33 @@ mod tests {
             None,
             "unreachable service must not leave stale attributes in place"
         );
+    }
+
+    /// A policy update revalidates the topology and revokes visas over links it takes
+    /// down under the topology operation lock (TopoOps), so it cannot interleave with a
+    /// link-state report, disconnect or authentication.
+    #[tokio::test]
+    async fn test_policy_update_waits_for_the_topology_operation_lock() {
+        let (asm, _node_a) = build_sweep_asm(false).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let held = asm.topo_mgr.ops().await;
+                let update = tokio::task::spawn_local({
+                    let asm = asm.clone();
+                    async move { handle_policy_updated(&asm, vinst).await }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(!update.is_finished(), "policy pass must wait for the lock");
+                drop(held);
+                update.await.unwrap().unwrap();
+            })
+            .await;
     }
 
     /// A policy update reconciles the actors behind live visas before it sweeps them.

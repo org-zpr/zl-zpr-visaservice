@@ -1920,7 +1920,10 @@ impl ConnectionControl {
 
         if let Some(actor) = maybe_actor {
             if actor.is_node() {
-                asm.topo_mgr.remove_node(&zpr_addr).await;
+                // Topology operation: the guard spans the removal (TopoOps invariant).
+                let ops = asm.topo_mgr.ops().await;
+                asm.topo_mgr.remove_node(&ops, &zpr_addr).await;
+                drop(ops);
                 if let Some(vss_hndl) = asm.vss_mgr.get_handle(&zpr_addr) {
                     if let Err(e) = vss_hndl.stop().await {
                         error!(target: CC, "failed to stop VSS worker for disconnected node at addr {zpr_addr}: {e}");
@@ -3208,6 +3211,45 @@ mod tests {
             ["hr".to_string()],
             "exactly the user-vending source names the authority"
         );
+    }
+
+    /// Disconnect removes the node from the router under the topology operation lock
+    /// (TopoOps), so it cannot interleave with a link-state report or policy pass.
+    #[tokio::test]
+    async fn disconnect_waits_for_the_topology_operation_lock() {
+        use crate::test_helpers::make_node_actor_defexp;
+
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = Arc::new(make_cc("test-vs"));
+        let node_addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        asm.topo_mgr.add_node(node_addr).unwrap();
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let held = asm.topo_mgr.ops().await;
+                let dc = tokio::task::spawn_local({
+                    let (asm, cc) = (asm.clone(), cc.clone());
+                    async move {
+                        cc.disconnect(asm, node_addr, vsapi::DisconnectReason::Admin)
+                            .await
+                    }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(!dc.is_finished(), "disconnect must wait for the lock");
+                assert!(
+                    asm.topo_mgr.has_node(&node_addr),
+                    "router untouched while held"
+                );
+                drop(held);
+                dc.await.unwrap().unwrap();
+                assert!(!asm.topo_mgr.has_node(&node_addr));
+            })
+            .await;
     }
 
     /// Disconnect purges recorded trusted-service revisions for the actor AND for every

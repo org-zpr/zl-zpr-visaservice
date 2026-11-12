@@ -235,6 +235,9 @@ impl Router {
     /// - If a or b do not exist returns [TopologyError::NodeNotFound]
     /// - If link id already exists then this returns [TopologyError::LinkExists]
     ///
+    /// Test helper: production code adds links through [Self::add_link_with_state] or
+    /// [Self::apply_link_batch] under the topology operation lock.
+    #[cfg(test)]
     pub fn add_link(
         &self,
         zpr_addr_a: IpAddr,

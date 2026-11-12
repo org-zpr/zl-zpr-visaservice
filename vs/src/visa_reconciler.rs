@@ -453,9 +453,13 @@ mod tests {
         let route = asm.topo_mgr.get_best_route(&node_a, &node_b).unwrap();
 
         // The link goes down between route selection and commit.
-        let down =
-            asm.topo_mgr
-                .record_link_states_with_cns(&node_a, None, vec![], &|_: &IpAddr| None);
+        let down = asm.topo_mgr.record_link_states_with_cns(
+            &asm.topo_mgr.ops_now(),
+            &node_a,
+            None,
+            vec![],
+            &|_: &IpAddr| None,
+        );
         assert_eq!(down, vec![(node_a, node_b)]);
         assert!(
             try_create_sweep_visa_on_route(&asm, &node_a, 0, &route)
@@ -520,8 +524,13 @@ mod tests {
 
         // The link goes down; the commit-time check runs and its revocation fails.
         // (Same for a route link that was removed outright: no endpoints needed.)
-        asm.topo_mgr
-            .record_link_states_with_cns(&node_a, None, vec![], &|_: &IpAddr| None);
+        asm.topo_mgr.record_link_states_with_cns(
+            &asm.topo_mgr.ops_now(),
+            &node_a,
+            None,
+            vec![],
+            &|_: &IpAddr| None,
+        );
         db.set_set_ex_fault(FaultMode::Reject);
         assert!(
             asm.visa_mgr

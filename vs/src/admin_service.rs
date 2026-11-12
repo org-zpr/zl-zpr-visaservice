@@ -2735,8 +2735,13 @@ mod tests {
             .add_link(addr_a, addr_b, LinkId("link-ab".into()), vec![], 1)
             .unwrap();
         // A reports an empty snapshot: its link to B is not up.
-        asm.topo_mgr
-            .record_link_states_with_cns(&addr_a, None, vec![], &|_: &IpAddr| None);
+        asm.topo_mgr.record_link_states_with_cns(
+            &asm.topo_mgr.ops_now(),
+            &addr_a,
+            None,
+            vec![],
+            &|_: &IpAddr| None,
+        );
 
         let details = fetch_network(&asm).await;
 

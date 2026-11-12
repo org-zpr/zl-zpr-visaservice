@@ -426,8 +426,14 @@ async fn main() -> std::process::ExitCode {
     };
     // Capture one consistent policy snapshot for the whole restore pass so every edge is
     // validated against the same policy/links view.
+    let ops = asm.topo_mgr.ops().await;
     let psnap = asm.policy_mgr.get_current_snapshot();
-    if let Err(e) = asm.topo_mgr.restore_from_state(&psnap, &node_addrs).await {
+    let restored = asm
+        .topo_mgr
+        .restore_from_state(&ops, &psnap, &node_addrs)
+        .await;
+    drop(ops);
+    if let Err(e) = restored {
         error!(target: MAIN, "failed to restore topology state: {}", e);
         return std::process::ExitCode::FAILURE;
     }
@@ -692,7 +698,10 @@ async fn teardown_culled_nodes(asm: &Assembly, culled: &[crate::actor_mgr::Culle
         if let Err(e) = asm.visa_mgr.clear_node_state(&node.node_addr).await {
             error!(target: MAIN, "failed to clear visa state for culled node {}: {e}", node.node_addr);
         }
-        asm.topo_mgr.remove_node(&node.node_addr).await;
+        {
+            let ops = asm.topo_mgr.ops().await;
+            asm.topo_mgr.remove_node(&ops, &node.node_addr).await;
+        }
         match asm.actor_mgr.finish_cull(&node.node_addr).await {
             Ok(()) => {
                 if asm.net_mgr.is_managed_address(&node.node_addr) {
