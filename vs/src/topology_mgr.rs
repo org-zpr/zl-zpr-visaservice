@@ -153,9 +153,22 @@ impl TopologyMgr {
             .edge_usable(a, a_cn.as_deref(), b, b_cn.as_deref())
     }
 
-    /// True if every link of a route still exists and is up. See [Router::links_up].
-    pub fn route_links_up(&self, links: &[LinkId]) -> bool {
-        self.router.links_up(links)
+    /// `None` if every link of a route still exists and is up (see [Router::links_up]).
+    /// Otherwise the endpoints of the route's links that are present but down, so a
+    /// failed revocation can be retried per link. A route link missing from the
+    /// router entirely also makes the route stale; it contributes no endpoints.
+    pub fn route_down_links(&self, links: &[LinkId]) -> Option<Vec<(IpAddr, IpAddr)>> {
+        if self.router.links_up(links) {
+            return None;
+        }
+        Some(
+            self.router
+                .link_snapshot()
+                .into_iter()
+                .filter(|l| !l.up && links.contains(&l.id))
+                .map(|l| (l.a, l.b))
+                .collect(),
+        )
     }
 
     /// The links whose visas must be revoked after a report from `node`: the ones that

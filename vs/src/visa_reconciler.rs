@@ -485,4 +485,42 @@ mod tests {
             vec![id]
         );
     }
+
+    /// A commit-time revocation whose state write fails is kept for retry on the
+    /// downed link, and the issuance fails rather than succeeding.
+    #[tokio::test]
+    async fn test_commit_time_revocation_failure_is_retained_for_retry() {
+        use crate::db::FaultMode;
+        use crate::test_helpers::{build_sweep_asm_with_db, create_routed_sweep_visa};
+        let (asm, node_a, db) = build_sweep_asm_with_db(true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let route = asm.topo_mgr.get_best_route(&node_a, &node_b).unwrap();
+        let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
+
+        // The link goes down; the commit-time check runs and its revocation fails.
+        asm.topo_mgr
+            .record_link_states(&node_a, vec![], &|_: &IpAddr| None);
+        db.set_set_ex_fault(FaultMode::Reject);
+        assert!(
+            asm.visa_mgr
+                .revoke_if_route_down(&asm, id, &route.links)
+                .await
+                .is_err(),
+            "a stale visa that could not be revoked must not be issued"
+        );
+        db.set_set_ex_fault(FaultMode::None);
+        assert_eq!(
+            asm.topo_mgr.links_to_revoke(&node_a, vec![]),
+            vec![(node_a, node_b)],
+            "the downed link is kept for retry"
+        );
+
+        // A route that is still up is left alone.
+        assert!(
+            asm.visa_mgr
+                .revoke_if_route_down(&asm, id, &[])
+                .await
+                .is_ok()
+        );
+    }
 }

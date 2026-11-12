@@ -21,7 +21,7 @@ use crate::visareq_worker::{VisaDecision, request_visa_wait_response};
 
 use libeval::eval_result::{Direction, Hit};
 use libeval::policy::Policy;
-use libeval::route::{NodeId, Route};
+use libeval::route::{LinkId, NodeId, Route};
 use zpr::vsapi_types::vsapi_ip_number as ip_proto;
 use zpr::vsapi_types::{
     CommFlag, DockPep, DockPepType, EndpointT, FwdPep, FwdPepStyle, IcmpPep, KeySet, PacketDesc,
@@ -531,19 +531,39 @@ impl VisaMgr {
             )
             .await?;
 
-        // A link on the route may have gone down after the route was chosen and before
-        // the visa was stored (zl-zipline#224). The link-down revocation pass lists the
-        // visas that were stored when it ran, so it can miss this one. Check now that
-        // the visa is committed: if the link went down before this check, the check
-        // catches it; if it goes down after, the revocation pass finds the visa stored.
-        if !asm.topo_mgr.route_links_up(&route.links) {
-            let visa_id = vwmd.visa.issuer_id;
-            warn!(target: VISA, "visa {visa_id}: a link on its route went down while it was issued; revoking it");
-            if let Err(e) = self.mark_visa_revoked(visa_id).await {
-                warn!(target: VISA, "visa {visa_id}: failed to revoke after its route went down: {e}");
-            }
-        }
+        self.revoke_if_route_down(asm, vwmd.visa.issuer_id, &route.links)
+            .await?;
         Ok(vwmd)
+    }
+
+    /// Commit-time check for a just-stored visa (zl-zipline#224). A link on its route
+    /// may have gone down after the route was chosen and before the visa was stored;
+    /// the link-down revocation pass lists the visas stored when it ran, so it can miss
+    /// this one. Called once the visa is committed: if the link went down before this
+    /// check, the check catches it; if it goes down after, the pass finds the visa.
+    ///
+    /// A stale visa is marked `PendingRevoke`. If that write fails, the downed links are
+    /// recorded for retry (`TopologyMgr::note_revocation`, retried on the next report
+    /// from either end) and an error is returned so the visa is not handed out.
+    pub(crate) async fn revoke_if_route_down(
+        &self,
+        asm: &Assembly,
+        visa_id: u64,
+        links: &[LinkId],
+    ) -> Result<(), ServiceError> {
+        let Some(down) = asm.topo_mgr.route_down_links(links) else {
+            return Ok(());
+        };
+        warn!(target: VISA, "visa {visa_id}: a link on its route went down while it was issued; revoking it");
+        if let Err(e) = self.mark_visa_revoked(visa_id).await {
+            for (a, b) in &down {
+                asm.topo_mgr.note_revocation(a, b, false);
+            }
+            return Err(ServiceError::Internal(format!(
+                "visa {visa_id}: its route went down while it was issued and revoking it failed: {e}"
+            )));
+        }
+        Ok(())
     }
 
     /// As [VisaMgr::create_visa], but with the node path supplied rather than derived from
