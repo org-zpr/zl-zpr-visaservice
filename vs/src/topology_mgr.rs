@@ -558,8 +558,6 @@ impl TopologyMgr {
             persisted: bool,
             desc: LinkDescription,
             action: Action,
-            /// Whether the router link was up before this reconciliation.
-            was_up: bool,
         }
         struct Removal {
             a: IpAddr,
@@ -609,7 +607,6 @@ impl TopologyMgr {
                         persisted,
                         desc,
                         action,
-                        was_up: router_link.as_ref().is_some_and(|rl| rl.up),
                     });
                 }
             }
@@ -675,10 +672,20 @@ impl TopologyMgr {
                 cost: e.desc.cost,
                 up: Self::usable_in(&table, &e.a, &e.b, &flag_cn_of),
             };
-            if e.was_up && !spec.up {
+            // The router flag as it is now. Flags only change under the table lock,
+            // which is held, so this cannot move before the batch is applied.
+            let up_now = self.router.link_between(&e.a, &e.b).is_some_and(|l| l.up);
+            if up_now && !spec.up {
                 report.links_down.push((e.a, e.b));
             }
             match e.action {
+                // Keep was decided with the pass snapshot; under the current policy the
+                // flag may still differ. Rebuild such a link with the right flag.
+                Action::Keep if up_now != spec.up => {
+                    removal_ids.push(spec.id.clone());
+                    additions.push(spec);
+                    report.links_updated += 1;
+                }
                 Action::Keep => {}
                 Action::Fresh => {
                     additions.push(spec);
@@ -1815,6 +1822,61 @@ mod tests {
         assert!(
             !topo.router.link_between(&a, &b).unwrap().up,
             "flags come from the current policy, not the stale pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revalidation_rechecks_kept_links_against_the_current_policy() {
+        // The pass snapshot says Keep (its CNs still match A's report), but the current
+        // policy renamed B: the kept link must go down and be reported for revocation.
+        use crate::test_helpers::policy_with_peerings_and_node_cns;
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let old = make_policy_mgr_from_container(
+            db.clone(),
+            policy_with_peerings_and_node_cns(
+                &[peering(a, b, "link-ab", vec![])],
+                &[(a, "a.zpr"), (b, "b.zpr")],
+            ),
+        )
+        .await;
+        let new = make_policy_mgr_from_container(
+            db.clone(),
+            policy_with_peerings_and_node_cns(
+                &[peering(a, b, "link-ab", vec![])],
+                &[(a, "a.zpr"), (b, "b2.zpr")],
+            ),
+        )
+        .await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("link-ab".into()), vec![], 1)
+            .unwrap();
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+
+        // Under the old policy A's report matches B: the link is up.
+        topo.record_link_states(&a, vec![report("b.zpr", LinkState::Up)], &|| {
+            old.get_current_snapshot()
+        });
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+
+        // A pass with the old snapshot runs after the new policy became current.
+        let report = topo
+            .revalidate_against_policy(&old.get_current_snapshot(), &[a, b], &|| {
+                new.get_current_snapshot()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !topo.router.link_between(&a, &b).unwrap().up,
+            "the kept link follows the current policy"
+        );
+        assert_eq!(
+            report.links_down.len(),
+            1,
+            "and its down transition is reported"
         );
     }
 }
