@@ -22,6 +22,7 @@ use zpr::write_to::WriteTo;
 
 use crate::assembly::Assembly;
 use crate::config;
+use crate::connection_control::ensure_session_unchanged;
 use crate::counters::CounterType;
 use crate::error::ServiceError;
 use crate::event_mgr::VsEvent;
@@ -342,6 +343,29 @@ impl VSHandleImpl {
             }
         }
     }
+}
+
+/// Mint a login nonce for the node at `node_addr` whose handle was minted under
+/// VS-API session `session`. Under the self-renewal lock -- which a node's
+/// authenticate holds while it persists a new session -- the stored session is
+/// re-checked first, so a stale handle that passed the liveness gate just before
+/// a reconnect cannot mint, and cannot sweep away the new session's nonces
+/// (#63 review). A mismatch is [MintError::StaleSession].
+async fn mint_login_nonce_for_handle(
+    asm: &Assembly,
+    node_addr: IpAddr,
+    session: &str,
+) -> Result<(String, SystemTime), MintError> {
+    let _guard = asm.cc.self_reauth_lock.lock().await;
+    if ensure_session_unchanged(asm, &node_addr, Some(session))
+        .await
+        .is_err()
+    {
+        return Err(MintError::StaleSession);
+    }
+    asm.cc
+        .login_nonces
+        .mint(node_addr, session, SystemTime::now())
 }
 
 /// Persist an authenticated node (its fresh `zpr.session` included) while
@@ -1924,12 +1948,7 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         };
         self.update_last_seen_time(&node_addr).await;
 
-        match self
-            .asm
-            .cc
-            .login_nonces
-            .mint(node_addr, &session, SystemTime::now())
-        {
+        match mint_login_nonce_for_handle(&self.asm, node_addr, &session).await {
             Ok((nonce, expires)) => {
                 let expires_at = expires
                     .duration_since(UNIX_EPOCH)
@@ -1945,6 +1964,14 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
                     &mut results.get().init_res().init_error(),
                     vsapi::ErrorCode::QuotaExceeded,
                     "too many outstanding login nonces",
+                );
+            }
+            Err(MintError::StaleSession) => {
+                warn!(target: API, "get_login_nonce from {:?}: the node re-authenticated; stale handle refused", self.node.get_cn());
+                write_error(
+                    &mut results.get().init_res().init_error(),
+                    vsapi::ErrorCode::AuthRequired,
+                    "node is no longer connected; re-authenticate",
                 );
             }
             Err(MintError::Random(e)) => {
@@ -3346,6 +3373,42 @@ mod tests {
             task.await
                 .unwrap()
                 .expect("the persist completes once the lock is free");
+        }
+
+        /// #63 round 4 (Codex P2): a handle whose session is no longer the
+        /// stored one (the node reconnected after its liveness check) mints
+        /// nothing and leaves the new session's nonces alone.
+        #[tokio::test]
+        async fn test_stale_handle_mint_refused_and_keeps_new_nonces() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let mut node = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
+            VSHandleImpl::stamp_new_session(&mut node);
+            asm.actor_mgr
+                .add_node(&node, false, &Default::default())
+                .await
+                .unwrap();
+            let addr: std::net::IpAddr = NODE.parse().unwrap();
+            let current = node
+                .get_attribute(key::SESSION)
+                .unwrap()
+                .get_single_value()
+                .unwrap()
+                .to_string();
+            let (fresh, _) = mint_login_nonce_for_handle(&asm, addr, &current)
+                .await
+                .expect("the current session mints");
+            assert!(
+                mint_login_nonce_for_handle(&asm, addr, "an-older-session")
+                    .await
+                    .is_err(),
+                "a stale session must not mint"
+            );
+            assert!(
+                asm.cc
+                    .login_nonces
+                    .consume(&fresh, addr, &current, SystemTime::now()),
+                "the current session's nonce must survive the stale mint"
+            );
         }
 
         /// Test 19: a dead handle (node disconnected) gets `authRequired`.

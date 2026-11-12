@@ -43,6 +43,9 @@ pub(crate) enum MintError {
     QuotaExceeded,
     /// The OS random source failed; no nonce was issued.
     Random(String),
+    /// The calling handle's session is no longer the node's current one (set
+    /// by the `getLoginNonce` handler, never by the store itself).
+    StaleSession,
 }
 
 /// One outstanding nonce: whom it was issued to and until when it is usable.

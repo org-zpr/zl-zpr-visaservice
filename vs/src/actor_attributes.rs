@@ -18,6 +18,7 @@ use libeval::policy::Policy;
 use tracing::{debug, warn};
 
 use crate::assembly::Assembly;
+use crate::connection_control::ATTR_KEY_VS_IDENT;
 use crate::error::ServiceError;
 use crate::logging::targets::VREQ;
 use crate::trusted_services::{
@@ -87,9 +88,7 @@ pub(crate) async fn refresh_and_persist_actor(
     if outcome.changed {
         // The attributes moved, so the services they grant may have too.
         restamp_services(&policy, actor);
-        asm.actor_mgr
-            .update_actor(actor, &asm.policy_service_names())
-            .await?;
+        persist_refreshed_actor(asm, actor).await?;
     }
 
     // No ZPR address means refresh_expired_attributes did nothing at all (an actor
@@ -108,6 +107,49 @@ pub(crate) async fn refresh_and_persist_actor(
         )));
     }
     Ok(outcome.changed)
+}
+
+/// Write back an actor whose attributes were just refreshed.
+///
+/// A node's own actor can be re-authorized (a Zode login or logout through
+/// `reauthorize`, or a re-authentication) while a refresh holds a copy loaded
+/// earlier; writing that copy back would undo the re-authorization -- e.g.
+/// restore the `user.*` attributes a logout removed (#63 review). So for a node
+/// the write takes the self-renewal lock (`ConnectionControl::self_reauth_lock`,
+/// held by those paths from load to persist) and is refused when the stored
+/// actor's VS identity token (`zpr.vs.bootstrap.ident`, re-minted by every
+/// reauthorize and authenticate) differs from the copy's. The refusal is
+/// `AttributesIndeterminate`, which callers treat as a denial; the next request
+/// reloads the actor.
+///
+/// ponytail: nodes only, one global lock; adapters are not renewed by
+/// themselves, so their refresh race with reauthorize is unchanged.
+pub(crate) async fn persist_refreshed_actor(
+    asm: &Assembly,
+    actor: &Actor,
+) -> Result<(), ServiceError> {
+    let _guard = if actor.is_node() {
+        Some(asm.cc.self_reauth_lock.lock().await)
+    } else {
+        None
+    };
+    if let (true, Some(addr)) = (actor.is_node(), actor.get_zpr_addr()) {
+        let ident_of = |a: &Actor| {
+            a.get_attribute(ATTR_KEY_VS_IDENT)
+                .and_then(|i| i.get_single_value().ok())
+                .map(|s| s.to_string())
+        };
+        let stored = asm.actor_mgr.get_actor_by_zpr_addr(addr).await?;
+        if stored.as_ref().map(ident_of) != Some(ident_of(actor)) {
+            warn!(target: VREQ, "refresh of node {addr} discarded: it was re-authorized since the copy was loaded");
+            return Err(ServiceError::AttributesIndeterminate(format!(
+                "node {addr} was re-authorized during an attribute refresh"
+            )));
+        }
+    }
+    asm.actor_mgr
+        .update_actor(actor, &asm.policy_service_names())
+        .await
 }
 
 /// Recompute the services the actor provides ([key::SERVICES]) from its current

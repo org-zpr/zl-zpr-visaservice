@@ -52,7 +52,7 @@ const CLASS_DEVICE: &str = "device";
 const CLASS_USER: &str = "user";
 const CLASS_SERVICE: &str = "service";
 
-const ATTR_KEY_VS_IDENT: &str = "zpr.vs.bootstrap.ident";
+pub(crate) const ATTR_KEY_VS_IDENT: &str = "zpr.vs.bootstrap.ident";
 
 /// Expiration window for every bootstrap (RSA-verified) `device.zpr.authority`
 /// stamp (zipline#119): bootstrap authentication does not expire, so every
@@ -142,7 +142,7 @@ impl OidcSessionRecord {
 /// renewal would write the old session back over the new one, reviving the old
 /// handle and cutting off the new. Same generic `AuthError` as every other
 /// credential failure; the node simply retries on its new session.
-async fn ensure_session_unchanged(
+pub(crate) async fn ensure_session_unchanged(
     asm: &Assembly,
     zpr_addr: &IpAddr,
     expected: Option<&str>,
@@ -8635,6 +8635,51 @@ mod tests {
             has_user_attrs(&stored),
             "the new session's login must survive"
         );
+    }
+
+    /// Review fix (#63 round 4, Codex P1): an attribute refresh of a node
+    /// copy loaded before a logout must not write the pre-logout attributes
+    /// back over the logout.
+    #[tokio::test]
+    async fn test_stale_refresh_cannot_undo_logout() {
+        let cn = "zode-x.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let stale = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(has_user_attrs(&stale));
+        zode_logout(&asm, &cc, addr, &privkey, cn).await;
+
+        let result = crate::actor_attributes::persist_refreshed_actor(&asm, &stale).await;
+        assert!(
+            matches!(result, Err(ServiceError::AttributesIndeterminate(_))),
+            "a stale refresh must be refused, got {result:?}"
+        );
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !has_user_attrs(&stored),
+            "the logout must survive the stale refresh"
+        );
+
+        // A refresh of the current copy still persists.
+        let current = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::actor_attributes::persist_refreshed_actor(&asm, &current)
+            .await
+            .expect("a refresh of the current copy persists");
     }
 
     /// The namespace-change decision table (vs.capnp "Re-Authorization").
