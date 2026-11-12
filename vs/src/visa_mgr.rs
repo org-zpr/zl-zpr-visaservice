@@ -537,11 +537,20 @@ impl VisaMgr {
             )
             .await?;
 
+        // The path was derived from the live router after the route was chosen, so it
+        // must also still end where the destination is docked now.
+        let egress = match &vwmd.metadata.path {
+            Some(_) => {
+                crate::visa_policy::docking_node_for_addr(asm, &pdesc.five_tuple.dest_addr).await
+            }
+            None => None,
+        };
         self.revoke_if_route_down(
             asm,
             vwmd.visa.issuer_id,
             &route.links,
             vwmd.metadata.path.as_deref(),
+            egress,
         )
         .await?;
         Ok(vwmd)
@@ -550,7 +559,8 @@ impl VisaMgr {
     /// Commit-time check for a just-stored visa (zl-zipline#224). A link on its route
     /// may have gone down, or its id moved to another edge, after the route was chosen
     /// and before the visa was stored; `path` is the visa's recorded node path, against
-    /// which each route link's endpoints are checked;
+    /// which each route link's endpoints are checked, and `egress` the destination's
+    /// docking node, at which that path must end;
     /// the link-down revocation pass lists the visas stored when it ran, so it can miss
     /// this one. Called once the visa is committed: if the link went down before this
     /// check, the check catches it; if it goes down after, the pass finds the visa.
@@ -566,8 +576,18 @@ impl VisaMgr {
         visa_id: u64,
         links: &[LinkId],
         path: Option<&[IpAddr]>,
+        egress: Option<IpAddr>,
     ) -> Result<(), ServiceError> {
-        if asm.topo_mgr.route_still_valid(links, path) {
+        // With a recorded path, it must end at the destination's docking node
+        // (`egress`, looked up afresh): the path itself was derived from the mutable
+        // router after the route was chosen, so a link id moved in between would
+        // otherwise validate against a path to the wrong node.
+        let ends_ok = match (path, egress) {
+            (Some(p), Some(e)) => p.last() == Some(&e),
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if ends_ok && asm.topo_mgr.route_still_valid(links, path) {
             return Ok(());
         }
         warn!(target: VISA, "visa {visa_id}: a link on its route went down while it was issued; revoking it");

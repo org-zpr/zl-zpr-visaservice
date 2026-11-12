@@ -525,7 +525,7 @@ mod tests {
         db.set_set_ex_fault(FaultMode::Reject);
         assert!(
             asm.visa_mgr
-                .revoke_if_route_down(&asm, id, &route.links, None)
+                .revoke_if_route_down(&asm, id, &route.links, None, None)
                 .await
                 .is_err(),
             "a stale visa that could not be revoked must not be issued"
@@ -561,9 +561,45 @@ mod tests {
         // A route that is still up is left alone.
         assert!(
             asm.visa_mgr
-                .revoke_if_route_down(&asm, id, &[], None)
+                .revoke_if_route_down(&asm, id, &[], None, None)
                 .await
                 .is_ok()
+        );
+    }
+
+    /// A path that no longer ends at the destination's docking node is stale even if
+    /// every route link is up and joins the path's hops (a link id moved before the
+    /// path was derived from the router): the visa is revoked and not issued.
+    #[tokio::test]
+    async fn test_path_not_ending_at_the_egress_node_is_rejected() {
+        use crate::test_helpers::create_routed_sweep_visa;
+        let (asm, node_a) = build_sweep_asm(true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let elsewhere: IpAddr = "fd5a:5052:3000::9".parse().unwrap();
+        let route = asm.topo_mgr.get_best_route(&node_a, &node_b).unwrap();
+        let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
+        let path = [node_a, node_b];
+
+        assert!(
+            asm.visa_mgr
+                .revoke_if_route_down(&asm, id, &route.links, Some(&path), Some(node_b))
+                .await
+                .is_ok(),
+            "path ends at the egress node: valid"
+        );
+        assert!(
+            asm.visa_mgr
+                .revoke_if_route_down(&asm, id, &route.links, Some(&path), Some(elsewhere))
+                .await
+                .is_err(),
+            "path ends somewhere else: stale"
+        );
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap(),
+            vec![id]
         );
     }
 }
