@@ -159,6 +159,30 @@ pub struct PolicyMgr {
     repo: db::PolicyRepo,
     /// Serializes concurrent policy updates; reads remain lock-free via ArcSwap.
     update_lock: tokio::sync::Mutex<()>,
+    /// The node commit lock (zl-zipline#232, #63 review): every writer of a
+    /// node's own actor -- `reauthorize` of its own actor, the node
+    /// `authenticate` persist, `open`, the login-nonce mint, a node's
+    /// attribute-refresh write and a disconnect's actor removal -- holds it
+    /// from the read its write is based on through the write, and calls
+    /// `connection_control::recheck_before_commit` just before committing.
+    /// Policy publication takes it too, so an install is serialized with that
+    /// recheck and write: it lands either before the recheck (which then sees
+    /// the new generation) or after the write (which the install's own
+    /// reconciliation then sees). The cost is that an install waits behind an
+    /// in-flight login or logout, including its attribute fetch
+    /// (org-zpr/zl-zipline#247).
+    ///
+    /// **Lock order (with #224's topology operation lock, [crate::topology_mgr::TopoOps]):**
+    /// `update_lock` -> topology lock -> `node_commit_lock`. A path that holds
+    /// the topology guard may take this lock (policy publication, the node
+    /// `authenticate` persist, `open`, a disconnect's actor removal, a node's
+    /// refresh commit); a path that holds this lock must never wait for the
+    /// topology guard -- so `reauthorize`, which holds it across its attribute
+    /// fetch, releases it before any disconnect -- otherwise each could wait for
+    /// the other forever.
+    /// ponytail: one global lock; per-address locks if node commits become
+    /// frequent (today: Zode logins/logouts, node authentications, refreshes).
+    pub(crate) node_commit_lock: tokio::sync::Mutex<()>,
     /// The topology operation lock ([crate::topology_mgr::TopoOps]), bound once the
     /// Assembly exists. An install commits under it, so the current policy cannot
     /// change while a topology operation that read it is still running.
@@ -249,10 +273,18 @@ impl PolicySnapshot {
     /// names a file or attribute-service store, which no OIDC declaration matches, so no user
     /// blob is demanded — or accepted — for it.
     pub fn declares_oidc_service(&self, id: &str) -> bool {
+        self.oidc_service_by_id(id).is_some()
+    }
+
+    /// The OIDC trusted service with id `id` in this snapshot, if its policy
+    /// declares one. A node's logout (zl-zipline#232) uses it to forget the
+    /// session anchors the dropped `user.zpr.authority` named.
+    pub fn oidc_service_by_id(&self, id: &str) -> Option<Arc<OidcTrustedService>> {
         self.0
             .oidc_services
             .iter()
-            .any(|service| service.id() == id)
+            .find(|service| service.id() == id)
+            .cloned()
     }
 
     /// Build a snapshot directly from a policy and its stores, for unit tests
@@ -612,6 +644,7 @@ impl PolicyMgr {
             state: ArcSwap::from_pointee(state),
             repo,
             update_lock: tokio::sync::Mutex::new(()),
+            node_commit_lock: tokio::sync::Mutex::new(()),
             topology_lock: std::sync::OnceLock::new(),
             resolver,
             ts_mgr,
@@ -685,6 +718,11 @@ impl PolicyMgr {
         };
         self.repo.set_current_policy(&loaded, false).await?;
 
+        // Publish under the node commit lock too: an install never lands between a
+        // node commit's recheck and its write (#63 review, zl-zipline#247). Lock
+        // order: update_lock -> topology lock -> node_commit_lock (see the
+        // `node_commit_lock` field).
+        let _commit = self.node_commit_lock.lock().await;
         self.publish(candidate.commit(Some(&previous), self.oidc_refresh));
         Ok(vinst)
     }
@@ -700,6 +738,33 @@ impl PolicyMgr {
     /// hold across awaits.
     pub fn get_current_snapshot(&self) -> PolicySnapshot {
         PolicySnapshot(self.state.load_full())
+    }
+
+    /// A copy of the current snapshot with one more trusted service appended,
+    /// installed as current -- same policy, generation and OIDC stores.
+    /// Test-only: lets a test hook into enrichment on a live path.
+    #[cfg(test)]
+    pub(crate) fn add_trusted_service_for_tests(&self, svc: Arc<dyn TrustedServiceInterface>) {
+        let cur = self.state.load_full();
+        let mut trusted_services = cur.trusted_services.clone();
+        trusted_services.push(svc);
+        self.state.store(Arc::new(PolicyState {
+            policy: cur.policy.clone(),
+            container: cur.container.clone(),
+            resolved_peers_by_node: cur.resolved_peers_by_node.clone(),
+            trusted_services,
+            oidc_services: cur.oidc_services.clone(),
+            ts_definitions: cur.ts_definitions.clone(),
+            oidc_refreshers: std::sync::Mutex::new(HashMap::new()),
+        }));
+    }
+
+    /// Make `snapshot` the current one, bypassing a policy install. Test-only:
+    /// lets a test run a live path against a snapshot with chosen trusted
+    /// services (e.g. one that fails).
+    #[cfg(test)]
+    pub(crate) fn set_current_snapshot_for_tests(&self, snapshot: &PolicySnapshot) {
+        self.state.store(snapshot.0.clone());
     }
 
     /// Bind the topology operation lock ([crate::topology_mgr::TopologyMgr::ops_lock]);

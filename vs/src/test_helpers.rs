@@ -712,6 +712,13 @@ pub async fn build_sweep_asm_with_db(
 ) -> (Arc<Assembly>, IpAddr, Arc<crate::db::FakeDb>) {
     let (asm, event_rx, db) = crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
     std::mem::forget(event_rx);
+    let (asm, node_a) = build_sweep_asm_on(asm, with_link).await;
+    (asm, node_a, db)
+}
+
+/// As [build_sweep_asm], on a caller-built assembly (e.g. one whose fake DB and
+/// event queue the test holds).
+pub async fn build_sweep_asm_on(asm: Assembly, with_link: bool) -> (Arc<Assembly>, IpAddr) {
     let node_a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
     let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
     asm.actor_mgr
@@ -753,7 +760,7 @@ pub async fn build_sweep_asm_with_db(
         )
         .await
         .unwrap();
-    (Arc::new(asm), node_a, db)
+    (Arc::new(asm), node_a)
 }
 
 /// Create a single-node visa held (PendingInstall) by `req` for the given

@@ -35,6 +35,7 @@ pub struct FakeDb {
     set_ex_fault: std::sync::Mutex<FaultMode>,
     del_fault: std::sync::Mutex<FaultMode>,
     hset_fault: std::sync::Mutex<FaultMode>,
+    exists_fault: std::sync::Mutex<FaultMode>,
 }
 
 #[allow(dead_code)]
@@ -60,6 +61,7 @@ impl FakeDb {
             set_ex_fault: std::sync::Mutex::new(FaultMode::None),
             del_fault: std::sync::Mutex::new(FaultMode::None),
             hset_fault: std::sync::Mutex::new(FaultMode::None),
+            exists_fault: std::sync::Mutex::new(FaultMode::None),
         }
     }
 
@@ -73,6 +75,13 @@ impl FakeDb {
     #[allow(dead_code)]
     pub fn set_del_fault(&self, mode: FaultMode) {
         *self.del_fault.lock().unwrap() = mode;
+    }
+
+    /// Inject a fault on the next (and subsequent) `exists` calls: a read
+    /// fault (any mode other than `None` fails the read).
+    #[allow(dead_code)]
+    pub fn set_exists_fault(&self, mode: FaultMode) {
+        *self.exists_fault.lock().unwrap() = mode;
     }
 
     /// Inject a fault mode on the next (and subsequent) `hset` calls.
@@ -218,6 +227,9 @@ impl DbConnection for FakeDb {
     /// True if the key exists (and not expired).  As a side effect this removes the
     /// key if it is expired before returning false.
     async fn exists(&self, key: &str) -> DbResult<bool> {
+        if *self.exists_fault.lock().unwrap() != FaultMode::None {
+            return Err(injected_fault_err());
+        }
         let _rlock = self.lock.read().await;
         self.exists_with_lock(key).await
     }

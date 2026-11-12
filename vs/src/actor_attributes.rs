@@ -131,7 +131,17 @@ pub(crate) async fn refresh_and_persist_actor(
 /// a different one is (the address was recycled while the refresh was in flight: its
 /// attributes were queried with the old actor's identities). A reconnect of the same
 /// actor (same identity, CN and role; a new session) is merged into.
-async fn commit_refresh(
+///
+/// For a node, the commit also takes the node commit lock
+/// (`PolicyMgr::node_commit_lock`, inside the topology guard -- lock order:
+/// topology lock, then node commit lock), which a node's `reauthorize` of its
+/// own actor holds from its read through its write (#63 review). Without it a
+/// refresh could read the pre-login actor, a login commit, and the refresh then
+/// write its merge over the login. A node re-authorized since `read_before` was
+/// read (a login, logout or renewal) fails [same_actor] -- its identity values
+/// begin with the re-minted VS identity token -- so nothing is written, and a
+/// refreshed `user.*` attribute of a pre-logout copy is never put back.
+pub(crate) async fn commit_refresh(
     asm: &Assembly,
     read_before: &Actor,
     refreshed: &mut Actor,
@@ -140,6 +150,11 @@ async fn commit_refresh(
         return Ok(false);
     };
     let ops = asm.topo_mgr.ops().await;
+    let node_commit = if read_before.is_node() {
+        Some(asm.policy_mgr.node_commit_lock.lock().await)
+    } else {
+        None
+    };
     let Some(mut stored) = asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await? else {
         return Ok(false);
     };
@@ -152,6 +167,7 @@ async fn commit_refresh(
     asm.actor_mgr
         .update_actor(&stored, &asm.policy_service_names())
         .await?;
+    drop(node_commit);
     drop(ops);
     *refreshed = stored;
     Ok(true)

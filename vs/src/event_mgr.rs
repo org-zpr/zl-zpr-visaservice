@@ -55,6 +55,13 @@ impl EventMgr {
         EventMgr { event_queue }
     }
 
+    /// Non-blocking enqueue; false when the queue is full. Test-only: lets a
+    /// test fill the bounded queue.
+    #[cfg(test)]
+    pub fn try_record_event_for_tests(&self, event: VsEvent) -> bool {
+        self.event_queue.try_send(event).is_ok()
+    }
+
     pub async fn record_event(&self, event: VsEvent) -> Result<(), ServiceError> {
         if let Err(e) = self.event_queue.send(event).await {
             error!(target: EVENT, "failed to send to event-queue: {}", e);
@@ -470,7 +477,26 @@ async fn handle_trusted_service_change(asm: &Arc<Assembly>) {
         "trusted service changed: actors refreshed={refreshed} unresolved={unresolved} failed={failed}"
     );
 
-    revalidate_visas(asm, &psnap, SweepReason::AttributeChange).await;
+    let failures = revalidate_visas(asm, &psnap, SweepReason::AttributeChange).await;
+    if failures > 0 {
+        // A verdict that could not be recorded must not be dropped -- after a
+        // Zode logout it is a visa that should be revoked (#63 review). Run
+        // the whole reconcile again later; it repeats while the sweep fails.
+        // ponytail: fixed interval; add backoff if long store outages make the
+        // retries noisy.
+        warn!(target: EVENT, "attribute-change sweep left {failures} visa(s) undecided; retrying in {:?}", crate::config::RECONCILE_RETRY);
+        let asm = asm.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(crate::config::RECONCILE_RETRY).await;
+            if let Err(e) = asm
+                .event_mgr
+                .record_event(VsEvent::TrustedServiceChange)
+                .await
+            {
+                error!(target: EVENT, "failed to re-queue the attribute-change reconcile: {e}");
+            }
+        });
+    }
 }
 
 /// The distinct actor addresses referenced by a live visa (both ends of every visa's
@@ -561,6 +587,35 @@ mod tests {
     use zpr::policy::v1 as capnp_policy;
     use zpr::policy_types::{JoinPolicy, PFlags, Scope, Service, ServiceType};
     use zpr::write_to::WriteTo;
+
+    /// #63 review (Copilot): a reconcile whose sweep could not record every
+    /// verdict re-queues itself after `RECONCILE_RETRY` instead of dropping
+    /// the work.
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_reconcile_sweep_is_retried() {
+        let (asm, mut event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let (asm, node_a) = crate::test_helpers::build_sweep_asm_on(asm, false).await;
+        create_sweep_visa(&asm, &node_a, 0).await; // the empty policy denies it
+        while event_rx.try_recv().is_ok() {}
+        db.set_set_ex_fault(crate::db::FaultMode::ApplyThenError);
+
+        handle_trusted_service_change(&asm).await;
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the retry waits RECONCILE_RETRY"
+        );
+        // Let the spawned retry task start its sleep before the clock moves.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(crate::config::RECONCILE_RETRY + Duration::from_secs(1)).await;
+        let evt = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("the retry must be queued")
+            .unwrap();
+        assert!(matches!(evt, VsEvent::TrustedServiceChange));
+    }
 
     /// Build a policy container whose single join policy marks connections as
     /// nodes. `provides` is the set of services a node must offer to stay valid

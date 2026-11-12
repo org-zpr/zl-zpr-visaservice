@@ -274,6 +274,13 @@ impl OidcTrustedService {
         );
     }
 
+    /// Forget the anchors of one actor session. A node's logout
+    /// (zl-zipline#232) drops its user namespace; without this a stale record
+    /// would outlive the login it described until its expiry swept it.
+    pub(crate) fn forget_session(&self, session_id: &str) {
+        self.sessions.remove(session_id);
+    }
+
     /// The recorded dual-clock anchors of one live actor session, or `None`
     /// when this store never recorded that session (or it was swept). zipline#43
     /// (zipline#43) reads these on re-admission to bind a refreshed token to
