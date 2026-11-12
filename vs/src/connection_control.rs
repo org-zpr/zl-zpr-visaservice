@@ -1550,35 +1550,6 @@ impl ConnectionControl {
             renewed.set_services(psnap.policy().join_services_for_role(&claims, true));
         }
 
-        // Re-mint the VS identity token with a fresh expiration (PR #19
-        // review): the connect-time token rode through as an authenticated
-        // claim, but keeping it would cap the renewed actor at the ORIGINAL
-        // connect's window — `get_authentication_expiration()` takes the
-        // minimum across identity attributes, so after
-        // `DEFAULT_AUTH_EXPIRATION` an OIDC-only actor could renew its user
-        // authority yet still be denied new visas. Same minting rules as
-        // connect; re-registered as the first identity key, exactly as
-        // connect does.
-        if renewed.get_attribute(ATTR_KEY_VS_IDENT).is_some() {
-            // The token follows the renewed actor's authority expiries
-            // (zipline#119) — same minting rule as connect.
-            let ident_expires = vs_ident_expiration(&renewed);
-            let jwt_lifetime = ident_expires
-                .duration_since(SystemTime::now())
-                .unwrap_or(config::DEFAULT_AUTH_EXPIRATION);
-            let actor_jwt = if renewed.is_node() {
-                self.gen_jwt(format!("node/{}", endpoint_cn), jwt_lifetime)?
-            } else {
-                self.gen_jwt(format!("adapter/{}", endpoint_cn), jwt_lifetime)?
-            };
-            let _ = renewed.add_attribute(
-                Attribute::builder(ATTR_KEY_VS_IDENT)
-                    .expires(ident_expires)
-                    .value(actor_jwt),
-            );
-            let _ = renewed.add_identity_key(0, ATTR_KEY_VS_IDENT);
-        }
-
         // Invariant, not policy: reauth renews credentials in place. The
         // address was passed through as an authenticated claim, so this can
         // only trip if authorize_connection changes shape underneath us.
@@ -1616,6 +1587,39 @@ impl ConnectionControl {
                 logout_without_enrichment = true;
             }
         }
+        // Re-mint the VS identity token with a fresh expiration (PR #19
+        // review): the connect-time token rode through as an authenticated
+        // claim, but keeping it would cap the renewed actor at the ORIGINAL
+        // connect's window — `get_authentication_expiration()` takes the
+        // minimum across identity attributes, so after
+        // `DEFAULT_AUTH_EXPIRATION` an OIDC-only actor could renew its user
+        // authority yet still be denied new visas. Same minting rules as
+        // connect; re-registered as the first identity key, exactly as
+        // connect does. Minted here, after the commit-time recheck has chosen
+        // the actor that is persisted, so a logout's reduced actor gets a
+        // fresh token too (#63 review): the pre-logout one was capped by the
+        // user authority's expiry, and a refresh holding a pre-logout copy
+        // matches on it.
+        if renewed.get_attribute(ATTR_KEY_VS_IDENT).is_some() {
+            // The token follows the renewed actor's authority expiries
+            // (zipline#119) — same minting rule as connect.
+            let ident_expires = vs_ident_expiration(&renewed);
+            let jwt_lifetime = ident_expires
+                .duration_since(SystemTime::now())
+                .unwrap_or(config::DEFAULT_AUTH_EXPIRATION);
+            let actor_jwt = if renewed.is_node() {
+                self.gen_jwt(format!("node/{}", endpoint_cn), jwt_lifetime)?
+            } else {
+                self.gen_jwt(format!("adapter/{}", endpoint_cn), jwt_lifetime)?
+            };
+            let _ = renewed.add_attribute(
+                Attribute::builder(ATTR_KEY_VS_IDENT)
+                    .expires(ident_expires)
+                    .value(actor_jwt),
+            );
+            let _ = renewed.add_identity_key(0, ATTR_KEY_VS_IDENT);
+        }
+
         asm.actor_mgr
             .update_actor(&renewed, &asm.policy_service_names())
             .await?;
@@ -9211,12 +9215,26 @@ mod tests {
     async fn test_logout_reduced_when_policy_moves_mid_flight() {
         let cn = "zode-ag.zpr";
         let (asm, cc, addr, privkey) = zode_fixture(cn).await;
-        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let logged_in = zode_login(&asm, &cc, addr, &privkey, cn).await;
         arm_mid_flight_install(&asm, cn, &privkey);
         let renewed = zode_logout(&asm, &cc, addr, &privkey, cn).await;
         assert!(!has_user_attrs(&renewed));
         assert!(renewed.get_attribute("device.clearance").is_none());
         assert!(renewed.is_node());
+        // The persisted reduced actor carries a freshly minted identity token
+        // (#63 review): the pre-logout one was capped by the user authority's
+        // expiry, and a refresh holding a pre-logout copy must not match it.
+        let ident = |a: &Actor| {
+            a.get_attribute(ATTR_KEY_VS_IDENT)
+                .and_then(|i| i.get_single_value().ok())
+                .map(|s| s.to_string())
+        };
+        assert!(ident(&renewed).is_some());
+        assert_ne!(
+            ident(&renewed),
+            ident(&logged_in),
+            "the identity token must be re-minted"
+        );
         let stored = asm
             .actor_mgr
             .get_actor_by_zpr_addr(&addr)
