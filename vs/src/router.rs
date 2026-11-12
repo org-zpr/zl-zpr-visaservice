@@ -446,8 +446,6 @@ impl Router {
     /// If the set changed, best routes are recomputed and the route cache is flushed
     /// under the same write lock. Returns the nodes that lost transit, sorted, so the
     /// caller can revoke the visas that pass through them.
-    // Until TopologyMgr sets it from policy (next task of zl-zipline#227), only tests call it.
-    #[allow(dead_code)]
     pub fn set_transit_nodes(&self, transit: HashSet<IpAddr>) -> Vec<IpAddr> {
         let mut inner = self.inner.write().unwrap();
         let transit: HashSet<NodeId> = transit.iter().map(NodeId::from).collect();
@@ -970,7 +968,6 @@ impl Graph {
 
     /// Replace the transit set and recompute best routes if it changed. Returns the
     /// nodes that were transit-capable before and are not now, sorted.
-    #[allow(dead_code)] // see Router::set_transit_nodes
     fn set_transit(&mut self, transit: HashSet<NodeId>) -> Vec<IpAddr> {
         if transit == self.transit {
             return Vec::new();

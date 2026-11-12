@@ -316,6 +316,28 @@ impl TopologyMgr {
         table.edge_usable(a, a_cn.as_deref(), b, b_cn.as_deref())
     }
 
+    /// Make the router's transit set the one `snapshot`'s policy declares
+    /// (`Policy.transitNodes`, zl-zipline#227): only those nodes may be an interior hop
+    /// of a route. Takes the caller's [TopoOps] because it is a topology write.
+    ///
+    /// Returns the nodes that lost transit, so the caller can revoke the visas that pass
+    /// through them. The flag is cleared before the caller lists visas, so a visa
+    /// committed concurrently is either listed by that revocation or fails the
+    /// commit-time route check ([Self::route_still_valid]), as for a link going down.
+    pub fn apply_transit_nodes(
+        &self,
+        _ops: &TopoOps<'_>,
+        snapshot: &PolicySnapshot,
+    ) -> Vec<IpAddr> {
+        let lost = self
+            .router
+            .set_transit_nodes(snapshot.policy().transit_nodes().clone());
+        if !lost.is_empty() {
+            info!(target: TOPO, "policy vinst {}: nodes no longer transit-capable: {:?}", snapshot.vinst(), lost);
+        }
+        lost
+    }
+
     /// Is `addr` a node in the router?
     pub fn has_node(&self, addr: &IpAddr) -> bool {
         self.router.has_node(addr)
@@ -530,6 +552,10 @@ impl TopologyMgr {
         snapshot: &PolicySnapshot,
         node_addrs: &[IpAddr],
     ) -> Result<(), ServiceError> {
+        // Which nodes may pass traffic through comes from policy (zl-zipline#227). The
+        // router is empty at startup, so no visa can be using a node that lost transit.
+        self.apply_transit_nodes(_ops, snapshot);
+
         // In this code path there should be no cases for errors from add_node.
         for addr in node_addrs {
             self.router.add_node(addr.clone())?;
@@ -992,6 +1018,12 @@ mod tests {
 
     /// Serialize a policy whose topology is exactly the given peerings.
     fn policy_bytes_from_peerings(peerings: &[Peering]) -> Vec<u8> {
+        policy_bytes_from_peerings_and_transit(peerings, &[])
+    }
+
+    /// As [policy_bytes_from_peerings], with `Policy.transitNodes` = `transit` (left
+    /// unset when empty).
+    fn policy_bytes_from_peerings_and_transit(peerings: &[Peering], transit: &[IpAddr]) -> Vec<u8> {
         let mut msg = capnp::message::Builder::new_default();
         {
             let mut policy = msg.init_root::<policy_capnp::policy::Builder>();
@@ -999,6 +1031,12 @@ mod tests {
             let mut topo = policy.reborrow().init_topology(peerings.len() as u32);
             for (i, p) in peerings.iter().enumerate() {
                 p.write_to(&mut topo.reborrow().get(i as u32));
+            }
+            if !transit.is_empty() {
+                let mut list = policy.reborrow().init_transit_nodes(transit.len() as u32);
+                for (i, addr) in transit.iter().enumerate() {
+                    list.set(i as u32, addr.to_string());
+                }
             }
         }
         let mut bytes = Vec::new();
@@ -1276,6 +1314,28 @@ mod tests {
     }
 
     /// add_node_if_not_exists preserves restored in-memory links and persisted edges on reconnect.
+    /// zl-zipline#227: restore applies the policy's transit set, so a route through a
+    /// transit-capable node exists after a restart.
+    #[tokio::test]
+    async fn test_restore_applies_the_policy_transit_set() {
+        let db = Arc::new(FakeDb::new());
+        let (a, b, c) = (ip("fd5a:5052::1"), ip("fd5a:5052::2"), ip("fd5a:5052::3"));
+        let peerings = [peering(a, c, "ac", vec![]), peering(c, b, "cb", vec![])];
+        let policy = policy_bytes_from_peerings_and_transit(&peerings, &[c]);
+        let policy_mgr = make_policy_mgr_from_bytes(db.clone(), policy).await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.link_repo.add_edge(&a, &c).await.unwrap();
+        topo.link_repo.add_edge(&c, &b).await.unwrap();
+        topo.restore_from_state(
+            &topo.ops_now(),
+            &policy_mgr.get_current_snapshot(),
+            &[a, b, c],
+        )
+        .await
+        .unwrap();
+        assert!(topo.get_best_route(&a, &b).is_some());
+    }
+
     #[tokio::test]
     async fn test_add_node_if_not_exists_preserves_restored_links_on_reconnect() {
         let db = Arc::new(FakeDb::new());
