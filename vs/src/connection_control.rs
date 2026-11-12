@@ -136,6 +136,33 @@ impl OidcSessionRecord {
     }
 }
 
+/// Refuse a node's self-renewal when the stored actor's VS-API session
+/// generation (`zpr.session`) is no longer `expected` (#63 review): the node
+/// re-authenticated while the renewal was in flight, and persisting the
+/// renewal would write the old session back over the new one, reviving the old
+/// handle and cutting off the new. Same generic `AuthError` as every other
+/// credential failure; the node simply retries on its new session.
+async fn ensure_session_unchanged(
+    asm: &Assembly,
+    zpr_addr: &IpAddr,
+    expected: Option<&str>,
+) -> Result<(), ServiceError> {
+    let stored = asm.actor_mgr.get_actor_by_zpr_addr(zpr_addr).await?;
+    let stored_session = stored
+        .as_ref()
+        .and_then(|a| a.get_attribute(key::SESSION))
+        .and_then(|a| a.get_single_value().ok());
+    if stored.is_none() || stored_session.as_deref() != expected {
+        info!(target: CC, "self-renewal of {zpr_addr} refused: the node re-authenticated while it was in flight");
+        return Err(ApiResponseError::new_code_msg(
+            ErrorCode::AuthError,
+            "authentication rejected",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Whether a `reauthorize` targets the calling node's OWN actor: the target
 /// address is the caller's address and the actor there is a node
 /// (zl-zipline#232). Only such a request may change the `user` namespace.
@@ -1273,6 +1300,15 @@ impl ConnectionControl {
             .into());
         };
 
+        // A login spends its nonce as soon as the request is classified, before
+        // either credential arm runs (#63 review): a login that then fails on
+        // its device proof or its token cannot retry the same nonce.
+        if user_change == UserNamespaceChange::Gain
+            && let Some(ob) = &oidc_blob
+        {
+            self.consume_login_nonce(&actor, &zpr_addr, &ob.nonce)?;
+        }
+
         let mut outcomes: Vec<BlobOutcome> = Vec::new();
         if let Some(ssb) = &ss_blob {
             // A revoked bootstrap root never renews (zipline#136): denylist
@@ -1289,10 +1325,9 @@ impl ConnectionControl {
         }
         if let Some(ob) = &oidc_blob {
             if user_change == UserNamespaceChange::Gain {
-                // A login: spend the visa-service-minted nonce BEFORE any
-                // token work, then validate exactly as the connect arm does
-                // (its nonce check binds the token to that nonce).
-                self.consume_login_nonce(&actor, &zpr_addr, &ob.nonce)?;
+                // A login (its nonce already spent above): validate exactly as
+                // the connect arm does; its nonce check binds the token to the
+                // visa-service nonce.
                 outcomes.push(self.authenticate_oidc_blob(&psnap, ob).await?);
             } else {
                 outcomes.push(self.reauthenticate_oidc_blob(&psnap, &actor, ob).await?);
@@ -1374,6 +1409,26 @@ impl ConnectionControl {
             .await
             .map_err(Self::classify_reauth_policy_error)?;
 
+        // A node's role is fixed at connect, as on the attribute-refresh path
+        // (`actor_attributes::restamp_services`). If the policy re-run no
+        // longer matches a node join policy -- e.g. the only one now requires
+        // the user attribute this logout drops -- keep the node role and grant
+        // only the services a node would get, instead of failing on a role
+        // change and leaving the login in place (#63 review).
+        if self_renewal && !renewed.is_node() {
+            renewed.add_attribute(
+                Attribute::builder(key::ROLE)
+                    .expires_in(libeval::attribute::NEVER_EXPIRES)
+                    .value(libeval::attribute::ROLE_NODE),
+            )?;
+            let claims: Vec<Attribute> = renewed
+                .attrs_iter()
+                .filter(|a| !key::POLICY_STAMPED.contains(&a.get_key()))
+                .cloned()
+                .collect();
+            renewed.set_services(psnap.policy().join_services_for_role(&claims, true));
+        }
+
         // Re-mint the VS identity token with a fresh expiration (PR #19
         // review): the connect-time token rode through as an authenticated
         // claim, but keeping it would cap the renewed actor at the ORIGINAL
@@ -1412,6 +1467,12 @@ impl ConnectionControl {
             ));
         }
 
+        if self_renewal {
+            let loaded_session = actor
+                .get_attribute(key::SESSION)
+                .and_then(|a| a.get_single_value().ok());
+            ensure_session_unchanged(&asm, &zpr_addr, loaded_session.as_deref()).await?;
+        }
         asm.actor_mgr
             .update_actor(&renewed, &asm.policy_service_names())
             .await?;
@@ -1456,8 +1517,20 @@ impl ConnectionControl {
         // sweep re-checks every live visa against the stored actors.
         // ponytail: full sweep of every live visa per login/logout; logins are
         // rare. Add a per-actor sweep if visa counts make this slow.
+        //
+        // The sweep uses the CURRENT snapshot, taken after the actor is
+        // persisted, and repeats while the policy generation moves under it:
+        // a sweep under a superseded generation applies no verdicts, and a
+        // policy install whose own sweep ran before this persist re-checked
+        // the visas against the pre-logout actor (#63 review).
         if user_change != UserNamespaceChange::Keep {
-            revalidate_visas(&asm, &psnap, SweepReason::AttributeChange).await;
+            loop {
+                let sweep_snap = asm.policy_mgr.get_current_snapshot();
+                revalidate_visas(&asm, &sweep_snap, SweepReason::AttributeChange).await;
+                if asm.policy_mgr.get_current_snapshot().vinst() == sweep_snap.vinst() {
+                    break;
+                }
+            }
         }
         Ok(renewed)
     }
@@ -7599,12 +7672,31 @@ mod tests {
     /// client must carry `user.domain = example.com` -- a rule that requires a
     /// user attribute.
     fn make_zode_oidc_policy(cn: &str, pubkey_der: &[u8]) -> Vec<u8> {
+        make_zode_oidc_policy_with_join(cn, pubkey_der, None)
+    }
+
+    /// As [make_zode_oidc_policy], but the node join policy may require one
+    /// `(key, value)` attribute.
+    fn make_zode_oidc_policy_with_join(
+        cn: &str,
+        pubkey_der: &[u8],
+        join_condition: Option<(&str, &str)>,
+    ) -> Vec<u8> {
         use zpr::policy::v1 as capnp_policy;
         use zpr::policy_types::{JoinPolicy, PFlags, Scope, Service, ServiceType, TrustedService};
         use zpr::write_to::WriteTo;
 
         let jp = JoinPolicy {
-            conditions: Vec::new(),
+            conditions: join_condition
+                .map(|(k, v)| {
+                    vec![
+                        zpr::policy_types::Attribute::tuple(k)
+                            .value(v)
+                            .build()
+                            .unwrap(),
+                    ]
+                })
+                .unwrap_or_default(),
             flags: PFlags {
                 node: true,
                 ..Default::default()
@@ -8328,6 +8420,90 @@ mod tests {
         task.await
             .unwrap()
             .expect("the renewal completes once the lock is free");
+    }
+
+    /// Review fix (#63, Copilot): once a request is classified as a login,
+    /// the nonce is spent before the device proof is checked, so a login that
+    /// fails on its device blob cannot retry the same nonce.
+    #[tokio::test]
+    async fn test_reauthorize_node_gain_spends_nonce_even_when_device_proof_fails() {
+        let cn = "zode-t.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        let nonce = mint_zode_nonce(&cc, addr);
+        let (other_key, _) = gen_rsa_test_keypair();
+        let mut blobs = zode_login_blobs(&privkey, cn, &nonce, oidc_base_claims());
+        blobs[0] = make_fresh_ss_blob(&other_key, cn); // wrong device key
+        assert_auth_rejected(api_err(cc.reauthorize_actor(asm, addr, blobs, &addr).await));
+        assert!(
+            !cc.login_nonces
+                .consume(&nonce, addr, ZODE_SESSION, SystemTime::now()),
+            "the nonce must be spent even though the device proof failed"
+        );
+    }
+
+    /// Review fix (#63, Copilot): a self-renewal is refused when the node
+    /// re-authenticated (new `zpr.session`) while it was in flight, so it can
+    /// never write the old session back over the new one.
+    #[tokio::test]
+    async fn test_self_renewal_refused_when_session_changed() {
+        let cn = "zode-u.zpr";
+        let (asm, _cc, addr, _privkey) = zode_fixture(cn).await;
+        assert!(
+            ensure_session_unchanged(&asm, &addr, Some(ZODE_SESSION))
+                .await
+                .is_ok()
+        );
+        let mut stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        stored
+            .add_attribute(Attribute::builder(key::SESSION).value("a-newer-session"))
+            .unwrap();
+        asm.actor_mgr
+            .update_actor(&stored, &Default::default())
+            .await
+            .unwrap();
+        assert_auth_rejected(api_err(
+            ensure_session_unchanged(&asm, &addr, Some(ZODE_SESSION)).await,
+        ));
+    }
+
+    /// Review fix (#63, Copilot): when policy now admits the node as a node
+    /// only with a user attribute, a logout keeps the node role (fixed at
+    /// connect) instead of failing on a role change and leaving the login in
+    /// place; services are recomputed for the node role.
+    #[tokio::test]
+    async fn test_reauthorize_node_logout_keeps_node_role() {
+        let cn = "zode-v.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let pubkey_der = privkey.public_key_to_der().unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_zode_oidc_policy_with_join(
+                cn,
+                &pubkey_der,
+                Some(("user.domain", "example.com")),
+            ))
+            .await
+            .expect("policy whose node join needs a user attribute installs");
+
+        let renewed = zode_logout(&asm, &cc, addr, &privkey, cn).await;
+        assert!(renewed.is_node(), "a logout must not change the node role");
+        assert!(!has_user_attrs(&renewed));
+        assert!(
+            renewed.services_iter().next().is_none(),
+            "no node join matches any more, so the node provides nothing"
+        );
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!has_user_attrs(&stored), "the logout must persist");
     }
 
     /// The namespace-change decision table (vs.capnp "Re-Authorization").
