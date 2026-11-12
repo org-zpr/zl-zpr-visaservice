@@ -84,6 +84,10 @@ pub const LOGIN_NONCE_TTL_SECS: u64 = 300;
 /// may hold; minting past it is refused with `quotaExceeded` (zl-zipline#232).
 pub const LOGIN_NONCE_MAX_PER_ACTOR: usize = 4;
 
+/// How many visa sweeps a node's login or logout runs before it hands an
+/// incomplete sweep to the event manager (zl-zipline#232).
+pub const NAMESPACE_SWEEP_ATTEMPTS: usize = 3;
+
 pub const MAX_VISA_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
 /// A visa must be valid for at least this long to be worth issuing. Below this the node

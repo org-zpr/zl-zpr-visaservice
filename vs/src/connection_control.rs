@@ -1236,7 +1236,7 @@ impl ConnectionControl {
         // whole operation, from loading the actor to recording the OIDC
         // anchors (#63 review): the namespace classification below must still
         // describe the actor that gets persisted.
-        let _self_reauth_guard = if zpr_addr == *connect_via {
+        let self_reauth_guard = if zpr_addr == *connect_via {
             Some(self.self_reauth_lock.lock().await)
         } else {
             None
@@ -1548,16 +1548,43 @@ impl ConnectionControl {
         // a sweep under a superseded generation applies no verdicts, and a
         // policy install whose own sweep ran before this persist re-checked
         // the visas against the pre-logout actor (#63 review).
+        //
+        // The self-renewal lock covers load -> classify -> persist -> anchors;
+        // the fleet-wide sweep needs none of that, so release it first rather
+        // than block every node authentication and nonce mint for the sweep's
+        // duration (#63 review).
+        drop(self_reauth_guard);
         if user_change != UserNamespaceChange::Keep {
-            loop {
-                let sweep_snap = asm.policy_mgr.get_current_snapshot();
-                revalidate_visas(&asm, &sweep_snap, SweepReason::AttributeChange).await;
-                if asm.policy_mgr.get_current_snapshot().vinst() == sweep_snap.vinst() {
-                    break;
-                }
-            }
+            Self::sweep_visas_after_namespace_change(&asm).await;
         }
         Ok(renewed)
+    }
+
+    /// Re-check every live visa after a node's login or logout (#63 review):
+    /// up to [config::NAMESPACE_SWEEP_ATTEMPTS] attribute-change sweeps, each
+    /// under the policy snapshot current when it starts, until one completes
+    /// with no failures under a generation that did not move. If none does,
+    /// the work is handed to the event manager as an attribute-change
+    /// reconcile (refresh, then sweep) rather than dropped: the actor is
+    /// already persisted, and a visa whose revocation failed must not stay
+    /// usable until it expires.
+    async fn sweep_visas_after_namespace_change(asm: &Arc<Assembly>) {
+        for _ in 0..config::NAMESPACE_SWEEP_ATTEMPTS {
+            let sweep_snap = asm.policy_mgr.get_current_snapshot();
+            let failures = revalidate_visas(asm, &sweep_snap, SweepReason::AttributeChange).await;
+            if failures == 0 && asm.policy_mgr.get_current_snapshot().vinst() == sweep_snap.vinst()
+            {
+                return;
+            }
+        }
+        warn!(target: CC, "visa sweep after a node login/logout did not complete; queueing an attribute-change reconcile");
+        if let Err(e) = asm
+            .event_mgr
+            .record_event(crate::event_mgr::VsEvent::TrustedServiceChange)
+            .await
+        {
+            error!(target: CC, "failed to queue the attribute-change reconcile after a node login/logout: {e}");
+        }
     }
 
     /// Spend a node's login nonce for a `user` namespace gain on its own actor
@@ -7839,6 +7866,15 @@ mod tests {
     /// and bootstrap key.
     async fn zode_fixture(cn: &str) -> (Arc<Assembly>, ConnectionControl, IpAddr, PKey<Private>) {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        zode_fixture_on(asm, cn).await
+    }
+
+    /// As [zode_fixture], on a caller-built assembly (e.g. one whose fake DB
+    /// and event queue the test holds).
+    async fn zode_fixture_on(
+        asm: Arc<Assembly>,
+        cn: &str,
+    ) -> (Arc<Assembly>, ConnectionControl, IpAddr, PKey<Private>) {
         let (privkey, pubkey_der) = gen_rsa_test_keypair();
         asm.policy_mgr
             .update_policy_from_container_bytes(make_zode_oidc_policy(cn, &pubkey_der))
@@ -8680,6 +8716,37 @@ mod tests {
         crate::actor_attributes::persist_refreshed_actor(&asm, &current)
             .await
             .expect("a refresh of the current copy persists");
+    }
+
+    /// Review fix (#63 round 5, Codex P1): when the logout's visa sweep
+    /// cannot record a revocation, the logout still persists but the work is
+    /// handed to the event manager (an attribute-change reconcile) instead of
+    /// being dropped.
+    #[tokio::test]
+    async fn test_incomplete_logout_sweep_is_requeued() {
+        let (asm, mut event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let cn = "zode-y.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        create_zode_files_visa(&asm, addr).await;
+        while event_rx.try_recv().is_ok() {} // drain events so far
+
+        // Visa writes fail from here on: the sweep cannot record the revoke.
+        // ApplyThenError: the visa write errors, while actor writes (atomic
+        // pipelines, which fail only on Reject) are unaffected.
+        db.set_set_ex_fault(crate::db::FaultMode::ApplyThenError);
+        let renewed = zode_logout(&asm, &cc, addr, &privkey, cn).await;
+        assert!(!has_user_attrs(&renewed), "the logout itself persists");
+
+        let mut requeued = false;
+        while let Ok(evt) = event_rx.try_recv() {
+            requeued |= matches!(evt, crate::event_mgr::VsEvent::TrustedServiceChange);
+        }
+        assert!(
+            requeued,
+            "an incomplete sweep must hand its work to the event manager"
+        );
     }
 
     /// The namespace-change decision table (vs.capnp "Re-Authorization").
