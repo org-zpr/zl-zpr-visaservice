@@ -265,6 +265,26 @@ fn logout_without_reauthorization(actor: &Actor, policy: &Policy) -> Actor {
     reduced
 }
 
+/// The actor a logout persists (#63 review): `renewed` -- re-authorized and
+/// re-enriched under `psnap` -- while `psnap` is still the live policy
+/// generation; otherwise [logout_without_reauthorization] of the loaded
+/// `actor` under the current policy, so no attribute re-enriched under a
+/// superseded snapshot is written after that install's reconciliation already
+/// ran. Refusing the logout instead would leave the login in place.
+fn logout_actor_for_current_policy(
+    asm: &Assembly,
+    psnap: &PolicySnapshot,
+    actor: &Actor,
+    renewed: Actor,
+) -> Actor {
+    let current = asm.policy_mgr.get_current_snapshot();
+    if current.vinst() == psnap.vinst() {
+        return renewed;
+    }
+    info!(target: CC, "logout: policy changed while it was being re-authorized; persisting it without re-enrichment");
+    logout_without_reauthorization(actor, current.policy())
+}
+
 /// Whether an attribute is carried over a logout (zl-zipline#232): only
 /// attributes the visa service itself stamped (internal source), and never
 /// one in the `user.` namespace.
@@ -1564,6 +1584,9 @@ impl ConnectionControl {
         }
         if user_change == UserNamespaceChange::Gain {
             ensure_policy_unchanged(&asm, &psnap)?;
+        }
+        if dropping_user {
+            renewed = logout_actor_for_current_policy(&asm, &psnap, &actor, renewed);
         }
         asm.actor_mgr
             .update_actor(&renewed, &asm.policy_service_names())
@@ -8999,6 +9022,41 @@ mod tests {
                 .all(|k| renewed.get_attribute(k).is_some()),
             "every identity key must name a surviving attribute"
         );
+    }
+
+    /// Review fix (#63 round 10, Codex P1): a logout whose policy snapshot
+    /// went stale does not persist attributes re-enriched under the old
+    /// snapshot; it persists the reduced actor instead.
+    #[tokio::test]
+    async fn test_logout_under_stale_policy_persists_reduced_actor() {
+        let cn = "zode-ad.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        let loaded = zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let mut reenriched = loaded.clone();
+        reenriched
+            .add_attribute(
+                AttributeSource::new("hr")
+                    .builder("device.clearance")
+                    .expires_in(Duration::from_secs(600))
+                    .value("secret"),
+            )
+            .unwrap();
+
+        // Same generation: the re-enriched actor is persisted as is.
+        let kept = logout_actor_for_current_policy(&asm, &psnap, &loaded, reenriched.clone());
+        assert!(kept.get_attribute("device.clearance").is_some());
+
+        // An install lands: the reduced actor is persisted instead.
+        let pubkey_der = privkey.public_key_to_der().unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .await
+            .expect("a new policy installs");
+        let reduced = logout_actor_for_current_policy(&asm, &psnap, &loaded, reenriched);
+        assert!(reduced.get_attribute("device.clearance").is_none());
+        assert!(!has_user_attrs(&reduced));
+        assert!(reduced.is_node());
     }
 
     /// The namespace-change decision table (vs.capnp "Re-Authorization").
