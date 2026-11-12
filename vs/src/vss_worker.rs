@@ -78,8 +78,9 @@ impl VssState {
         self.topology_state.last_update = Instant::now();
     }
 
-    /// A [VssCmd::TopologyChanged] arrived: the node's topology must be sent again.
-    /// Only marks it; housekeeping sends it, so a burst of changes costs one send.
+    /// The node's topology changed (its handle's topology-dirty flag was set,
+    /// `VssHandle::topology_changed`): it must be sent again. Only marks it;
+    /// housekeeping sends it, so a burst of changes costs one send.
     fn handle_topology_changed(&mut self) {
         self.mark_topology_updated();
     }
@@ -122,6 +123,7 @@ pub async fn vss_worker_loop(
     asm: Arc<Assembly>,
     node_addr: SocketAddr,
     mut cmd_rx: mpsc::Receiver<VssCmd>,
+    topology_dirty: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Open connect to VSS.
     info!(target: VSS, "connecting to VSS at {}", node_addr);
@@ -192,10 +194,6 @@ pub async fn vss_worker_loop(
                                 asm.counters.incr(CounterType::VssErrors);
                             }
                         }
-                        VssCmd::TopologyChanged => {
-                            debug!(target: VSS, "topology of {} changed; re-sending it at the next heartbeat", node_addr);
-                            state.handle_topology_changed();
-                        }
                         VssCmd::SetTopology(links, policy, resp_tx) => {
                             state.mark_topology_updated();
                             if let Err(e) = resp_tx.send(vss_do_set_topology(&vss_handle, asm.clone(), &node_addr.ip(), policy, links).await) {
@@ -213,6 +211,12 @@ pub async fn vss_worker_loop(
             }
 
             _ = heartbeat.tick() => {
+                // Taken before housekeeping reads the state it sends: a change marked
+                // after this swap is picked up by the next heartbeat (zl-zipline#227).
+                if topology_dirty.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    debug!(target: VSS, "topology of {} changed; re-sending it", node_addr);
+                    state.handle_topology_changed();
+                }
                 do_housekeeping(&mut state, &asm, &node_addr.ip(), &vss_handle).await;
             }
 

@@ -476,20 +476,18 @@ async fn resume_node_actor_for_open(
 
 /// Tell every connected peer policy declares for `node_addr` that `node_addr`'s
 /// substrate address changed (zl-zipline#227), so their topology `Link.peer` for it is
-/// re-sent (`VssCmd::TopologyChanged`, coalesced per heartbeat by each peer's VSS
+/// re-sent (`VssHandle::topology_changed`, coalesced per heartbeat by each peer's VSS
 /// worker; pd g72 q5). Call it after the change is persisted -- the worker reads the
-/// address when it sends -- and after dropping the topology guard: it only queues
-/// marks and never waits, but keeps queue work out of the guarded span all the same.
+/// address when it sends -- and after dropping the topology guard: it only sets flags
+/// and never waits, but stays out of the guarded span all the same.
 fn notify_peers_of_address_change(asm: &Assembly, node_addr: &IpAddr) {
     let psnap = asm.policy_mgr.get_current_snapshot();
     let Some(peers) = psnap.policy().get_peers_for_node(node_addr) else {
         return;
     };
     for peer in peers {
-        if let Some(handle) = asm.vss_mgr.get_handle(&peer.remote_zpr_addr)
-            && !handle.topology_changed()
-        {
-            warn!(target: API, "could not tell peer {} that node {node_addr} moved; its next policy pass or reconnect re-sends its topology", peer.remote_zpr_addr);
+        if let Some(handle) = asm.vss_mgr.get_handle(&peer.remote_zpr_addr) {
+            handle.topology_changed();
         }
     }
 }
@@ -4605,9 +4603,10 @@ mod tests {
             asm: Arc<Assembly>,
             laptop: vsapi::v_s_handle::Client,
             relay: vsapi::v_s_handle::Client,
-            /// Commands sent to the relay's and the other node's VSS workers.
-            relay_cmds: mpsc::Receiver<VssCmd>,
-            other_cmds: mpsc::Receiver<VssCmd>,
+            /// Command receivers of the relay's and the other node's test VSS
+            /// workers, kept open so their handles look live.
+            _relay_cmds: mpsc::Receiver<VssCmd>,
+            _other_cmds: mpsc::Receiver<VssCmd>,
         }
 
         /// Policy: laptop -- relay (laptop end has no address), relay -- other. All
@@ -4658,8 +4657,8 @@ mod tests {
                 laptop: capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), laptop_actor)),
                 relay: capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), relay_actor)),
                 asm,
-                relay_cmds,
-                other_cmds,
+                _relay_cmds: relay_cmds,
+                _other_cmds: other_cmds,
             }
         }
 
@@ -4695,15 +4694,11 @@ mod tests {
                 .clone()
         }
 
-        /// How many `TopologyChanged` marks are queued on a worker's channel.
-        fn topology_marks(rx: &mut mpsc::Receiver<VssCmd>) -> usize {
-            let mut n = 0;
-            while let Ok(cmd) = rx.try_recv() {
-                if matches!(cmd, VssCmd::TopologyChanged) {
-                    n += 1;
-                }
-            }
-            n
+        /// 1 if the node's VSS worker has been told its topology changed since the
+        /// last call (the mark is a flag, so repeats coalesce), else 0. Clears it.
+        fn topology_marks(asm: &Assembly, node: &str) -> usize {
+            let handle = asm.vss_mgr.get_handle(&node.parse().unwrap()).unwrap();
+            usize::from(handle.take_topology_dirty())
         }
 
         /// A new address is stored and the laptop's peers (only them) are told.
@@ -4711,11 +4706,28 @@ mod tests {
         async fn update_stores_the_address_and_notifies_peers() {
             tokio::task::LocalSet::new()
                 .run_until(async {
-                    let mut f = build().await;
+                    let f = build().await;
                     assert_eq!(send_update(&f.laptop, "198.51.100.9:6000").await, Ok(()));
                     assert_eq!(stored_addr(&f.asm, LAPTOP).await, "198.51.100.9:6000");
-                    assert_eq!(topology_marks(&mut f.relay_cmds), 1, "the relay is a peer");
-                    assert_eq!(topology_marks(&mut f.other_cmds), 0, "not a peer");
+                    assert_eq!(topology_marks(&f.asm, RELAY), 1, "the relay is a peer");
+                    assert_eq!(topology_marks(&f.asm, OTHER), 0, "not a peer");
+                })
+                .await;
+        }
+
+        /// Review r1 (Copilot): the mark does not ride the bounded command queue, so
+        /// a worker whose queue is full still learns of the change.
+        #[tokio::test]
+        async fn update_marks_a_peer_whose_command_queue_is_full() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let f = build().await;
+                    let relay: IpAddr = RELAY.parse().unwrap();
+                    let (full_tx, _full_rx) = mpsc::channel(1);
+                    full_tx.try_send(VssCmd::Stop()).unwrap(); // the queue is now full
+                    f.asm.vss_mgr.insert_test_handle(relay, full_tx);
+                    assert_eq!(send_update(&f.laptop, "198.51.100.9:6000").await, Ok(()));
+                    assert_eq!(topology_marks(&f.asm, RELAY), 1);
                 })
                 .await;
         }
@@ -4725,9 +4737,9 @@ mod tests {
         async fn update_to_the_same_address_notifies_nobody() {
             tokio::task::LocalSet::new()
                 .run_until(async {
-                    let mut f = build().await;
+                    let f = build().await;
                     assert_eq!(send_update(&f.laptop, LAPTOP_AT).await, Ok(()));
-                    assert_eq!(topology_marks(&mut f.relay_cmds), 0);
+                    assert_eq!(topology_marks(&f.asm, RELAY), 0);
                 })
                 .await;
         }
@@ -4737,7 +4749,7 @@ mod tests {
         async fn update_rejects_an_unspecified_address_or_port_zero() {
             tokio::task::LocalSet::new()
                 .run_until(async {
-                    let mut f = build().await;
+                    let f = build().await;
                     for bad in ["[::]:5000", "0.0.0.0:5000", "198.51.100.9:0"] {
                         assert_eq!(
                             send_update(&f.laptop, bad).await,
@@ -4746,7 +4758,7 @@ mod tests {
                         );
                     }
                     assert_eq!(stored_addr(&f.asm, LAPTOP).await, LAPTOP_AT);
-                    assert_eq!(topology_marks(&mut f.relay_cmds), 0);
+                    assert_eq!(topology_marks(&f.asm, RELAY), 0);
                 })
                 .await;
         }
@@ -4756,12 +4768,12 @@ mod tests {
         async fn update_contradicting_policy_is_a_param_error() {
             tokio::task::LocalSet::new()
                 .run_until(async {
-                    let mut f = build().await;
+                    let f = build().await;
                     assert_eq!(
                         send_update(&f.relay, "198.51.100.9:6000").await,
                         Err(vsapi::ErrorCode::ParamError)
                     );
-                    assert_eq!(topology_marks(&mut f.other_cmds), 0);
+                    assert_eq!(topology_marks(&f.asm, OTHER), 0);
                 })
                 .await;
         }
@@ -4771,7 +4783,7 @@ mod tests {
         async fn update_from_a_dead_handle_is_refused() {
             tokio::task::LocalSet::new()
                 .run_until(async {
-                    let mut f = build().await;
+                    let f = build().await;
                     // The laptop reconnects: a new session generation is persisted.
                     let mut actor = f
                         .asm
@@ -4791,7 +4803,7 @@ mod tests {
                         Err(vsapi::ErrorCode::AuthRequired)
                     );
                     assert_eq!(stored_addr(&f.asm, LAPTOP).await, LAPTOP_AT);
-                    assert_eq!(topology_marks(&mut f.relay_cmds), 0);
+                    assert_eq!(topology_marks(&f.asm, RELAY), 0);
                 })
                 .await;
         }
@@ -4819,7 +4831,7 @@ mod tests {
         /// `open` with a changed address notifies the peers; with the same one it does not.
         #[tokio::test]
         async fn open_with_a_changed_address_notifies_peers() {
-            let mut f = build().await;
+            let f = build().await;
             let laptop: IpAddr = LAPTOP.parse().unwrap();
             let (_actor, changed) =
                 resume_node_actor_for_open(&f.asm, laptop, LAPTOP_AT.parse().unwrap(), "laptop")
@@ -4840,7 +4852,7 @@ mod tests {
             assert!(changed);
             // `open` notifies after it drops the topology guard; this is that step.
             notify_peers_of_address_change(&f.asm, &laptop);
-            assert_eq!(topology_marks(&mut f.relay_cmds), 1);
+            assert_eq!(topology_marks(&f.asm, RELAY), 1);
         }
     }
 }

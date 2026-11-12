@@ -43,9 +43,4 @@ pub enum VssCmd {
         Arc<Policy>,
         oneshot::Sender<VssSetTopologyResponse>,
     ),
-    /// Something in this node's topology changed -- a peer reported a new substrate
-    /// address (zl-zipline#227). The worker marks its topology out of date, and its
-    /// next heartbeat sends one `setTopology` built from the state as it is then, so
-    /// any number of changes before that heartbeat cost one send. No response.
-    TopologyChanged,
 }

@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -29,6 +30,23 @@ pub struct VssMgr {
 pub struct VssHandle {
     // For sending requests to a VSS handler thread (all the API calls)
     cmd_tx: mpsc::Sender<VssCmd>,
+    /// Set when the node's topology changed and must be sent again (a peer reported a
+    /// new substrate address, zl-zipline#227). A flag beside the bounded command queue,
+    /// not a command in it, so a full queue cannot drop the change and any number of
+    /// changes before the worker's next heartbeat cost one `setTopology`.
+    topology_dirty: Arc<AtomicBool>,
+}
+
+/// A new worker's handle, plus the two ends the worker itself keeps: its command
+/// receiver and its topology-dirty flag (shared with the handle).
+fn new_worker_handle() -> (VssHandle, mpsc::Receiver<VssCmd>, Arc<AtomicBool>) {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<VssCmd>(16);
+    let topology_dirty = Arc::new(AtomicBool::new(false));
+    let handle = VssHandle {
+        cmd_tx,
+        topology_dirty: topology_dirty.clone(),
+    };
+    (handle, cmd_rx, topology_dirty)
 }
 
 enum Job {
@@ -39,6 +57,7 @@ enum Job {
         vss_addr: SocketAddr,
         delay: std::time::Duration,
         cmd_rx: mpsc::Receiver<VssCmd>,
+        topology_dirty: Arc<AtomicBool>,
     },
 }
 
@@ -86,7 +105,7 @@ impl VssMgr {
             return Err(VssSyncError::DuplicateWorker(*vss_addr));
         }
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<VssCmd>(16);
+        let (worker, cmd_rx, topology_dirty) = new_worker_handle();
 
         let job = Job::StartVssWorker {
             asm,
@@ -94,6 +113,7 @@ impl VssMgr {
             vss_addr: *vss_addr,
             delay,
             cmd_rx,
+            topology_dirty,
         };
         let send_result = self.jobs_tx.try_send(job);
         if let Err(e) = send_result {
@@ -102,7 +122,6 @@ impl VssMgr {
                 vss_addr, e
             )));
         }
-        let worker = VssHandle { cmd_tx };
         self.workers.insert(node_addr.clone(), worker);
         Ok(())
     }
@@ -123,13 +142,14 @@ impl VssMgr {
         match self.workers.entry(*node_addr) {
             dashmap::Entry::Occupied(_) => Ok(false),
             dashmap::Entry::Vacant(slot) => {
-                let (cmd_tx, cmd_rx) = mpsc::channel::<VssCmd>(16);
+                let (worker, cmd_rx, topology_dirty) = new_worker_handle();
                 let job = Job::StartVssWorker {
                     asm,
                     node_addr: *node_addr,
                     vss_addr: *vss_addr,
                     delay,
                     cmd_rx,
+                    topology_dirty,
                 };
                 self.jobs_tx.try_send(job).map_err(|e| {
                     VssSyncError::QueueFull(format!(
@@ -137,7 +157,7 @@ impl VssMgr {
                         vss_addr, e
                     ))
                 })?;
-                slot.insert(VssHandle { cmd_tx });
+                slot.insert(worker);
                 Ok(true)
             }
         }
@@ -193,7 +213,14 @@ impl VssMgr {
     /// [VssHandle] is just an mpsc sender). Overwrites any existing handle.
     #[cfg(test)]
     pub fn insert_test_handle(&self, node_addr: IpAddr, cmd_tx: mpsc::Sender<VssCmd>) {
-        self.workers.insert(node_addr, VssHandle { cmd_tx });
+        let topology_dirty = Arc::new(AtomicBool::new(false));
+        self.workers.insert(
+            node_addr,
+            VssHandle {
+                cmd_tx,
+                topology_dirty,
+            },
+        );
     }
 
     /// Run the worker-exit housekeeping ([VssMgr::clear_handle]) without a real
@@ -227,12 +254,18 @@ impl VssHandle {
             .map_err(|_| VssSyncError::ConnClosed)
     }
 
-    /// Tell the worker its node's topology changed ([VssCmd::TopologyChanged]) without
-    /// waiting: safe to call from anywhere. Returns false if the mark could not be
-    /// queued (channel full or worker gone); the node's next policy pass or reconnect
-    /// re-sends its topology anyway.
-    pub fn topology_changed(&self) -> bool {
-        self.cmd_tx.try_send(VssCmd::TopologyChanged).is_ok()
+    /// Tell the worker its node's topology changed, so its next heartbeat sends one
+    /// `setTopology` built from the state as it is then (zl-zipline#227). Sets a flag:
+    /// never waits and never fails, whatever the command queue holds.
+    pub fn topology_changed(&self) {
+        self.topology_dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the topology changed since the last call, clearing the mark. Tests read
+    /// what [Self::topology_changed] recorded through this.
+    #[cfg(test)]
+    pub fn take_topology_dirty(&self) -> bool {
+        self.topology_dirty.swap(false, Ordering::SeqCst)
     }
 
     /// Stop the worker.
@@ -316,10 +349,11 @@ async fn run_vss_job(job: Job) {
             vss_addr,
             delay,
             cmd_rx,
+            topology_dirty,
         } => {
             debug!(target: VSS, "starting VSS worker for node {} at {}", node_addr, vss_addr);
             tokio::time::sleep(delay).await;
-            vss_worker::vss_worker_loop(asm.clone(), vss_addr, cmd_rx).await;
+            vss_worker::vss_worker_loop(asm.clone(), vss_addr, cmd_rx, topology_dirty).await;
             // When we exit the worker loop, we are done but the handle is still sitting in
             // the manager. So we clean it out here:
             asm.vss_mgr.clear_handle(&node_addr);
