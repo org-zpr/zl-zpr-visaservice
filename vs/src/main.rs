@@ -435,11 +435,21 @@ async fn main() -> std::process::ExitCode {
         .topo_mgr
         .restore_from_state(&ops, &psnap, &node_addrs)
         .await;
-    drop(ops);
-    if let Err(e) = restored {
-        error!(target: MAIN, "failed to restore topology state: {}", e);
-        return std::process::ExitCode::FAILURE;
+    let down_links = match restored {
+        Ok(down) => down,
+        Err(e) => {
+            error!(target: MAIN, "failed to restore topology state: {}", e);
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    // R14: no node has reported since the restart, so every restored link is down until
+    // both its ends report it up again. R15: revoke the persisted visas that cross a
+    // down link, under the same guard, as a link-state report would. A failed revocation
+    // write quarantines the visa and is retried (VisaMgr), so startup continues.
+    for (a, b) in down_links {
+        let _ = visa_reconciler::revoke_visas_over_link(&asm, &a, &b).await;
     }
+    drop(ops);
 
     js.spawn_local(signal_worker::launch(asm.clone()));
     js.spawn_local(event_mgr::launch(asm.clone(), event_rx));

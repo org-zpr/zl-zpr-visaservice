@@ -540,6 +540,28 @@ async fn add_node_serialized(
         .await
 }
 
+/// R13a (ZODE_LINKS.md): `node` has just (re)connected its VS-API session, which counts as
+/// "something about the pair changed" for every failed pair it is part of. Clear those
+/// marks ([TopologyMgr::clear_failed_pairs_for]) and send `setTopology` to the other end
+/// of each, so its topology names the link again and the owner tries once more (R13).
+/// `node` itself gets its topology through its normal connect sync.
+///
+/// Called under the topology guard, so the clear is ordered with reports and policy
+/// passes. The sends wait on node RPCs, so they run in a spawned task and never under the
+/// guard ([TopoOps] rules); they read the marks after the clear, whenever they run.
+fn repropose_failed_pairs(asm: &Arc<Assembly>, ops: &TopoOps<'_>, node: &IpAddr) {
+    let others = asm.topo_mgr.clear_failed_pairs_for(ops, node);
+    if others.is_empty() {
+        return;
+    }
+    info!(target: API, "node {node} reconnected: proposing its failed links to {others:?} again");
+    let asm = asm.clone();
+    tokio::task::spawn_local(async move {
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        crate::event_mgr::send_topology_to(&asm, &psnap, &others).await;
+    });
+}
+
 /// Helper to write an error into a capnp error builder with a retry of zero.
 fn write_error(bldr: &mut vsapi::error::Builder, code: vsapi::ErrorCode, message: &str) {
     bldr.set_code(code);
@@ -1029,6 +1051,8 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         if matches!(vs_connect_request.ctype, ConnectType::Reset) {
             warn!(target: API, "{} requests RESET: not yet implemented", vs_connect_request.cn);
         }
+        // A session reconnect: the node's failed pairs are proposed again (R13a).
+        repropose_failed_pairs(&self.asm, &ops, &node_zpr_addr);
 
         drop(ops);
 
@@ -1337,6 +1361,9 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         // Install the node's policy-declared links to already-connected peers. Must happen
         // before ActorJoins: that event drives the topology fan-out, which reads the router.
         install_policy_links_for_node(&self.asm, &ops, &node_actor, &node_zpr_addr).await;
+        // A new connect, reconnect or reset: the node's failed pairs are proposed again
+        // (R13a).
+        repropose_failed_pairs(&self.asm, &ops, &node_zpr_addr);
         drop(ops);
 
         let evt = VsEvent::ActorJoins(node_zpr_addr);
@@ -1989,7 +2016,9 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
     /// snapshot: every link the node has, by peer CN, replacing its previous report.
     /// The visa service routes over a link only while both ends report it up; a link
     /// that goes down has the visas crossing it revoked, so their flows re-request and
-    /// get a route around it. A link coming up affects new visas only.
+    /// get a route around it. A link coming up affects new visas only. A `failed` entry
+    /// marks the pair, which is then left out of both ends' topology until either end
+    /// reconnects (R13a); the report itself never sends topology.
     ///
     /// Errors: `authRequired` on a dead handle; `paramError` for more entries than the
     /// node's policy-declared links, an empty peerCn, or a peerCn listed twice.
@@ -3761,6 +3790,16 @@ mod tests {
         /// As [build]; with `cns`, the policy also maps A and B to the CNs
         /// "node-a" and "node-b", so reports naming them resolve.
         async fn build_with_cns(cns: bool) -> (Arc<Assembly>, vsapi::v_s_handle::Client) {
+            build_with(cns, 0).await
+        }
+
+        /// As [build_with_cns]; a non-zero `substrate_port` gives every node the substrate
+        /// address `[<its ZPR address>]:<substrate_port>` in policy, so the node can
+        /// `open` (which refuses port 0 and checks the address against policy).
+        async fn build_with(
+            cns: bool,
+            substrate_port: u16,
+        ) -> (Arc<Assembly>, vsapi::v_s_handle::Client) {
             let (a, b, c): (IpAddr, IpAddr, IpAddr) = (
                 NODE_A.parse().unwrap(),
                 NODE_B.parse().unwrap(),
@@ -3777,7 +3816,20 @@ mod tests {
                     &[
                         make_peering(a, b, "link-ab", vec![]),
                         make_peering(a, c, "link-ac", vec![]),
-                    ],
+                    ]
+                    .map(|mut p| {
+                        if substrate_port != 0 {
+                            p.substrate_a = Some(zpr::policy_types::NetAddr::new_for_ip_or_host(
+                                &p.node_a.to_string(),
+                                substrate_port,
+                            ));
+                            p.substrate_b = Some(zpr::policy_types::NetAddr::new_for_ip_or_host(
+                                &p.node_b.to_string(),
+                                substrate_port,
+                            ));
+                        }
+                        p
+                    }),
                     node_cns,
                 ),
                 PolicyRepo::new(asm.state_db.clone()),
@@ -3926,6 +3978,15 @@ mod tests {
                         }
                         req.send().promise
                     };
+                    // B reports its end up, so A's snapshots alone decide the link
+                    // (R14: both ends must report up).
+                    asm.topo_mgr.record_link_states(
+                        &asm.topo_mgr.ops().await,
+                        &NODE_B.parse().unwrap(),
+                        None,
+                        vec![entry("node-a", LinkState::Up)],
+                        &|| asm.policy_mgr.get_current_snapshot(),
+                    );
                     // Down, then up: the up snapshot is the node's latest word.
                     let held = asm.topo_mgr.ops().await;
                     let down = send(vec![]);
@@ -4023,6 +4084,172 @@ mod tests {
                         send_report(&handle, &[]).await,
                         Err(vsapi::ErrorCode::AuthRequired)
                     );
+                })
+                .await;
+        }
+
+        // --- R13a (ZODE_LINKS.md): failed pairs ---
+
+        /// Substrate port the R13a tests give every node in policy (see [build_with]).
+        const R13A_PORT: u16 = 7000;
+
+        /// A capnp `VSSHandle` stand-in for `node`: the returned receiver gets every
+        /// command the visa service sends to the node's VSS.
+        fn capture_vss(
+            asm: &Assembly,
+            node: &str,
+        ) -> tokio::sync::mpsc::Receiver<crate::vss::VssCmd> {
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            asm.vss_mgr.insert_test_handle(node.parse().unwrap(), tx);
+            rx
+        }
+
+        /// True if `rx` receives a `SetTopology` within a second.
+        async fn gets_topology(rx: &mut tokio::sync::mpsc::Receiver<crate::vss::VssCmd>) -> bool {
+            matches!(
+                tokio::time::timeout(Duration::from_secs(1), rx.recv()).await,
+                Ok(Some(crate::vss::VssCmd::SetTopology(..)))
+            )
+        }
+
+        /// True if nothing reaches `rx` within 100 ms.
+        async fn gets_nothing(rx: &mut tokio::sync::mpsc::Receiver<crate::vss::VssCmd>) -> bool {
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err()
+        }
+
+        /// `open` (a soft VS-API session reconnect) as `node`, whose CN is `cn`.
+        async fn reopen(asm: &Arc<Assembly>, node: &str, cn: &str) {
+            let vs: vsapi::visa_service::Client = capnp_rpc::new_client(VisaServiceImpl {
+                asm: asm.clone(),
+                remote: SocketAddr::new(node.parse().unwrap(), 1234),
+            });
+            let mut req = vs.open_request();
+            {
+                let mut r = req.get().init_req();
+                r.set_cn(cn);
+                r.set_ctype(vsapi::VSConnT::Reconnect);
+                let mut p = r.init_params(1).get(0);
+                p.set_ptype(vsapi::ParamT::String);
+                p.set_name(pname::SUBSTRATE_ADDR);
+                p.set_value_text(format!("[{node}]:{R13A_PORT}"));
+            }
+            let resp = req.send().promise.await.unwrap();
+            assert!(
+                matches!(
+                    resp.get().unwrap().get_resp().unwrap().which().unwrap(),
+                    vsapi::result::Which::Ok(_)
+                ),
+                "open as {node} must succeed"
+            );
+        }
+
+        /// A, the owner, reports its link to B `failed` through its handle.
+        async fn a_reports_b_failed(asm: &Assembly, handle: &vsapi::v_s_handle::Client) {
+            assert_eq!(
+                send_report(handle, &[entry("node-b", LinkState::Failed)]).await,
+                Ok(())
+            );
+            assert!(
+                asm.topo_mgr
+                    .is_failed_pair(&NODE_A.parse().unwrap(), &NODE_B.parse().unwrap())
+            );
+        }
+
+        /// A `failed` report marks the pair and never itself sends topology (R13a: the
+        /// owner has already stopped; sending would only loop).
+        #[tokio::test]
+        async fn failed_report_marks_the_pair_and_sends_no_topology() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build_with(true, R13A_PORT).await;
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+                    a_reports_b_failed(&asm, &handle).await;
+                    assert!(
+                        gets_nothing(&mut a_vss).await,
+                        "no topology to the reporter"
+                    );
+                    assert!(gets_nothing(&mut b_vss).await, "no topology to the peer");
+                })
+                .await;
+        }
+
+        /// A `down` report sets no mark.
+        #[tokio::test]
+        async fn down_report_sets_no_mark() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build_with(true, R13A_PORT).await;
+                    assert_eq!(
+                        send_report(&handle, &[entry("node-b", LinkState::Down)]).await,
+                        Ok(())
+                    );
+                    assert!(
+                        !asm.topo_mgr
+                            .is_failed_pair(&NODE_A.parse().unwrap(), &NODE_B.parse().unwrap())
+                    );
+                })
+                .await;
+        }
+
+        /// A session reconnect of either end clears the mark and sends `setTopology`
+        /// to the other end, which now names the link again; R13 then makes the owner
+        /// try once more. The reconnecting end gets topology from its own connect
+        /// sync, not from here.
+        #[tokio::test]
+        async fn reconnect_of_either_end_clears_the_pair_and_tells_the_other_end() {
+            for (reconnecting, cn, other) in
+                [(NODE_A, "node-a", NODE_B), (NODE_B, "node-b", NODE_A)]
+            {
+                tokio::task::LocalSet::new()
+                    .run_until(async {
+                        let (asm, handle) = build_with(true, R13A_PORT).await;
+                        a_reports_b_failed(&asm, &handle).await;
+                        let mut reconnecting_vss = capture_vss(&asm, reconnecting);
+                        let mut other_vss = capture_vss(&asm, other);
+                        reopen(&asm, reconnecting, cn).await;
+                        assert!(
+                            !asm.topo_mgr
+                                .is_failed_pair(&NODE_A.parse().unwrap(), &NODE_B.parse().unwrap()),
+                            "{reconnecting} reconnected: the pair is cleared"
+                        );
+                        assert!(
+                            gets_topology(&mut other_vss).await,
+                            "{other} is sent topology with the link again"
+                        );
+                        assert!(gets_nothing(&mut reconnecting_vss).await);
+                    })
+                    .await;
+            }
+        }
+
+        /// A reconnect of a node outside the pair leaves the mark alone and sends no
+        /// topology to the pair's ends.
+        #[tokio::test]
+        async fn reconnect_of_an_unrelated_node_keeps_the_mark() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build_with(true, R13A_PORT).await;
+                    asm.actor_mgr
+                        .add_node(
+                            &make_node_actor_defexp(NODE_C, "node-c", "[fd5a:5052::103]:1234"),
+                            false,
+                            &Default::default(),
+                        )
+                        .await
+                        .unwrap();
+                    a_reports_b_failed(&asm, &handle).await;
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+                    reopen(&asm, NODE_C, "node-c").await;
+                    assert!(
+                        asm.topo_mgr
+                            .is_failed_pair(&NODE_A.parse().unwrap(), &NODE_B.parse().unwrap())
+                    );
+                    assert!(gets_nothing(&mut a_vss).await);
+                    assert!(gets_nothing(&mut b_vss).await);
                 })
                 .await;
         }

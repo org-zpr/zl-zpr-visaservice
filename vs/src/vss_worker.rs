@@ -825,7 +825,8 @@ async fn vss_do_set_topology(
 
 /// The `Link`s of `node_addr`'s topology message: one per resolved peer, each naming the
 /// peer's ZPR address and CN, and carrying the peer's bootstrap visas when it may need them
-/// (see [visa_bootstrap::visas_for_link]).
+/// (see [visa_bootstrap::visas_for_link]). A link whose owner reported it `failed` is left
+/// out until the pair is cleared (R13a, `TopologyMgr::is_failed_pair`).
 ///
 /// `policy` must be the snapshot `peers` was computed from, as for [vss_do_set_topology].
 pub(crate) async fn topology_links(
@@ -846,6 +847,16 @@ pub(crate) async fn topology_links(
             warn!(target: VSS, "no peer entry for link {link_id} under node {node_addr}; skipping it (zprAddr unknown)");
             continue;
         };
+        // R13a (ZODE_LINKS.md): the visa service owns the retry policy. The owner reported
+        // this link failed, so neither end is told about it until something about the pair
+        // changes; dropping it from topology also closes it (R12).
+        if asm
+            .topo_mgr
+            .is_failed_pair(node_addr, &peer.remote_zpr_addr)
+        {
+            info!(target: VSS, "link {link_id} between {node_addr} and {} was reported failed; left out of topology", peer.remote_zpr_addr);
+            continue;
+        }
         // The CN the peer's link certificate must carry (zl-zipline#221). A peer policy does
         // not name is left out (operator, pd g44 q2): its node would refuse an unnamed peer
         // (zl-zipline#220), and its bootstrap visas would have no CN to be bound to.

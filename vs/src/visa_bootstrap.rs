@@ -713,6 +713,76 @@ mod tests {
         );
     }
 
+    /// R13a (ZODE_LINKS.md): once the owner reports a link `failed`, the visa service leaves
+    /// it out of both ends' topology until the pair is cleared (a (re)connect of either end),
+    /// and proposes it again after that. Other links of the same node are unaffected.
+    #[tokio::test]
+    async fn topology_links_leave_out_a_failed_pair_until_it_is_cleared() {
+        use zpr::vsapi_types::{LinkState, LinkStateReport};
+        let relay: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let a: IpAddr = "fd5a:5052:3000::a".parse().unwrap();
+        let b: IpAddr = "fd5a:5052:3000::b".parse().unwrap();
+        let asm = Arc::new(
+            build_bootstrap_test_asm_with_cns(
+                relay,
+                &[a, b],
+                &[(relay, "relay.zpr"), (a, "a.zpr"), (b, "b.zpr")],
+            )
+            .await,
+        );
+        // The peers each end's topology names, by ZPR address.
+        let peers_of = |node: IpAddr| {
+            let asm = asm.clone();
+            async move {
+                let mut peers: Vec<IpAddr> = crate::vss_worker::topology_links(
+                    &asm,
+                    &asm.policy_mgr.get_current(),
+                    &node,
+                    resolved_peers(&asm, &node),
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|l| l.zpr_addr)
+                .collect();
+                peers.sort();
+                peers
+            }
+        };
+        assert_eq!(peers_of(relay).await, vec![a, b]);
+        assert_eq!(peers_of(a).await, vec![relay]);
+
+        // The relay reports its link to A failed.
+        asm.topo_mgr.record_link_states(
+            &asm.topo_mgr.ops().await,
+            &relay,
+            None,
+            vec![LinkStateReport {
+                peer_cn: "a.zpr".to_string(),
+                state: LinkState::Failed,
+            }],
+            &|| asm.policy_mgr.get_current_snapshot(),
+        );
+        assert_eq!(
+            peers_of(relay).await,
+            vec![b],
+            "left out of the reporter's topology"
+        );
+        assert!(
+            peers_of(a).await.is_empty(),
+            "and out of the peer's topology"
+        );
+
+        // A (re)connects: the pair is cleared and proposed again.
+        assert_eq!(
+            asm.topo_mgr
+                .clear_failed_pairs_for(&asm.topo_mgr.ops().await, &a),
+            vec![relay]
+        );
+        assert_eq!(peers_of(relay).await, vec![a, b]);
+        assert_eq!(peers_of(a).await, vec![relay]);
+    }
+
     /// Bootstrap visas go only to the node the visa service docks on -- the relay (plan §5.6,
     /// operator pd g44 q3). A connected node that is not the relay but is declared to link
     /// with an unconnected peer (an endpoint with a direct link to a laptop that has not
