@@ -516,6 +516,7 @@ impl TopologyMgr {
             old_id: Option<LinkId>,
         }
 
+        let cn_of = Self::policy_cn_lookup(snapshot);
         let mut surviving: Vec<Surviving> = Vec::new();
         let mut removals: Vec<Removal> = Vec::new();
         for (a, b) in work_edges {
@@ -532,9 +533,14 @@ impl TopologyMgr {
                     let action = match &router_link {
                         None => Action::Fresh,
                         Some(rl) => {
+                            // The up/down flag is part of the comparison: the
+                            // node-to-CN index comes from policy, so a new policy can
+                            // change which link-state reports match a link whose id,
+                            // cost and attributes did not change.
                             let changed = rl.id.0 != desc.link_id
                                 || rl.cost != desc.cost
-                                || !attributes_equivalent(&rl.attributes, &desc.attrs);
+                                || !attributes_equivalent(&rl.attributes, &desc.attrs)
+                                || rl.up != self.usable_now(&a, &b, &cn_of);
                             if changed {
                                 Action::Replace(rl.id.clone())
                             } else {
@@ -594,7 +600,6 @@ impl TopologyMgr {
         let mut additions: Vec<LinkSpec> = Vec::new();
         // Link state comes from link-state reports, not policy: every installed or
         // rebuilt link gets the flag its reports call for, inside the atomic batch.
-        let cn_of = Self::policy_cn_lookup(snapshot);
         for e in surviving {
             let spec = LinkSpec {
                 a: e.a,
@@ -1628,6 +1633,40 @@ mod tests {
         assert!(
             topo.links_to_revoke(&b, vec![]).is_empty(),
             "a link that is up again needs no revocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revalidate_reapplies_link_state_to_kept_links() {
+        // A link that is unchanged in policy (same id, cost, attributes) must still get
+        // its up/down flag re-evaluated: the node-to-CN index comes from policy, so a
+        // new policy can change which reports match the link.
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        // This policy declares the link but names no CNs.
+        let policy_mgr = make_policy_mgr(db.clone(), a, b, "link-ab").await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("link-ab".into()), vec![], 1)
+            .unwrap();
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+
+        // Under an earlier CN mapping, A's report matches B and the link is up.
+        let old_cns = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        topo.record_link_states(&a, vec![report("b.zpr", LinkState::Up)], &old_cns);
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+
+        // The current policy no longer knows B's CN, so A's entry cannot match it.
+        let report = topo
+            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
+            .await
+            .unwrap();
+        assert_eq!(report.links_removed, 0);
+        assert!(
+            !topo.router.link_between(&a, &b).unwrap().up,
+            "the kept link must follow the new CN mapping"
         );
     }
 }
