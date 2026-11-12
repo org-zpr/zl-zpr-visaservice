@@ -159,6 +159,10 @@ impl VisaMgr {
     ///   instructions.
     /// - On an egress node we send a full visa, no forwarding info.
     ///
+    /// In every context the copy's `prev_hop` names the node before `target_node` on the
+    /// path, and is unset on the ingress node and for a visa with no path of two or more
+    /// nodes (zl-zipline#245).
+    ///
     pub async fn actualize_visa_for_target_node(
         &self,
         mut visa: Visa,
@@ -186,8 +190,14 @@ impl VisaMgr {
             VCtx::Intermediary
         };
 
+        // Every node's copy names the node before it on the path: the only node it may accept
+        // a StreamIdRequest for this visa from (zl-zipline#245). The ingress node is first on
+        // the path, so its copy has none -- the flow starts there.
+        visa.prev_hop = prev_hop_in_path(path, target_node).copied();
+
         match vctx {
-            // The flow terminates here, so there is nothing to forward: full visa as-is.
+            // The flow terminates here, so there is nothing to forward: the full visa, with
+            // only its previous hop set above.
             VCtx::Egress => Ok(visa),
 
             // Both other roles forward one hop further along the path -- given [A, B, C, D],
@@ -714,6 +724,9 @@ impl VisaMgr {
             dock_pep: Some(pep),
             fwd_pep: None,
             cons: None,
+            // Per node: set when the visa is actualized for each node on its path
+            // (see [VisaMgr::actualize_visa_for_target_node]).
+            prev_hop: None,
         };
 
         // The store also updates the visa state along the path.
@@ -1174,6 +1187,13 @@ fn to_forwarding_visa(mut visa: Visa, fwd_pep: FwdPep) -> Visa {
     visa.dock_pep = None;
     visa.fwd_pep = Some(fwd_pep);
     visa
+}
+
+/// The node that hands off to `target_node` on `path`: the one before it, since the path runs
+/// in flow order. `None` if `target_node` is the ingress node or is not on the path at all.
+fn prev_hop_in_path<'a>(path: &'a [IpAddr], target_node: &IpAddr) -> Option<&'a IpAddr> {
+    let pos = path.iter().position(|n| n == target_node)?;
+    path.get(pos.checked_sub(1)?)
 }
 
 /// The node `target_node` hands off to on `path`: the next one along, since the path runs in
@@ -1670,6 +1690,46 @@ mod tests {
         assert!(pending.contains(&visa.issuer_id));
     }
 
+    /// The relay's copy of a joiner's forward bootstrap visa (path `[joiner, relay]`) names the
+    /// joiner as previous hop, and the joiner's copy of the reverse one (path
+    /// `[relay, joiner]`) names the relay. The relay hand-off (zl-zipline#222) accepts a
+    /// StreamIdRequest for these only from that previous hop.
+    #[tokio::test]
+    async fn test_vsapi_bootstrap_visas_carry_prev_hop() {
+        let asm = crate::assembly::tests::new_assembly_for_tests(None).await;
+        let relay = add_vs_docking_node(&asm).await;
+        let joiner: IpAddr = "fd5a:5052:3000::a".parse().unwrap();
+
+        // (direction, node whose copy is checked, expected prev_hop).
+        let cases = [
+            (Direction::Forward, relay, joiner),
+            (Direction::Reverse, joiner, relay),
+        ];
+        for (direction, node, expected) in cases {
+            let visa = asm
+                .visa_mgr
+                .vsapi_bootstrap_visa_for_future_peer(
+                    &asm,
+                    &asm.policy_mgr.get_current(),
+                    &joiner,
+                    &relay,
+                    direction,
+                )
+                .await
+                .unwrap();
+            let actualized = asm
+                .visa_mgr
+                .actualize_visa_for_target_node(visa, &node)
+                .await
+                .unwrap();
+            assert_eq!(
+                actualized.prev_hop,
+                Some(expected),
+                "{direction:?} bootstrap visa actualized for {node}"
+            );
+        }
+    }
+
     /// The mint must hold `bootstrap_lock` across its whole check-then-create. Two neighbours
     /// minting for the same future peer would otherwise interleave at the DB awaits, both see
     /// no visa, and mint duplicates. Holding the lock here has to stall a concurrent mint;
@@ -1777,6 +1837,7 @@ mod tests {
             .unwrap();
         assert_eq!(result.issuer_id, 1);
         assert!(result.fwd_pep.is_none());
+        assert!(result.prev_hop.is_none(), "no path, no previous hop");
     }
 
     /// Path with only one node → visa returned unchanged.
@@ -1792,6 +1853,49 @@ mod tests {
             .unwrap();
         assert_eq!(result.issuer_id, 1);
         assert!(result.fwd_pep.is_none());
+        // A single-node visa never arrives by StreamIdRequest, so it names no
+        // previous hop (zl-zipline#245, g65 q2).
+        assert!(
+            result.prev_hop.is_none(),
+            "single-node visa, no previous hop"
+        );
+    }
+
+    /// Each node's copy names the node before it on the flow-order path as its previous
+    /// hop, which is the only node it may accept a StreamIdRequest for the visa from
+    /// (zl-zipline#245). The ingress node has none: the flow starts there. The reverse
+    /// visa stores its own flow order [C, B, A], so the roles and previous hops flip with it.
+    #[tokio::test]
+    async fn test_actualize_sets_prev_hop_from_flow_order_path() {
+        let mgr = make_mgr().await;
+        let a: IpAddr = PATH_NODE_A.parse().unwrap();
+        let b: IpAddr = PATH_NODE_B.parse().unwrap();
+        let c: IpAddr = PATH_NODE_C.parse().unwrap();
+        let mut reverse_path = three_node_path();
+        reverse_path.reverse();
+        let forward = store_test_visa(&mgr, 1, Some(three_node_path())).await;
+        let reverse = store_test_visa(&mgr, 2, Some(reverse_path)).await;
+
+        // (visa, target node, expected prev_hop): ingress, intermediary, egress per direction.
+        let cases = [
+            (&forward, a, None),
+            (&forward, b, Some(a)),
+            (&forward, c, Some(b)),
+            (&reverse, c, None),
+            (&reverse, b, Some(c)),
+            (&reverse, a, Some(b)),
+        ];
+        for (visa, node, expected) in cases {
+            let result = mgr
+                .actualize_visa_for_target_node(visa.clone(), &node)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.prev_hop, expected,
+                "visa {} actualized for {node}",
+                visa.issuer_id
+            );
+        }
     }
 
     /// Ingress context (first node + Forward) → full visa with fwd_pep pointing to the second path node.
