@@ -456,21 +456,9 @@ impl ConnectionControl {
 
         let mut authd_claims: Vec<Attribute> = Vec::new();
 
-        // Policy topology may declare this node's substrate address; if so the node's
-        // advertised value must match it. With no topology entry (single-node deploy,
-        // no peerings) the advertised value is all we have, and it is trusted operator
-        // config just like a policy-declared substrate.
-        let substrate_addr = match substrate_addr_from_topology(&asm, &node_req_addr) {
-            Some(sa) => {
-                if sa != reported_substrate {
-                    return Err(ServiceError::Param(format!(
-                        "substrate address mismatch: policy declares {sa}, node reported {reported_substrate}"
-                    )));
-                }
-                sa
-            }
-            None => reported_substrate,
-        };
+        // The node's substrate address: policy's, if it declares one (the report must
+        // match), else the reported one (plan §7 check 3, zl-zipline#227).
+        let substrate_addr = accept_reported_substrate(&asm, &node_req_addr, reported_substrate)?;
         authd_claims
             .push(Attribute::builder(key::SUBSTRATE_ADDR).value(substrate_addr.to_string()));
         match a2a_dh_pubkey.and_then(a2a_dh_pubkey_claim) {
@@ -2551,6 +2539,33 @@ pub fn substrate_addr_from_topology(asm: &Assembly, node_addr: &IpAddr) -> Optio
     None
 }
 
+/// The substrate address to record for the node at `node_addr`, which reported
+/// `reported` (the address its peers should dial). The one rule for every path that
+/// records it -- `authenticate_node`, `open` and `updateSubstrateAddr`:
+///
+/// - policy declares an address for the node ([substrate_addr_from_topology]): the
+///   report must equal it, or this is a [ServiceError::Param];
+/// - policy declares none -- no peerings at all, or links whose end for this node has
+///   no address (a laptop endpoint that changes networks, zl-zipline#225) -- the
+///   reported address stands (plan §7 check 3, zl-zipline#227).
+///
+/// Trusting the report steers only where peers dial: a link still needs the peer's
+/// CA-signed certificate with the expected CN, so a wrong address yields a failed
+/// link, not an impersonation.
+pub fn accept_reported_substrate(
+    asm: &Assembly,
+    node_addr: &IpAddr,
+    reported: SocketAddr,
+) -> Result<SocketAddr, ServiceError> {
+    match substrate_addr_from_topology(asm, node_addr) {
+        Some(declared) if declared != reported => Err(ServiceError::Param(format!(
+            "substrate address mismatch: policy declares {declared}, node reported {reported}"
+        ))),
+        Some(declared) => Ok(declared),
+        None => Ok(reported),
+    }
+}
+
 /// Required claims must be present and non-empty.
 fn check_required_claims(claims: &[Claim], required: &[&str]) -> Result<(), ServiceError> {
     let mut required_set = std::collections::HashSet::new();
@@ -3297,6 +3312,91 @@ mod tests {
             matches!(result, Err(ServiceError::Param(_))),
             "expected param error, got {:?}",
             result
+        );
+    }
+
+    /// Plan §7 check 3 (zl-zipline#227): policy declares links for the node but no
+    /// substrate address for it (a laptop endpoint). The node's reported address is
+    /// accepted and becomes its `key::SUBSTRATE_ADDR` claim.
+    #[tokio::test]
+    async fn authenticate_node_declared_links_without_substrate_accepts_reported() {
+        use crate::test_helpers::make_peering;
+
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        let relay: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
+        let laptop: IpAddr = "fd5a:5052:90de:1::2".parse().unwrap();
+        let mut peering = make_peering(relay, laptop, "link-relay-laptop", vec![]);
+        peering.substrate_b = None; // the laptop reports its own
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_and_peering(
+                cn,
+                &pubkey_der,
+                &peering,
+            ))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let challenge = b"my-challenge";
+        let timestamp = unix_now();
+        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
+        let reported: SocketAddr = "192.0.2.10:7000".parse().unwrap();
+
+        let actor = cc
+            .authenticate_node(asm, challenge, timestamp, cn, &sig, laptop, reported, None)
+            .await
+            .expect("a node with links but no declared substrate authenticates");
+        let stored = actor
+            .get_attribute(key::SUBSTRATE_ADDR)
+            .expect("substrate addr claim must be present")
+            .get_value()[0]
+            .clone();
+        assert_eq!(stored, reported.to_string());
+    }
+
+    /// [accept_reported_substrate] is the one rule every path that records a node's
+    /// substrate address uses: policy's address when it declares one (the report must
+    /// match), the reported one otherwise.
+    #[tokio::test]
+    async fn accept_reported_substrate_follows_policy_when_it_declares_one() {
+        use crate::test_helpers::make_peering;
+
+        let asm = crate::assembly::tests::new_assembly_for_tests(None).await;
+        let (_privkey, pubkey_der) = gen_rsa_test_keypair();
+        let relay: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
+        let laptop: IpAddr = "fd5a:5052:90de:1::2".parse().unwrap();
+        let unpeered: IpAddr = "fd5a:5052:90de:1::9".parse().unwrap();
+        let mut peering = make_peering(relay, laptop, "link-relay-laptop", vec![]);
+        peering.substrate_b = None;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_and_peering(
+                "test-node.zpr",
+                &pubkey_der,
+                &peering,
+            ))
+            .await
+            .unwrap();
+        let reported: SocketAddr = "192.0.2.10:7000".parse().unwrap();
+
+        // Declared: make_peering gives the relay its own address, port 0.
+        let declared = SocketAddr::new(relay, 0);
+        assert_eq!(
+            accept_reported_substrate(&asm, &relay, declared).unwrap(),
+            declared
+        );
+        assert!(matches!(
+            accept_reported_substrate(&asm, &relay, reported),
+            Err(ServiceError::Param(_))
+        ));
+        // Links but no declared address, and no peering at all: the report stands.
+        assert_eq!(
+            accept_reported_substrate(&asm, &laptop, reported).unwrap(),
+            reported
+        );
+        assert_eq!(
+            accept_reported_substrate(&asm, &unpeered, reported).unwrap(),
+            reported
         );
     }
 

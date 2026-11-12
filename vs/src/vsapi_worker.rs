@@ -432,18 +432,14 @@ async fn resume_node_actor_for_open(
         ));
     }
 
-    // If policy topology declares a substrate for this node it must agree with the
-    // reported one; with no topology entry the reported value stands.
-    if let Some(sa) = crate::connection_control::substrate_addr_from_topology(asm, &node_zpr_addr)
-        && sa != reported_substrate
-    {
-        return Err((
-            vsapi::ErrorCode::ParamError,
-            format!(
-                "substrate address mismatch: policy declares {sa}, node reported {reported_substrate}"
-            ),
-        ));
-    }
+    // The same substrate rule as `connect`: policy's address if it declares one (the
+    // report must match), else the reported one (zl-zipline#227).
+    let reported_substrate = crate::connection_control::accept_reported_substrate(
+        asm,
+        &node_zpr_addr,
+        reported_substrate,
+    )
+    .map_err(|e| (vsapi::ErrorCode::ParamError, e.to_string()))?;
 
     // A soft reconnect may carry a changed dock address; keep the stored claim current.
     let stored = existing_actor
@@ -4266,6 +4262,56 @@ mod tests {
             task.await
                 .unwrap()
                 .expect("open's state update completes once the lock is free");
+        }
+
+        /// `open` applies the same substrate rule as `connect` (zl-zipline#227): with a
+        /// policy that declares links for the node but no address for it, a changed
+        /// reported address is accepted and stored; where policy declares one, a
+        /// different report is a `paramError` and the stored claim is unchanged.
+        #[tokio::test]
+        async fn test_open_applies_the_reported_substrate_rule() {
+            use crate::test_helpers::{make_peering, policy_with_peerings};
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let node: std::net::IpAddr = NODE.parse().unwrap();
+            let relay: std::net::IpAddr = "fd5a:5052:3000::9".parse().unwrap();
+            let mut peering = make_peering(relay, node, "link-relay-zode", vec![]);
+            peering.substrate_b = None;
+            asm.policy_mgr
+                .update_policy_from_container_bytes(policy_with_peerings(&[peering]))
+                .await
+                .unwrap();
+            let stored = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
+            asm.actor_mgr
+                .add_node(&stored, false, &Default::default())
+                .await
+                .unwrap();
+            let moved: std::net::SocketAddr = "192.0.2.10:7000".parse().unwrap();
+            let actor = resume_node_actor_for_open(&asm, node, moved, "zode")
+                .await
+                .map_err(|(code, msg)| format!("{code:?}: {msg}"))
+                .expect("a reported address stands when policy declares none");
+            assert_eq!(
+                actor
+                    .get_attribute(key::SUBSTRATE_ADDR)
+                    .unwrap()
+                    .get_value()[0],
+                moved.to_string()
+            );
+
+            // The relay's address is declared ([relay]:0): another report is refused.
+            let relay_actor = make_node_actor_defexp(
+                "fd5a:5052:3000::9",
+                "relay",
+                &std::net::SocketAddr::new(relay, 0).to_string(),
+            );
+            asm.actor_mgr
+                .add_node(&relay_actor, false, &Default::default())
+                .await
+                .unwrap();
+            let err = resume_node_actor_for_open(&asm, relay, moved, "relay")
+                .await
+                .expect_err("a report that contradicts policy is refused");
+            assert!(matches!(err.0, vsapi::ErrorCode::ParamError), "{err:?}");
         }
 
         /// #63 review (Codex P1): a Reset authentication tears the node's old
