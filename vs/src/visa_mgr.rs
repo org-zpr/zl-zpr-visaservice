@@ -37,9 +37,9 @@ pub struct VisaMgr {
     /// Serializes the check-then-create in [VisaMgr::vsapi_bootstrap_visa_for_future_peer].
     /// Behind an `Arc` so every clone of the manager shares the one lock.
     bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Visas found on a downed route at commit whose revocation failed
-    /// ([VisaMgr::revoke_if_route_down]). They are never handed out, and their
-    /// revocation is retried on every [VisaMgr::get_pending_visas_for_node].
+    /// Visas whose revocation write failed, at commit ([VisaMgr::revoke_if_route_down])
+    /// or when a link went down (`revoke_visas_over_link`). They are never handed out,
+    /// and their revocation is retried on every [VisaMgr::get_pending_visas_for_node].
     quarantine: Arc<Mutex<HashSet<u64>>>,
 }
 
@@ -564,7 +564,7 @@ impl VisaMgr {
         }
         warn!(target: VISA, "visa {visa_id}: a link on its route went down while it was issued; revoking it");
         if let Err(e) = self.mark_visa_revoked(visa_id).await {
-            self.quarantine.lock().unwrap().insert(visa_id);
+            self.quarantine(visa_id);
             return Err(ServiceError::Internal(format!(
                 "visa {visa_id}: its route went down while it was issued and revoking it failed: {e}"
             )));
@@ -705,6 +705,14 @@ impl VisaMgr {
             .filter(|v| !quarantined.contains(&v.issuer_id))
             .collect();
         Ok(visas)
+    }
+
+    /// Quarantine a visa whose revocation write failed: it is never handed out by
+    /// [VisaMgr::get_pending_visas_for_node], which also retries the revocation until
+    /// it succeeds. Covers visas installed or pending on any route, whatever later
+    /// happens to the link that made them stale.
+    pub(crate) fn quarantine(&self, visa_id: u64) {
+        self.quarantine.lock().unwrap().insert(visa_id);
     }
 
     /// Try again to revoke every quarantined visa; drop each one whose revocation

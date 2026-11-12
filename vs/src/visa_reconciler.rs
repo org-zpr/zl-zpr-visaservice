@@ -151,10 +151,12 @@ pub(crate) async fn revalidate_visas(
 /// route that avoids the link. A visa with no path (both actors on one node) never
 /// crosses a link.
 ///
-/// Every crossing visa is attempted even if some writes fail. Returns `Ok(marked)`
-/// when every write succeeded, or `Err(failed)` with the number of visas whose state
-/// write failed, so the caller can retry the whole link later (marking a visa that is
-/// already `PendingRevoke` again is harmless).
+/// Every crossing visa is attempted even if some writes fail. A visa whose write fails
+/// is quarantined ([VisaMgr::quarantine]): withheld from distribution and retried on
+/// every pending-visa read. Returns `Ok(marked)` when every write succeeded, or
+/// `Err(failed)` with the number quarantined.
+///
+/// [VisaMgr::quarantine]: crate::visa_mgr::VisaMgr::quarantine
 ///
 /// [VisaMgr::mark_visa_revoked]: crate::visa_mgr::VisaMgr::mark_visa_revoked
 pub(crate) async fn revoke_visas_over_link(
@@ -179,7 +181,9 @@ pub(crate) async fn revoke_visas_over_link(
             Ok(false) => {} // already being revoked
             Err(e) => {
                 failed += 1;
-                warn!(target: VISA, "link {a} <-> {b} down: failed to revoke visa {visa_id}: {e}")
+                // Retried per visa from now on, independent of the link or reports.
+                asm.visa_mgr.quarantine(visa_id);
+                warn!(target: VISA, "link {a} <-> {b} down: failed to revoke visa {visa_id}, quarantined for retry: {e}")
             }
         }
     }
@@ -468,10 +472,11 @@ mod tests {
         assert_eq!(revoked.len(), 1, "the stored visa is revoked");
     }
 
-    /// A revocation whose state write fails is reported as failed, so the caller can
-    /// retry it; once the write works again the retry succeeds.
+    /// A link revocation whose state write fails quarantines the visa: it is not
+    /// handed out while the write keeps failing, and the next pending-visa read
+    /// revokes it once writes work again -- whatever happens to the link meanwhile.
     #[tokio::test]
-    async fn test_revoke_visas_over_link_reports_failed_writes() {
+    async fn test_failed_link_revocation_quarantines_the_visa() {
         use crate::db::FaultMode;
         use crate::test_helpers::{build_sweep_asm_with_db, create_routed_sweep_visa};
         let (asm, node_a, db) = build_sweep_asm_with_db(true).await;
@@ -480,14 +485,25 @@ mod tests {
 
         db.set_set_ex_fault(FaultMode::Reject);
         assert_eq!(revoke_visas_over_link(&asm, &node_a, &node_b).await, Err(1));
+        let pending = asm
+            .visa_mgr
+            .get_pending_visas_for_node(&node_a)
+            .await
+            .unwrap();
+        assert!(pending.iter().all(|v| v.issuer_id != id), "quarantined");
+
         db.set_set_ex_fault(FaultMode::None);
-        assert_eq!(revoke_visas_over_link(&asm, &node_a, &node_b).await, Ok(1));
+        asm.visa_mgr
+            .get_pending_visas_for_node(&node_a)
+            .await
+            .unwrap();
         assert_eq!(
             asm.visa_mgr
                 .get_pending_revoke_visa_ids_for_node(&node_a)
                 .await
                 .unwrap(),
-            vec![id]
+            vec![id],
+            "the quarantine retry revoked it"
         );
     }
 

@@ -1771,9 +1771,7 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
     /// get a route around it. A link coming up affects new visas only.
     ///
     /// Errors: `authRequired` on a dead handle; `paramError` for more entries than the
-    /// node's policy-declared links, an empty peerCn, or a peerCn listed twice;
-    /// `internal` when the snapshot was stored but revoking the visas over a link that
-    /// went down failed -- the node should re-send, which retries the revocation.
+    /// node's policy-declared links, an empty peerCn, or a peerCn listed twice.
     async fn report_link_states(
         self: Rc<Self>,
         params: vsapi::v_s_handle::ReportLinkStatesParams,
@@ -1850,23 +1848,11 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             .asm
             .topo_mgr
             .record_link_states(&reporter, entries, &cn_of);
-        // Links that just went down, plus earlier failed revocations on this node's
-        // links that are still down: retried here, independent of a new transition.
-        let mut revocation_failed = false;
-        for (a, b) in self.asm.topo_mgr.links_to_revoke(&reporter, went_down) {
-            let ok = revoke_visas_over_link(&self.asm, &a, &b).await.is_ok();
-            self.asm.topo_mgr.note_revocation(&a, &b, ok);
-            revocation_failed |= !ok;
-        }
-        if revocation_failed {
-            // The snapshot is stored; only the revocation is incomplete. Ask the node to
-            // re-send, which retries it.
-            refuse(
-                &mut results,
-                vsapi::ErrorCode::Internal,
-                "link-down revocation incomplete; re-send the report",
-            );
-            return Ok(());
+        // Revoke the visas crossing every link that just went down. A visa whose
+        // revocation write fails is quarantined and retried per visa (VisaMgr), so the
+        // report itself succeeds either way.
+        for (a, b) in went_down {
+            let _ = revoke_visas_over_link(&self.asm, &a, &b).await;
         }
 
         results.get().init_res().set_ok(());

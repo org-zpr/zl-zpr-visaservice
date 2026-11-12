@@ -279,15 +279,21 @@ impl Router {
     }
 
     /// Atomically apply a batch of link removals followed by additions under a single
-    /// write lock, so no concurrent route observes a partially-rewritten graph.
+    /// write lock, so no concurrent route observes a partially-rewritten graph. If an
+    /// addition fails, every change is undone -- added links removed, removed links
+    /// restored with their flags -- and the error returned.
     pub fn apply_link_batch(
         &self,
         removals: &[LinkId],
         additions: Vec<LinkSpec>,
     ) -> Result<(), TopologyError> {
         let mut inner = self.inner.write().unwrap();
+        // Keep what was removed, so a failed addition can put the graph back exactly.
+        let mut removed: Vec<(LinkId, Link)> = Vec::with_capacity(removals.len());
         for id in removals {
-            inner.topology.remove_link(id);
+            if let Some(link) = inner.topology.remove_link(id) {
+                removed.push((id.clone(), link));
+            }
         }
         let mut added: Vec<LinkId> = Vec::with_capacity(additions.len());
         for spec in additions {
@@ -302,8 +308,22 @@ impl Router {
                 inner.topology.set_link_up(&spec.id, false);
             }
             if let Err(e) = added_result {
+                // Undo the batch: drop what was added, then restore what was removed
+                // (with its up/down flag), so a rejected reconcile leaves the live
+                // topology untouched.
                 for done in added.iter().rev() {
                     inner.topology.remove_link(done);
+                }
+                for (id, link) in removed {
+                    let up = link.up;
+                    if inner
+                        .topology
+                        .add_link(link.a, link.b, id.clone(), link.attributes, link.cost)
+                        .is_ok()
+                        && !up
+                    {
+                        inner.topology.set_link_up(&id, false);
+                    }
                 }
                 inner.route_cache.clear();
                 inner.link_to_cache_keys.clear();
@@ -2144,5 +2164,29 @@ mod tests {
             "a missing link is not up"
         );
         assert!(r.links_up(&[]), "no links (direct route) is trivially up");
+    }
+
+    #[test]
+    fn test_apply_link_batch_restores_removed_links_when_an_addition_fails() {
+        // A failed addition must leave the graph as it was, including the links the
+        // batch removed first (and their up/down flags).
+        let (r, a, b, _c) = make_triangle();
+        r.set_link_up(&LinkId("ab".into()), false);
+        let err = r.apply_link_batch(
+            &[LinkId("ab".into())],
+            vec![LinkSpec {
+                a,
+                b: ip("10.9.9.9"), // not a node: this addition fails
+                id: LinkId("ax".into()),
+                attributes: vec![],
+                cost: 1,
+                up: true,
+            }],
+        );
+        assert!(err.is_err());
+        let ab = r.link_between(&a, &b).expect("removed link restored");
+        assert_eq!(ab.id, LinkId("ab".into()));
+        assert!(!ab.up, "restored with its flag");
+        assert_eq!(r.link_snapshot().len(), 3);
     }
 }

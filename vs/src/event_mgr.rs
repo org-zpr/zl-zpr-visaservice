@@ -262,12 +262,10 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         // Links the reconciliation took down or removed: revoke the visas crossing them
         // through the ungated link path (zl-zipline#224). The policy sweep would skip a
         // visa committed under this policy before the link went down, because its
-        // generation gate considers it current. Failures are kept for retry.
+        // generation gate considers it current. A visa whose revocation write fails is
+        // quarantined and retried per visa.
         for (a, b) in &report.links_down {
-            let ok = crate::visa_reconciler::revoke_visas_over_link(asm, a, b)
-                .await
-                .is_ok();
-            asm.topo_mgr.note_revocation(a, b, ok);
+            let _ = crate::visa_reconciler::revoke_visas_over_link(asm, a, b).await;
         }
 
         // Queue up setTopology messages in parallel.
