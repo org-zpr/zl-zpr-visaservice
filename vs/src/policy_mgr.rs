@@ -170,6 +170,10 @@ pub struct PolicyMgr {
     /// refresh re-resolves the actor currently providing the policy-named
     /// `jwks_proxy_service` (zipline#19).
     actor_repo: Arc<db::ActorRepo>,
+    /// The visa service's own ZPR address (`vs_addr`). Proxied JWKS fetches
+    /// bind to it, because the CONNECT proxy is an actor on the ZPRnet and a
+    /// relay Zode's TUN also carries the relay's address (zl-zipline#240).
+    vs_addr: IpAddr,
     /// Period between JWKS refreshes for OIDC stores; `None` disables the
     /// periodic refresher (config `oidc_refresh_seconds` of 0 or unset).
     oidc_refresh: Option<Duration>,
@@ -329,6 +333,7 @@ impl PolicyMgr {
         ts_secrets_dir: PathBuf,
         actor_repo: Arc<db::ActorRepo>,
         oidc_refresh: Option<Duration>,
+        vs_addr: IpAddr,
     ) -> Result<Self, ServiceError> {
         debug!(target: MAIN, "initializing policy manager");
 
@@ -364,6 +369,7 @@ impl PolicyMgr {
             &file_ts_dir,
             &ts_secrets_dir,
             &actor_repo,
+            vs_addr,
             None,
         )
         .await?;
@@ -380,6 +386,7 @@ impl PolicyMgr {
             ts_secrets_dir,
             actor_repo,
             oidc_refresh,
+            vs_addr,
         ))
     }
 
@@ -399,6 +406,7 @@ impl PolicyMgr {
         ts_secrets_dir: PathBuf,
         actor_repo: Arc<db::ActorRepo>,
         oidc_refresh: Option<Duration>,
+        vs_addr: IpAddr,
     ) -> Result<Self, ServiceError> {
         debug!(target: MAIN, "initializing policy manager from state");
         let mut loaded = repo
@@ -421,6 +429,7 @@ impl PolicyMgr {
             &file_ts_dir,
             &ts_secrets_dir,
             &actor_repo,
+            vs_addr,
             None,
         )
         .await?;
@@ -436,6 +445,7 @@ impl PolicyMgr {
             ts_secrets_dir,
             actor_repo,
             oidc_refresh,
+            vs_addr,
         ))
     }
 
@@ -473,6 +483,7 @@ impl PolicyMgr {
         file_ts_dir: &Path,
         ts_secrets_dir: &Path,
         actor_repo: &Arc<db::ActorRepo>,
+        vs_addr: IpAddr,
         previous: Option<&PolicyState>,
     ) -> Result<CandidateState, ServiceError> {
         let policy = loaded.policy();
@@ -548,6 +559,7 @@ impl PolicyMgr {
                                 definition.jwks_proxy_port(),
                             )
                         },
+                        Some(vs_addr),
                     )
                     .await?;
                     // Refresher spawning is deferred to commit: a definition
@@ -588,6 +600,7 @@ impl PolicyMgr {
         ts_secrets_dir: PathBuf,
         actor_repo: Arc<db::ActorRepo>,
         oidc_refresh: Option<Duration>,
+        vs_addr: IpAddr,
     ) -> Self {
         ts_mgr
             .update_services_with_oidc(state.trusted_services.clone(), state.oidc_services.clone());
@@ -600,6 +613,7 @@ impl PolicyMgr {
             file_ts_dir,
             ts_secrets_dir,
             actor_repo,
+            vs_addr,
             oidc_refresh,
         }
     }
@@ -650,6 +664,7 @@ impl PolicyMgr {
             &self.file_ts_dir,
             &self.ts_secrets_dir,
             &self.actor_repo,
+            self.vs_addr,
             Some(&previous),
         )
         .await?;
@@ -851,6 +866,11 @@ mod tests {
     use crate::db::{DbConnection, FakeDb, PolicyRepo};
     use crate::test_helpers::FakeResolver;
 
+    /// `vs_addr` for managers built in these tests. It must be a local
+    /// address: proxied JWKS refreshes bind to it (zl-zipline#240) and the
+    /// test CONNECT stubs listen on 127.0.0.1.
+    const TEST_VS_ADDR: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
@@ -873,6 +893,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap()
@@ -895,6 +916,7 @@ mod tests {
             dir.to_path_buf(),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap()
@@ -1066,6 +1088,7 @@ mod tests {
             PathBuf::from("."),
             actor_repo.clone(),
             oidc_refresh,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1607,6 +1630,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await;
 
@@ -1869,6 +1893,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1886,6 +1911,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1908,6 +1934,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1923,6 +1950,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1939,6 +1967,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1961,6 +1990,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1976,6 +2006,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await;
         assert!(res.is_err());

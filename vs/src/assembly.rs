@@ -172,6 +172,7 @@ pub mod tests {
                 PathBuf::from("."),
                 Arc::new(ActorRepo::new(db_handle.clone())),
                 None,
+                crate::config::VSConfig::default().get_vs_addr(),
             )
             .await
             .expect("failed to initialize PolicyMgr"),
