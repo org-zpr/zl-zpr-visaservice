@@ -567,12 +567,58 @@ mod tests {
             "the retry revoked it"
         );
 
-        // A route that is still up is left alone.
+        // A live visa whose route is still up is left alone (the revoked one above
+        // stays unissuable whatever its route does).
+        let live = crate::test_helpers::create_sweep_visa(&asm, &node_a, 1).await;
         assert!(
             asm.visa_mgr
-                .revoke_if_route_down(&asm, id, &[], None, None)
+                .revoke_if_route_down(&asm, live, &[], None, None)
                 .await
                 .is_ok()
+        );
+    }
+
+    /// Round 16 (Copilot): `register_vss` prepares its visas outside the topology
+    /// lock and filters them under it with `still_grantable`: a visa revoked or
+    /// quarantined meanwhile, or no longer staged for the node, is not granted.
+    #[tokio::test]
+    async fn test_still_grantable_filters_revoked_and_quarantined_visas() {
+        let (asm, node_a) = build_sweep_asm(true).await;
+        let fresh = crate::test_helpers::create_sweep_visa(&asm, &node_a, 0).await;
+        assert!(asm.visa_mgr.still_grantable(fresh, &node_a));
+
+        let revoked = crate::test_helpers::create_sweep_visa(&asm, &node_a, 1).await;
+        assert!(asm.visa_mgr.mark_visa_revoked(revoked).await.unwrap());
+        assert!(!asm.visa_mgr.still_grantable(revoked, &node_a));
+
+        let quarantined = crate::test_helpers::create_sweep_visa(&asm, &node_a, 2).await;
+        asm.visa_mgr.quarantine(quarantined);
+        assert!(!asm.visa_mgr.still_grantable(quarantined, &node_a));
+
+        let elsewhere: IpAddr = "fd5a:5052:3000::99".parse().unwrap();
+        assert!(!asm.visa_mgr.still_grantable(fresh, &elsewhere));
+    }
+
+    /// Round 16 (Copilot): a visa revoked between being stored and the commit-time
+    /// check -- the link went down, its revocation pass marked the visa, and the link
+    /// came back up -- is not issued, although its route looks valid again. Link
+    /// recovery must not make a revoked visa issuable.
+    #[tokio::test]
+    async fn test_visa_revoked_during_issuance_is_not_issued_after_recovery() {
+        use crate::test_helpers::create_routed_sweep_visa;
+        let (asm, node_a) = build_sweep_asm(true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let route = asm.topo_mgr.get_best_route(&node_a, &node_b).unwrap();
+        let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
+        // The link-down pass revoked it; the link is up again now.
+        assert!(asm.visa_mgr.mark_visa_revoked(id).await.unwrap());
+
+        assert!(
+            asm.visa_mgr
+                .revoke_if_route_down(&asm, id, &route.links, None, None)
+                .await
+                .is_err(),
+            "a revoked visa must not be issued"
         );
     }
 

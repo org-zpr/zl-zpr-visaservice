@@ -588,6 +588,14 @@ impl VisaMgr {
             (None, _) => true,
         };
         if ends_ok && asm.topo_mgr.route_still_valid(links, path) {
+            // The route looks valid now, but a link may have gone down and come back
+            // up since the visa was stored: its revocation pass then revoked the visa
+            // already, and link recovery must not make it issuable again.
+            if !self.repo.is_issuable(visa_id) {
+                return Err(ServiceError::Internal(format!(
+                    "visa {visa_id}: revoked while it was issued"
+                )));
+            }
             return Ok(());
         }
         warn!(target: VISA, "visa {visa_id}: a link on its route went down while it was issued; revoking it");
@@ -733,6 +741,18 @@ impl VisaMgr {
             .filter(|v| !quarantined.contains(&v.issuer_id))
             .collect();
         Ok(visas)
+    }
+
+    /// Whether `visa_id` may still be granted to `node_addr`: staged there as
+    /// `PendingInstall` or `Installed`, and not quarantined. For visas prepared before
+    /// a caller took the topology lock (`register_vss`): one revoked, acknowledged or
+    /// quarantined meanwhile must not be granted again.
+    pub fn still_grantable(&self, visa_id: u64, node_addr: &IpAddr) -> bool {
+        let staged = matches!(
+            self.repo.get_node_visa_state(visa_id, node_addr),
+            Some(db::NodeVisaState::PendingInstall | db::NodeVisaState::Installed)
+        );
+        staged && !self.quarantine.lock().unwrap().contains(&visa_id)
     }
 
     /// Quarantine a visa whose revocation write failed: it is never handed out by

@@ -652,6 +652,20 @@ impl VisaRepo {
         Ok(true)
     }
 
+    /// Whether a visa can still be handed out: it is live and no node holds it as
+    /// `PendingRevoke`. A revocation (by policy, departure or a link going down) marks
+    /// its nodes `PendingRevoke`, and an acknowledged one removes them, so a revoked
+    /// visa never reads as issuable again.
+    pub fn is_issuable(&self, visa_id: u64) -> bool {
+        let store = self.inner.store.read().unwrap();
+        live_entry(&store, visa_id).is_some_and(|e| {
+            !e.node_states.is_empty()
+                && e.node_states
+                    .values()
+                    .all(|ns| ns.state != NodeVisaState::PendingRevoke)
+        })
+    }
+
     /// Whether a given live visa still references any node.
     pub async fn visa_has_node_refs(&self, visa_id: u64) -> bool {
         let store = self.inner.store.read().unwrap();

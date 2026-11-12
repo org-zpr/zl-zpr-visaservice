@@ -1411,8 +1411,18 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         }
         // A superseded handle is told to re-authenticate (above) before it hears
         // about a preparation failure.
+        // The visas were prepared before the guard: drop any revoked, acknowledged or
+        // quarantined meanwhile (a link-down report can revoke one while preparation
+        // waits), so a revoked visa is never granted again.
         let initial_visas = match prepared {
-            Ok(visas) => visas,
+            Ok(visas) => visas
+                .into_iter()
+                .filter(|v| {
+                    self.asm
+                        .visa_mgr
+                        .still_grantable(v.issuer_id, node_zpr_addr)
+                })
+                .collect::<Vec<_>>(),
             Err(e) => {
                 error!(target: API, "failed to initialize node VSS for {:?}: {}", self.node.get_cn(), e);
                 let res_builder = res.get().init_res();
