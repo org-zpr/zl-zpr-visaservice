@@ -286,21 +286,23 @@ impl TopologyMgr {
             debug!(target: TOPO, "link-state report from {reporter}: node is no longer connected; dropped");
             return Vec::new();
         }
-        // R13a: remember each pair whose link the owner reports `failed`. A CN that
-        // names none of the reporter's peers marks nothing (it may race a policy change).
+        // R13a: remember each pair whose link the owner newly reports `failed`
+        // (LinkStateTable::record_failures). A CN that names none of the reporter's peers
+        // marks nothing (it may race a policy change).
+        let mut failed_peers = Vec::new();
         for entry in entries.iter().filter(|e| e.state == LinkState::Failed) {
             match declared_peers
                 .iter()
                 .find(|p| cn_of(p).as_deref() == Some(entry.peer_cn.as_str()))
             {
-                Some(peer) => {
-                    info!(target: TOPO, "link {reporter} <-> {peer} reported failed; left out of topology until either end reconnects");
-                    table.mark_failed(*reporter, *peer);
-                }
+                Some(peer) => failed_peers.push(*peer),
                 None => {
                     debug!(target: TOPO, "failed report from {reporter} for peerCn '{}': no such peer; nothing marked", entry.peer_cn);
                 }
             }
+        }
+        for peer in table.record_failures(*reporter, &failed_peers) {
+            info!(target: TOPO, "link {reporter} <-> {peer} reported failed; left out of topology until either end reconnects");
         }
         table.set_snapshot(*reporter, entries);
         self.refresh_links_locked(table, reporter, cn_of)
@@ -584,18 +586,23 @@ impl TopologyMgr {
     /// "Load state completely or fail": any error other than the precise
     /// link-not-found-in-policy case is propagated, so a transient policy/DB problem at
     /// startup fails the service rather than silently deleting valid persisted edges.
+    ///
+    /// Returns the restored links that are down. At startup the link-state table is
+    /// empty, so under R14 that is every restored link until both its ends report it
+    /// up; the caller revokes the persisted visas that cross them (R15).
     pub async fn restore_from_state(
         &self,
         _ops: &TopoOps<'_>,
         snapshot: &PolicySnapshot,
         node_addrs: &[IpAddr],
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Vec<(IpAddr, IpAddr)>, ServiceError> {
         // In this code path there should be no cases for errors from add_node.
         for addr in node_addrs {
             self.router.add_node(addr.clone())?;
         }
 
         let known: HashSet<IpAddr> = node_addrs.iter().copied().collect();
+        let mut down = Vec::new();
 
         for (a, b) in self.link_repo.list_edges().await? {
             // Decide the edge's fate against the current policy + known-node set. Any
@@ -609,7 +616,12 @@ impl TopologyMgr {
                         link_desc,
                         &Self::policy_cn_lookup(snapshot),
                     ) {
-                        Ok(()) | Err(TopologyError::LinkExists(_)) => {}
+                        Ok(()) => {
+                            if !self.link_up(&a, &b) {
+                                down.push((a, b));
+                            }
+                        }
+                        Err(TopologyError::LinkExists(_)) => {}
                         Err(e) => return Err(e.into()),
                     }
                 }
@@ -622,7 +634,7 @@ impl TopologyMgr {
             }
         }
 
-        Ok(())
+        Ok(down)
     }
 
     /// Decide whether an edge should be installed (policy still describes it) or
@@ -1968,13 +1980,19 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
 
-        topo.restore_from_state(&topo.ops_now(), &policy_mgr.get_current_snapshot(), &[a, b])
+        let down = topo
+            .restore_from_state(&topo.ops_now(), &policy_mgr.get_current_snapshot(), &[a, b])
             .await
             .unwrap();
         assert!(
             !topo.router.link_between(&a, &b).unwrap().up,
             "no reports after a restart: the link is down"
         );
+        // Review (Codex P1, #66): the restored-down link is returned, so startup can
+        // revoke the persisted visas that cross it (R15).
+        assert_eq!(down.len(), 1);
+        let (x, y) = down[0];
+        assert!((x, y) == (a, b) || (x, y) == (b, a));
         report_both_up_and_check(&topo, a, b);
     }
 
@@ -2096,6 +2114,43 @@ mod tests {
         assert_eq!(topo.clear_failed_pairs_for(&topo.ops_now(), &c), vec![a]);
         assert!(!topo.is_failed_pair(&a, &c));
         assert!(topo.is_failed_pair(&a, &b));
+    }
+
+    #[test]
+    fn test_stale_failed_snapshot_does_not_re_mark_a_cleared_pair() {
+        // Review (Copilot, #66): B reconnects and the A-B pair is cleared. Before A
+        // receives the re-proposed topology it sends a snapshot for an unrelated A-C
+        // change that still lists B as failed; that must not re-mark A-B, or the
+        // re-proposed topology would leave the link out again.
+        let (topo, a, b) = two_linked_nodes();
+        let c = ip("fd5a:5052::3");
+        topo.add_node(c).unwrap();
+        topo.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr"), (c, "c.zpr")]);
+        let a_reports = |entries: Vec<LinkStateReport>| {
+            topo.record_link_states_with_cns(&topo.ops_now(), &a, None, entries, &cn_of);
+        };
+        a_reports(vec![report("b.zpr", LinkState::Failed)]);
+        assert!(topo.is_failed_pair(&a, &b));
+        assert_eq!(topo.clear_failed_pairs_for(&topo.ops_now(), &b), vec![a]);
+
+        a_reports(vec![
+            report("b.zpr", LinkState::Failed),
+            report("c.zpr", LinkState::Up),
+        ]);
+        assert!(
+            !topo.is_failed_pair(&a, &b),
+            "a stale failure re-marks nothing"
+        );
+
+        // A retries (its entry for B leaves `failed`), and the retry fails: marked.
+        a_reports(vec![report("c.zpr", LinkState::Up)]);
+        assert!(!topo.is_failed_pair(&a, &b));
+        a_reports(vec![
+            report("b.zpr", LinkState::Failed),
+            report("c.zpr", LinkState::Up),
+        ]);
+        assert!(topo.is_failed_pair(&a, &b), "a new failure is marked");
     }
 
     #[tokio::test]

@@ -46,6 +46,11 @@ pub struct LinkStateTable {
     /// Unordered node pairs whose link the owner reported `failed` (R13a), each stored
     /// as (lower address, higher address); see [failed_pair_key].
     failed_pairs: HashSet<(IpAddr, IpAddr)>,
+    /// (reporter, peer) for every peer the reporter's latest accepted snapshot lists as
+    /// `failed`, so a repeated `failed` does not count as a new failure
+    /// ([Self::record_failures]). Kept across [Self::remove_node]: the first report after
+    /// a reconnect may still list the failure the reconnect has just cleared.
+    listed_failed: HashSet<(IpAddr, IpAddr)>,
 }
 
 /// The key of the unordered pair {a, b} in [LinkStateTable::failed_pairs].
@@ -77,9 +82,32 @@ impl LinkStateTable {
 
     /// Remember that the link between `a` and `b` failed: its owner reported `failed`
     /// after the link-up window (R13a). The mark stays until [Self::clear_failed_for]
-    /// clears it; `up` and `down` reports never touch it.
-    pub fn mark_failed(&mut self, a: IpAddr, b: IpAddr) {
+    /// clears it; `up` and `down` reports never touch it. Reports mark through
+    /// [Self::record_failures].
+    fn mark_failed(&mut self, a: IpAddr, b: IpAddr) {
         self.failed_pairs.insert(failed_pair_key(a, b));
+    }
+
+    /// Apply the `failed` entries of `reporter`'s latest accepted snapshot (resolved to
+    /// peer addresses) and return the peers whose pair this newly marked (R13a).
+    ///
+    /// Only a **new** failure marks a pair: one the reporter's previous snapshot did not
+    /// already list as failed. A snapshot sends every link again, so a repeated `failed`
+    /// is the failure already accounted for; if the pair has been cleared since (the
+    /// peer reconnected and the link is being proposed again), re-marking it would leave
+    /// the link out of the very topology that asks the owner to retry. The owner's entry
+    /// leaves `failed` when it retries, and a retry that fails is new again.
+    pub fn record_failures(&mut self, reporter: IpAddr, failed_peers: &[IpAddr]) -> Vec<IpAddr> {
+        let mut newly_marked = Vec::new();
+        for peer in failed_peers {
+            if self.listed_failed.insert((reporter, *peer)) {
+                self.mark_failed(reporter, *peer);
+                newly_marked.push(*peer);
+            }
+        }
+        self.listed_failed
+            .retain(|(r, p)| *r != reporter || failed_peers.contains(p));
+        newly_marked
     }
 
     /// True if the link between `a` and `b` is marked failed (in either order).
@@ -107,7 +135,8 @@ impl LinkStateTable {
 
     /// Forget a node's reports (it disconnected or was reset). Afterwards it counts as a
     /// non-reporter again, so its links are down until it reports again (R14). Its
-    /// failed pairs are kept: only a (re)connect clears them (R13a).
+    /// failed pairs, and which failures it last listed, are kept: only a (re)connect
+    /// clears a pair (R13a).
     pub fn remove_node(&mut self, node: &IpAddr) {
         self.snapshots.remove(node);
         self.latest_session.remove(node);
@@ -321,6 +350,43 @@ mod tests {
             t.clear_failed_for(&ip(A)).is_empty(),
             "nothing left to clear"
         );
+    }
+
+    #[test]
+    fn a_repeated_failure_does_not_re_mark_a_cleared_pair() {
+        // Review (Copilot, #66): after B reconnects and the pair is cleared, A may send
+        // a snapshot that still lists B as failed (it has not received the re-proposed
+        // topology yet). That is the failure already accounted for, not a new one.
+        let mut t = LinkStateTable::new();
+        assert_eq!(
+            t.record_failures(ip(A), &[ip(B)]),
+            vec![ip(B)],
+            "new failure"
+        );
+        assert!(t.is_failed(&ip(A), &ip(B)));
+        t.clear_failed_for(&ip(B));
+        assert!(
+            t.record_failures(ip(A), &[ip(B)]).is_empty(),
+            "stale repeat"
+        );
+        assert!(!t.is_failed(&ip(A), &ip(B)));
+        // A's entry leaves `failed` (its retry is under way), then fails again: a new
+        // failure, marked.
+        assert!(t.record_failures(ip(A), &[]).is_empty());
+        assert_eq!(t.record_failures(ip(A), &[ip(B)]), vec![ip(B)]);
+        assert!(t.is_failed(&ip(A), &ip(B)));
+    }
+
+    #[test]
+    fn a_stale_failure_after_a_reconnect_does_not_re_mark() {
+        // A disconnects (its reports are forgotten) and reconnects, which clears its
+        // pairs; its first report still lists the old failure. Not a new one.
+        let mut t = LinkStateTable::new();
+        t.record_failures(ip(A), &[ip(B)]);
+        t.remove_node(&ip(A));
+        assert_eq!(t.clear_failed_for(&ip(A)), vec![ip(B)]);
+        assert!(t.record_failures(ip(A), &[ip(B)]).is_empty());
+        assert!(!t.is_failed(&ip(A), &ip(B)));
     }
 
     #[test]
