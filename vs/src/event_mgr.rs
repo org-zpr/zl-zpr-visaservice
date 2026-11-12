@@ -248,7 +248,9 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         info!(target: EVENT, "policy updated vinst={vinst}: revalidating topology ({} nodes)", valid_node_addrs.len());
         let report = asm
             .topo_mgr
-            .revalidate_against_policy(&psnap, &valid_node_addrs)
+            .revalidate_against_policy(&psnap, &valid_node_addrs, &|| {
+                asm.policy_mgr.get_current_snapshot()
+            })
             .await?;
         info!(
             target: EVENT,
