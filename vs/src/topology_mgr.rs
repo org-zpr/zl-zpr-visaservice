@@ -320,10 +320,12 @@ impl TopologyMgr {
     /// (`Policy.transitNodes`, zl-zipline#227): only those nodes may be an interior hop
     /// of a route. Takes the caller's [TopoOps] because it is a topology write.
     ///
-    /// Returns the nodes that lost transit, so the caller can revoke the visas that pass
-    /// through them. The flag is cleared before the caller lists visas, so a visa
-    /// committed concurrently is either listed by that revocation or fails the
-    /// commit-time route check ([Self::route_still_valid]), as for a link going down.
+    /// Returns the nodes that lost transit, for the log and tests. The caller revokes
+    /// the visas through every non-transit node afterwards
+    /// (`visa_reconciler::revoke_visas_through_non_transit`). The flag is cleared before
+    /// that lists visas, so a visa committed concurrently is either listed by it or
+    /// fails the commit-time route check ([Self::route_still_valid]), as for a link
+    /// going down.
     pub fn apply_transit_nodes(
         &self,
         _ops: &TopoOps<'_>,

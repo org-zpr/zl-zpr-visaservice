@@ -774,7 +774,20 @@ pub const TRANSIT_NODE_C: &str = "fd5a:5052:3000::3";
 /// ([TRANSIT_NODE_C]) linked to both, over `ac` and `cb`. Returns (asm, A, B, C).
 /// Nothing is transit-capable yet: that comes from policy ([transit_policy]).
 pub async fn build_transit_asm() -> (Arc<Assembly>, IpAddr, IpAddr, IpAddr) {
-    let (asm, node_a) = build_sweep_asm(true).await;
+    let (asm, a, b, c, _db) = build_transit_asm_with_db().await;
+    (asm, a, b, c)
+}
+
+/// As [build_transit_asm], but also hands back the [crate::db::FakeDb] so a test can
+/// inject state-DB faults.
+pub async fn build_transit_asm_with_db() -> (
+    Arc<Assembly>,
+    IpAddr,
+    IpAddr,
+    IpAddr,
+    Arc<crate::db::FakeDb>,
+) {
+    let (asm, node_a, db) = build_sweep_asm_with_db(true).await;
     let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
     let node_c: IpAddr = TRANSIT_NODE_C.parse().unwrap();
     asm.actor_mgr
@@ -792,7 +805,7 @@ pub async fn build_transit_asm() -> (Arc<Assembly>, IpAddr, IpAddr, IpAddr) {
     asm.topo_mgr
         .add_link(node_c, node_b, LinkId("cb".into()), vec![], 1)
         .unwrap();
-    (asm, node_a, node_b, node_c)
+    (asm, node_a, node_b, node_c, db)
 }
 
 /// Container bytes of the policy for [build_transit_asm]: a node join policy every

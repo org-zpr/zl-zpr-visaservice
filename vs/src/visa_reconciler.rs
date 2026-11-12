@@ -168,30 +168,18 @@ pub(crate) async fn revoke_visas_over_link(
     .await
 }
 
-/// Revoke every live visa whose path passes *through* `node` -- `node` is an interior
-/// hop, neither its first nor its last node -- because policy no longer lists it as
-/// transit-capable (zl-zipline#227). A visa that only starts or ends at `node` is kept.
-/// See [revoke_visas_on_paths] for how each visa is revoked and what is returned.
-pub(crate) async fn revoke_visas_through_node(
-    asm: &Arc<Assembly>,
-    node: &std::net::IpAddr,
-) -> Result<usize, usize> {
-    revoke_visas_on_paths(asm, &format!("node {node} no longer transit"), |path| {
-        path.len() > 2 && path[1..path.len() - 1].contains(node)
-    })
-    .await
-}
-
 /// Revoke every live visa whose recorded path has an interior node the router does not
 /// hold transit-capable ([crate::topology_mgr::TopologyMgr::interior_is_transit]).
 ///
-/// Startup runs this right after the topology restore (review on visaservice#65). The
-/// visas come back from the store, but the revocations a policy pass owed them do not:
-/// if the service stopped after installing a policy that took a node's transit flag
-/// away and before that pass revoked the visas through it, the restored router already
-/// has the new transit set and reports no change, so nothing else would revoke them.
-/// The caller holds [crate::topology_mgr::TopoOps], so the transit set cannot change
-/// while the paths are checked. See [revoke_visas_on_paths] for how each visa is
+/// A visa that only starts or ends at such a node is kept. The check is against the
+/// transit set as it is now, not against a change, so it finds every visa a lost
+/// transit flag left behind however that loss was missed (review on visaservice#65):
+/// the policy pass runs it after applying the policy's transit set, and startup runs
+/// it after the topology restore -- the visas come back from the store, but if the
+/// service stopped between a policy install and its pass, the restored router already
+/// has the new transit set and reports no change. The caller holds
+/// [crate::topology_mgr::TopoOps], so the transit set cannot change while the paths
+/// are checked. See [revoke_visas_on_paths] for how each visa is
 /// revoked and what is returned.
 pub(crate) async fn revoke_visas_through_non_transit(asm: &Arc<Assembly>) -> Result<usize, usize> {
     revoke_visas_on_paths(asm, "restored route through a non-transit node", |path| {
@@ -495,10 +483,10 @@ mod tests {
         assert!(pending.contains(&local), "a visa off the link stays");
     }
 
-    /// zl-zipline#227: a node that lost transit revokes the visas whose path passes
-    /// through it, and not the visas that only start or end there.
+    /// zl-zipline#227: a node that is not transit-capable revokes the visas whose path
+    /// passes through it, and not the visas that only start or end there.
     #[tokio::test]
-    async fn test_revoke_visas_through_node_hits_only_interior_hops() {
+    async fn test_revoke_visas_through_non_transit_hits_only_interior_hops() {
         use crate::test_helpers::{build_transit_asm, create_sweep_visa_on_route};
         let (asm, a, b, c) = build_transit_asm().await;
         asm.topo_mgr.set_transit_nodes(&[c]);
@@ -512,10 +500,11 @@ mod tests {
         assert_eq!(direct.links.len(), 1);
         let direct = create_sweep_visa_on_route(&asm, &a, 0, &direct).await;
 
-        // A and B are ends of both paths: nothing passes through them.
-        assert_eq!(revoke_visas_through_node(&asm, &a).await, Ok(0));
-        assert_eq!(revoke_visas_through_node(&asm, &b).await, Ok(0));
-        assert_eq!(revoke_visas_through_node(&asm, &c).await, Ok(1));
+        // A and B are ends of both paths, so they need no transit flag.
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        assert_eq!(revoke_visas_through_non_transit(&asm).await, Ok(0));
+        asm.topo_mgr.set_transit_nodes(&[]);
+        assert_eq!(revoke_visas_through_non_transit(&asm).await, Ok(1));
 
         let revoked = asm
             .visa_mgr

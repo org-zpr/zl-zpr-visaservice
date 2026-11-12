@@ -444,8 +444,8 @@ impl Router {
     /// a route. Starts empty (fail closed).
     ///
     /// If the set changed, best routes are recomputed and the route cache is flushed
-    /// under the same write lock. Returns the nodes that lost transit, sorted, so the
-    /// caller can revoke the visas that pass through them.
+    /// under the same write lock. Returns the nodes that lost transit, sorted, for the
+    /// log and tests.
     pub fn set_transit_nodes(&self, transit: HashSet<IpAddr>) -> Vec<IpAddr> {
         let mut inner = self.inner.write().unwrap();
         let transit: HashSet<NodeId> = transit.iter().map(NodeId::from).collect();

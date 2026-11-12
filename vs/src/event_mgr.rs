@@ -170,6 +170,16 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
           - TO BE SAFE: expire auth from all services - force re-auth of all existing services (after removing non-existing ones)
      */
 
+    // Which nodes may pass traffic through comes from the current policy
+    // (zl-zipline#227). Applied first, under its own short topology guard, before
+    // anything fallible or slow: an error below ends this event with no retry, and
+    // the actor refresh can take long, and until this runs the router would keep
+    // routing through a node the policy no longer lets carry traffic (review r2).
+    {
+        let ops = asm.topo_mgr.ops().await;
+        apply_policy_transit(asm, &ops, &asm.policy_mgr.get_current_snapshot()).await;
+    }
+
     // The snapshot for the attribute and hostname reconciliation below. The
     // topology part of the pass re-reads it under the topology operation lock, and
     // everything from there on (node validity, links, re-auth obligation, visa sweep)
@@ -357,12 +367,6 @@ async fn policy_pass_locked(
     }
     let vinst = psnap.vinst();
 
-    // Which nodes may pass traffic through comes from this policy (zl-zipline#227).
-    // Applied whether or not any node is connected, so nodes that connect later route
-    // under it, and first: nothing fallible runs before it, so no failure can leave
-    // the transit change applied without its revocations.
-    apply_policy_transit(asm, ops, &psnap).await;
-
     // The new policy may invalidate some existing nodes. Read the live-node set
     // under the guard, so the pass cannot re-add a node that has disconnected.
     let connected_node_addrs = asm.actor_mgr.list_node_addrs().await?;
@@ -433,18 +437,21 @@ async fn policy_pass_locked(
 }
 
 /// Make the router's transit set `psnap`'s (`Policy.transitNodes`, zl-zipline#227) and
-/// revoke the visas that pass through every node that lost transit -- one step, under
-/// the caller's [TopoOps], with nothing fallible in between: the router keeps no
-/// record of the change once applied, so a failure between the two would lose the
-/// revocations for good. They go through the ungated path, like `links_down`: the
-/// policy sweep skips a visa committed under this policy before the pass ran. The
-/// flag is cleared before the visas are listed, so a visa committed concurrently is
-/// either listed or fails its commit-time route check. Failed revocations are
-/// quarantined and retried per visa.
+/// revoke every live visa whose path passes through a node that is not
+/// transit-capable, under the caller's [TopoOps]. Applied whether or not any node is
+/// connected, so nodes that connect later route under it.
+///
+/// The revocation checks every visa against the transit set as it now is, not against
+/// what this call changed, so it does not depend on the change being seen once: a
+/// pass that stopped early, or a restart, leaves nothing a later call cannot find
+/// (review r2). The revocations go through the ungated path, like `links_down`: the
+/// policy sweep skips a visa committed under this policy before the pass ran. The flag
+/// is cleared before the visas are listed, so a visa committed concurrently is either
+/// listed or fails its commit-time route check. Failed revocations are quarantined
+/// and retried per visa.
 async fn apply_policy_transit(asm: &Arc<Assembly>, ops: &TopoOps<'_>, psnap: &PolicySnapshot) {
-    for node in asm.topo_mgr.apply_transit_nodes(ops, psnap) {
-        let _ = crate::visa_reconciler::revoke_visas_through_node(asm, &node).await;
-    }
+    asm.topo_mgr.apply_transit_nodes(ops, psnap);
+    let _ = crate::visa_reconciler::revoke_visas_through_non_transit(asm).await;
 }
 
 /// Fan the `requestAuthentication` VSS call out to every listed node
@@ -1055,6 +1062,51 @@ mod tests {
         let vinst = asm.policy_mgr.get_current_snapshot().vinst();
         let id = create_sweep_visa_on_route(&asm, &a, vinst, &via_c).await;
         handle_policy_updated(&asm, vinst).await.unwrap();
+
+        assert!(
+            asm.topo_mgr
+                .get_routes(&a, &b, None)
+                .iter()
+                .all(|r| r.links.len() == 1),
+            "no route through C any more"
+        );
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&a)
+                .await
+                .unwrap()
+                .contains(&id),
+            "the visa through C is revoked"
+        );
+    }
+
+    /// Review r2 (Codex): the policy's transit set is applied, and the visas through a
+    /// node that lost it revoked, before any fallible step of the handler. Here the
+    /// live-node read fails (the event worker only logs that, with no retry); the
+    /// router must still stop routing through C.
+    #[tokio::test]
+    async fn test_policy_update_applies_transit_before_any_fallible_step() {
+        use crate::test_helpers::{
+            build_transit_asm_with_db, create_sweep_visa_on_route, transit_policy,
+        };
+        let (asm, a, b, c, db) = build_transit_asm_with_db().await;
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        let via_c = asm
+            .topo_mgr
+            .get_routes(&a, &b, None)
+            .into_iter()
+            .find(|r| r.links.len() == 2)
+            .unwrap();
+        let id = create_sweep_visa_on_route(&asm, &a, 0, &via_c).await;
+
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[]))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        db.set_scan_fault(crate::db::FaultMode::Reject);
+        assert!(handle_policy_updated(&asm, vinst).await.is_err());
+        db.set_scan_fault(crate::db::FaultMode::None);
 
         assert!(
             asm.topo_mgr

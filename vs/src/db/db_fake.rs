@@ -36,6 +36,7 @@ pub struct FakeDb {
     del_fault: std::sync::Mutex<FaultMode>,
     hset_fault: std::sync::Mutex<FaultMode>,
     exists_fault: std::sync::Mutex<FaultMode>,
+    scan_fault: std::sync::Mutex<FaultMode>,
 }
 
 #[allow(dead_code)]
@@ -62,6 +63,7 @@ impl FakeDb {
             del_fault: std::sync::Mutex::new(FaultMode::None),
             hset_fault: std::sync::Mutex::new(FaultMode::None),
             exists_fault: std::sync::Mutex::new(FaultMode::None),
+            scan_fault: std::sync::Mutex::new(FaultMode::None),
         }
     }
 
@@ -82,6 +84,13 @@ impl FakeDb {
     #[allow(dead_code)]
     pub fn set_exists_fault(&self, mode: FaultMode) {
         *self.exists_fault.lock().unwrap() = mode;
+    }
+
+    /// Inject a fault on the next (and subsequent) `scan_match_all` calls: a read
+    /// fault (any mode other than `None` fails the read).
+    #[allow(dead_code)]
+    pub fn set_scan_fault(&self, mode: FaultMode) {
+        *self.scan_fault.lock().unwrap() = mode;
     }
 
     /// Inject a fault mode on the next (and subsequent) `hset` calls.
@@ -586,6 +595,9 @@ impl DbConnection for FakeDb {
 
     /// Return the set of keys that match the pattern.
     async fn scan_match_all(&self, pattern: String) -> DbResult<Vec<String>> {
+        if *self.scan_fault.lock().unwrap() != FaultMode::None {
+            return Err(injected_fault_err());
+        }
         let _rlock = self.lock.read().await;
         let mut results = Vec::new();
         let pattern = pattern.replace("*", ".*");
