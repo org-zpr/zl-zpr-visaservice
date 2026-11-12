@@ -270,19 +270,23 @@ fn logout_without_reauthorization(actor: &Actor, policy: &Policy) -> Actor {
 /// generation; otherwise [logout_without_reauthorization] of the loaded
 /// `actor` under the current policy, so no attribute re-enriched under a
 /// superseded snapshot is written after that install's reconciliation already
-/// ran. Refusing the logout instead would leave the login in place.
+/// ran. Refusing the logout instead would leave the login in place. The
+/// second value is true when the reduced actor was chosen.
 fn logout_actor_for_current_policy(
     asm: &Assembly,
     psnap: &PolicySnapshot,
     actor: &Actor,
     renewed: Actor,
-) -> Actor {
+) -> (Actor, bool) {
     let current = asm.policy_mgr.get_current_snapshot();
     if current.vinst() == psnap.vinst() {
-        return renewed;
+        return (renewed, false);
     }
     info!(target: CC, "logout: policy changed while it was being re-authorized; persisting it without re-enrichment");
-    logout_without_reauthorization(actor, current.policy())
+    (
+        logout_without_reauthorization(actor, current.policy()),
+        true,
+    )
 }
 
 /// Whether an attribute is carried over a logout (zl-zipline#232): only
@@ -1504,6 +1508,9 @@ impl ConnectionControl {
                 Some(zpr_addr),
             )
             .await;
+        // Set when a logout persists without re-enrichment (below); the
+        // trusted-service attributes it dropped must then be re-fetched.
+        let mut logout_without_enrichment = false;
         let mut renewed = match reauthorized {
             Ok(renewed) => renewed,
             // A logout must not depend on the policy re-run (#63 review): if
@@ -1513,6 +1520,7 @@ impl ConnectionControl {
             // and the device proof has already been checked.
             Err(e) if dropping_user => {
                 warn!(target: CC, "logout of {zpr_addr}: policy re-run failed ({e}); persisting the logout without re-enrichment");
+                logout_without_enrichment = true;
                 logout_without_reauthorization(&actor, psnap.policy())
             }
             Err(e) => return Err(Self::classify_reauth_policy_error(e)),
@@ -1586,7 +1594,10 @@ impl ConnectionControl {
             ensure_policy_unchanged(&asm, &psnap)?;
         }
         if dropping_user {
-            renewed = logout_actor_for_current_policy(&asm, &psnap, &actor, renewed);
+            let (persisted, reduced) =
+                logout_actor_for_current_policy(&asm, &psnap, &actor, renewed);
+            renewed = persisted;
+            logout_without_enrichment |= reduced;
         }
         asm.actor_mgr
             .update_actor(&renewed, &asm.policy_service_names())
@@ -1616,6 +1627,16 @@ impl ConnectionControl {
         // SS arm has no session state.
         for session in renewed_sessions {
             session.record(&zpr_addr);
+        }
+
+        // A logout persisted without re-enrichment dropped trusted-service
+        // attributes it could not re-fetch -- possibly ones a deny rule
+        // depends on. Forget the actor's source revisions so the next refresh
+        // re-fetches every source; while one is still down that request is
+        // indeterminate and denied, instead of proceeding as if the dropped
+        // attributes were known to be absent (#63 review).
+        if logout_without_enrichment {
+            asm.ts_mgr.forget_actor_revisions(&zpr_addr);
         }
 
         // A logout also forgets the dropped login's session anchors, so a
@@ -9044,7 +9065,7 @@ mod tests {
             .unwrap();
 
         // Same generation: the re-enriched actor is persisted as is.
-        let kept = logout_actor_for_current_policy(&asm, &psnap, &loaded, reenriched.clone());
+        let (kept, _) = logout_actor_for_current_policy(&asm, &psnap, &loaded, reenriched.clone());
         assert!(kept.get_attribute("device.clearance").is_some());
 
         // An install lands: the reduced actor is persisted instead.
@@ -9053,10 +9074,59 @@ mod tests {
             .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
             .await
             .expect("a new policy installs");
-        let reduced = logout_actor_for_current_policy(&asm, &psnap, &loaded, reenriched);
+        let (reduced, chose_reduced) =
+            logout_actor_for_current_policy(&asm, &psnap, &loaded, reenriched);
+        assert!(chose_reduced);
         assert!(reduced.get_attribute("device.clearance").is_none());
         assert!(!has_user_attrs(&reduced));
         assert!(reduced.is_node());
+    }
+
+    /// Review fix (#63 round 10, Copilot): a fallback logout (enrichment
+    /// failed) drops trusted-service attributes it could not re-fetch, so it
+    /// also forgets the actor's source revisions: the next refresh re-fetches,
+    /// and while the source is down the request is indeterminate (denied)
+    /// instead of proceeding as if, say, `device.blocked` were absent.
+    #[tokio::test]
+    async fn test_fallback_logout_forces_reenrichment() {
+        use std::sync::atomic::Ordering;
+        let cn = "zode-ae.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let ts = crate::test_helpers::register_ts(&asm, &[("device.blocked", "true")]);
+        let mut stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::actor_attributes::refresh_and_persist_actor(&asm, &mut stored)
+            .await
+            .expect("a healthy refresh records the source revision");
+
+        ts.fail.store(true, Ordering::SeqCst);
+        let current = asm.policy_mgr.get_current_snapshot();
+        let mut services = current.trusted_services().to_vec();
+        services.push(Arc::new(FailingTrustedService));
+        asm.policy_mgr
+            .set_current_snapshot_for_tests(&PolicySnapshot::for_tests(
+                current.policy_arc(),
+                services,
+            ));
+        let renewed = zode_logout(&asm, &cc, addr, &privkey, cn).await;
+        assert!(renewed.get_attribute("device.blocked").is_none());
+
+        let mut after = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = crate::actor_attributes::refresh_and_persist_actor(&asm, &mut after).await;
+        assert!(
+            matches!(result, Err(ServiceError::AttributesIndeterminate(_))),
+            "with the source still down the next request must be indeterminate, got {result:?}"
+        );
     }
 
     /// The namespace-change decision table (vs.capnp "Re-Authorization").
