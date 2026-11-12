@@ -171,9 +171,22 @@ pub struct PolicyMgr {
     /// reconciliation then sees). The cost is that an install waits behind an
     /// in-flight login or logout, including its attribute fetch
     /// (org-zpr/zl-zipline#247).
+    ///
+    /// **Lock order (with #224's topology operation lock, [crate::topology_mgr::TopoOps]):**
+    /// `update_lock` -> topology lock -> `node_commit_lock`. A path that holds
+    /// the topology guard may take this lock (policy publication, the node
+    /// `authenticate` persist, `open`, a disconnect's actor removal, a node's
+    /// refresh commit); a path that holds this lock must never wait for the
+    /// topology guard -- so `reauthorize`, which holds it across its attribute
+    /// fetch, releases it before any disconnect -- otherwise each could wait for
+    /// the other forever.
     /// ponytail: one global lock; per-address locks if node commits become
     /// frequent (today: Zode logins/logouts, node authentications, refreshes).
     pub(crate) node_commit_lock: tokio::sync::Mutex<()>,
+    /// The topology operation lock ([crate::topology_mgr::TopoOps]), bound once the
+    /// Assembly exists. An install commits under it, so the current policy cannot
+    /// change while a topology operation that read it is still running.
+    topology_lock: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>>,
     resolver: PolicyResolver,
     ts_mgr: Arc<TrustedServicesMgr>,
     /// Directory holding the `<service-id>.json` files for `api=file` trusted services.
@@ -185,6 +198,10 @@ pub struct PolicyMgr {
     /// refresh re-resolves the actor currently providing the policy-named
     /// `jwks_proxy_service` (zipline#19).
     actor_repo: Arc<db::ActorRepo>,
+    /// The visa service's own ZPR address (`vs_addr`). Proxied JWKS fetches
+    /// bind to it, because the CONNECT proxy is an actor on the ZPRnet and a
+    /// relay Zode's TUN also carries the relay's address (zl-zipline#240).
+    vs_addr: IpAddr,
     /// Period between JWKS refreshes for OIDC stores; `None` disables the
     /// periodic refresher (config `oidc_refresh_seconds` of 0 or unset).
     oidc_refresh: Option<Duration>,
@@ -352,6 +369,7 @@ impl PolicyMgr {
         ts_secrets_dir: PathBuf,
         actor_repo: Arc<db::ActorRepo>,
         oidc_refresh: Option<Duration>,
+        vs_addr: IpAddr,
     ) -> Result<Self, ServiceError> {
         debug!(target: MAIN, "initializing policy manager");
 
@@ -387,6 +405,7 @@ impl PolicyMgr {
             &file_ts_dir,
             &ts_secrets_dir,
             &actor_repo,
+            vs_addr,
             None,
         )
         .await?;
@@ -403,6 +422,7 @@ impl PolicyMgr {
             ts_secrets_dir,
             actor_repo,
             oidc_refresh,
+            vs_addr,
         ))
     }
 
@@ -422,6 +442,7 @@ impl PolicyMgr {
         ts_secrets_dir: PathBuf,
         actor_repo: Arc<db::ActorRepo>,
         oidc_refresh: Option<Duration>,
+        vs_addr: IpAddr,
     ) -> Result<Self, ServiceError> {
         debug!(target: MAIN, "initializing policy manager from state");
         let mut loaded = repo
@@ -444,6 +465,7 @@ impl PolicyMgr {
             &file_ts_dir,
             &ts_secrets_dir,
             &actor_repo,
+            vs_addr,
             None,
         )
         .await?;
@@ -459,6 +481,7 @@ impl PolicyMgr {
             ts_secrets_dir,
             actor_repo,
             oidc_refresh,
+            vs_addr,
         ))
     }
 
@@ -496,6 +519,7 @@ impl PolicyMgr {
         file_ts_dir: &Path,
         ts_secrets_dir: &Path,
         actor_repo: &Arc<db::ActorRepo>,
+        vs_addr: IpAddr,
         previous: Option<&PolicyState>,
     ) -> Result<CandidateState, ServiceError> {
         let policy = loaded.policy();
@@ -571,6 +595,7 @@ impl PolicyMgr {
                                 definition.jwks_proxy_port(),
                             )
                         },
+                        Some(vs_addr),
                     )
                     .await?;
                     // Refresher spawning is deferred to commit: a definition
@@ -611,6 +636,7 @@ impl PolicyMgr {
         ts_secrets_dir: PathBuf,
         actor_repo: Arc<db::ActorRepo>,
         oidc_refresh: Option<Duration>,
+        vs_addr: IpAddr,
     ) -> Self {
         ts_mgr
             .update_services_with_oidc(state.trusted_services.clone(), state.oidc_services.clone());
@@ -619,11 +645,13 @@ impl PolicyMgr {
             repo,
             update_lock: tokio::sync::Mutex::new(()),
             node_commit_lock: tokio::sync::Mutex::new(()),
+            topology_lock: std::sync::OnceLock::new(),
             resolver,
             ts_mgr,
             file_ts_dir,
             ts_secrets_dir,
             actor_repo,
+            vs_addr,
             oidc_refresh,
         }
     }
@@ -674,13 +702,26 @@ impl PolicyMgr {
             &self.file_ts_dir,
             &self.ts_secrets_dir,
             &self.actor_repo,
+            self.vs_addr,
             Some(&previous),
         )
         .await?;
+
+        // Commit under the topology operation lock (taken after the network-bound
+        // build above, and only around local writes): a topology operation reads the
+        // policy under that lock and relies on it staying current until it is done.
+        // Lock order: update_lock, then the topology lock; topology operations never
+        // take update_lock.
+        let _topology = match self.topology_lock.get() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         self.repo.set_current_policy(&loaded, false).await?;
 
-        // Publish under the node commit lock: an install never lands between a
-        // node commit's recheck and its write (#63 review, zl-zipline#247).
+        // Publish under the node commit lock too: an install never lands between a
+        // node commit's recheck and its write (#63 review, zl-zipline#247). Lock
+        // order: update_lock -> topology lock -> node_commit_lock (see the
+        // `node_commit_lock` field).
         let _commit = self.node_commit_lock.lock().await;
         self.publish(candidate.commit(Some(&previous), self.oidc_refresh));
         Ok(vinst)
@@ -724,6 +765,13 @@ impl PolicyMgr {
     #[cfg(test)]
     pub(crate) fn set_current_snapshot_for_tests(&self, snapshot: &PolicySnapshot) {
         self.state.store(snapshot.0.clone());
+    }
+
+    /// Bind the topology operation lock ([crate::topology_mgr::TopologyMgr::ops_lock]);
+    /// from then on every install commits under it. Called once, when the Assembly is
+    /// built; a second call is ignored.
+    pub fn bind_topology_lock(&self, lock: Arc<tokio::sync::Mutex<()>>) {
+        let _ = self.topology_lock.set(lock);
     }
 
     /// Callers should drop the policy as quickly as possible to avoid missing a policy update.
@@ -905,6 +953,11 @@ mod tests {
     use crate::db::{DbConnection, FakeDb, PolicyRepo};
     use crate::test_helpers::FakeResolver;
 
+    /// `vs_addr` for managers built in these tests. It must be a local
+    /// address: proxied JWKS refreshes bind to it (zl-zipline#240) and the
+    /// test CONNECT stubs listen on 127.0.0.1.
+    const TEST_VS_ADDR: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
@@ -927,6 +980,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap()
@@ -949,6 +1003,7 @@ mod tests {
             dir.to_path_buf(),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap()
@@ -1120,6 +1175,7 @@ mod tests {
             PathBuf::from("."),
             actor_repo.clone(),
             oidc_refresh,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1661,6 +1717,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await;
 
@@ -1923,6 +1980,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1940,6 +1998,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1962,6 +2021,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1977,6 +2037,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1993,6 +2054,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -2015,6 +2077,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -2030,6 +2093,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await;
         assert!(res.is_err());

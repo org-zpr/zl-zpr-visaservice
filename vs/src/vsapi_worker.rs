@@ -15,8 +15,8 @@ use ::zpr::vsapi::v1 as vsapi;
 use libeval::actor::Actor;
 use libeval::attribute::{Attribute, key};
 use zpr::vsapi_types::{
-    ConnectRequest, ConnectType, Connection, PacketDesc, Param, ParamValue, PublicKey,
-    ReauthRequest, SockAddr, VSConnectRequest, VisaOp, pname,
+    ConnectRequest, ConnectType, Connection, LinkStateReport, PacketDesc, Param, ParamValue,
+    PublicKey, ReauthRequest, SockAddr, VSConnectRequest, VisaOp, pname,
 };
 use zpr::write_to::WriteTo;
 
@@ -28,11 +28,13 @@ use crate::connection_control::{
 use crate::counters::CounterType;
 use crate::error::ServiceError;
 use crate::event_mgr::VsEvent;
+use crate::link_state::validate_snapshot;
 use crate::logging::targets::API;
 use crate::login_nonce::MintError;
 use crate::net_mgr;
 use crate::packet::describe_five_tuple;
-use crate::topology_mgr::{AddLinkedNodeError, TopologyMgr};
+use crate::topology_mgr::{AddLinkedNodeError, TopoOps, TopologyMgr};
+use crate::visa_reconciler::revoke_visas_over_link;
 use crate::visareq_worker::{VisaDecision, request_visa_wait_response};
 
 // During node authentication we keep track in here of what state we have
@@ -62,18 +64,28 @@ impl AuthenticateUndo {
     fn add_node_to_router_and_track_if_added(
         &mut self,
         topo_mgr: &TopologyMgr,
+        ops: &TopoOps<'_>,
         addr: IpAddr,
     ) -> bool {
-        let added_node_to_router = topo_mgr.add_node_if_not_exists(addr);
+        let added_node_to_router = topo_mgr.add_node_if_not_exists(ops, addr);
         if added_node_to_router {
             self.added_node_to_router = Some(addr);
         }
         added_node_to_router
     }
 
-    async fn undo(self, asm: &Assembly) {
+    /// Undo what authentication changed. `ops` is the caller's topology guard if it
+    /// holds one (the lock is not re-entrant); otherwise one is taken here if the router
+    /// must be touched.
+    async fn undo(self, asm: &Assembly, ops: Option<&TopoOps<'_>>) {
         if let Some(addr) = self.added_node_to_router {
-            asm.topo_mgr.remove_node(&addr).await;
+            match ops {
+                Some(ops) => asm.topo_mgr.remove_node(ops, &addr).await,
+                None => {
+                    let ops = asm.topo_mgr.ops().await;
+                    asm.topo_mgr.remove_node(&ops, &addr).await;
+                }
+            }
         }
         if let Some(addr) = self.actor_mgr_add_node {
             let _ = asm.actor_mgr.remove_node(&addr).await;
@@ -223,10 +235,46 @@ impl VSHandleImpl {
     /// persisting the actor and before building its handle: the persisted
     /// session is the current generation, the handle captures it, and every
     /// handle bound to an earlier generation fails [Self::node_is_live].
+    ///
+    /// The id is `"<generation>-<uuid>"`. The generation comes from a process-wide
+    /// counter that only goes up, so link-state reports can tell a newer session from
+    /// an older one (zl-zipline#224, `link_state::session_generation`); the uuid keeps
+    /// ids unpredictable. Session checks elsewhere compare the whole string.
     fn stamp_new_session(actor: &mut Actor) {
+        static SESSION_GENERATION: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let generation = SESSION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         actor
-            .add_attribute(Attribute::builder(key::SESSION).value(uuid::Uuid::new_v4().to_string()))
+            .add_attribute(
+                Attribute::builder(key::SESSION)
+                    .value(format!("{generation}-{}", uuid::Uuid::new_v4())),
+            )
             .expect("session attribute is unvalidated and cannot fail");
+    }
+
+    /// Admission checks `authorize_connect` makes under the caller's [TopoOps],
+    /// after authenticating the connecting `actor` outside it: the calling handle
+    /// must still be live (an `open` may have replaced its session meanwhile), and
+    /// `actor` must have been approved under the current policy. Returns the error
+    /// code and message to refuse with.
+    async fn admit_under_guard(
+        &self,
+        _ops: &TopoOps<'_>,
+        actor: &Actor,
+    ) -> Result<(), (vsapi::ErrorCode, &'static str)> {
+        if !self.node_is_live().await {
+            return Err((
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            ));
+        }
+        if !approved_under_current_policy(&self.asm, actor) {
+            return Err((
+                vsapi::ErrorCode::TemporarilyUnavailable,
+                "policy changed during authorization; retry",
+            ));
+        }
+        Ok(())
     }
 
     /// Capability-liveness gate (zipline#123, K2): a `VSHandleImpl` holds a
@@ -467,8 +515,13 @@ async fn mint_login_nonce_for_handle(
 /// state down ([reset_node_state]) only after that recheck and under the same
 /// lock, so a refused authentication never leaves the old node with its
 /// adapters, visas and topology destroyed (#63 review).
+///
+/// The caller holds the topology guard (`ops`, #224's [TopoOps]); this takes
+/// the node commit lock inside it. Lock order: topology lock, then node commit
+/// lock (see `PolicyMgr::node_commit_lock`).
 async fn add_node_serialized(
     asm: &Assembly,
+    ops: &TopoOps<'_>,
     node_actor: &Actor,
     reconnect: bool,
 ) -> Result<(), ServiceError> {
@@ -480,7 +533,7 @@ async fn add_node_serialized(
         return Err(policy_moved_error());
     }
     if !reconnect && let Some(addr) = node_actor.get_zpr_addr() {
-        reset_node_state(asm, addr).await?;
+        reset_node_state(asm, ops, addr).await?;
     }
     asm.actor_mgr
         .add_node(node_actor, reconnect, &asm.policy_service_names())
@@ -510,7 +563,18 @@ fn write_error(bldr: &mut vsapi::error::Builder, code: vsapi::ErrorCode, message
 ///
 /// Must run before [crate::actor_mgr::ActorMgr::add_node] replaces the node
 /// record, which drops the node's connected-adapters set.
-async fn reset_node_state(asm: &Assembly, node_addr: &IpAddr) -> Result<(), ServiceError> {
+/// Whether `actor` was approved (its `zpr.vinst`, stamped by `approve_connection`)
+/// under the policy that is current now. Call under a [TopoOps]: policy installs
+/// commit under it, so the answer holds until the guard is dropped.
+fn approved_under_current_policy(asm: &Assembly, actor: &Actor) -> bool {
+    crate::auth_sweep::actor_vinst(actor) == asm.policy_mgr.get_current_snapshot().vinst()
+}
+
+async fn reset_node_state(
+    asm: &Assembly,
+    ops: &TopoOps<'_>,
+    node_addr: &IpAddr,
+) -> Result<(), ServiceError> {
     let departed: Vec<IpAddr> = asm
         .actor_mgr
         .get_adapters_connected_to_node(node_addr)
@@ -525,7 +589,7 @@ async fn reset_node_state(asm: &Assembly, node_addr: &IpAddr) -> Result<(), Serv
         error!(target: API, "failed to remove visas for adapters of reset node {node_addr}: {e}");
     }
     asm.visa_mgr.clear_node_state(node_addr).await?;
-    asm.topo_mgr.remove_node(node_addr).await;
+    asm.topo_mgr.remove_node(ops, node_addr).await;
     Ok(())
 }
 
@@ -558,7 +622,12 @@ async fn reset_node_state(asm: &Assembly, node_addr: &IpAddr) -> Result<(), Serv
 ///
 /// TODO: Rethink this: do we really node connect and open in VSAPI?
 /// See: https://github.com/org-zpr/zpr-visaservice/issues/302
-async fn install_policy_links_for_node(asm: &Assembly, node_actor: &Actor, node_addr: &IpAddr) {
+async fn install_policy_links_for_node(
+    asm: &Assembly,
+    ops: &TopoOps<'_>,
+    node_actor: &Actor,
+    node_addr: &IpAddr,
+) {
     let psnap = asm.policy_mgr.get_current_snapshot();
     let Some(peers) = psnap.policy().get_peers_for_node(node_addr) else {
         return; // No peerings declared for this node.
@@ -578,6 +647,7 @@ async fn install_policy_links_for_node(asm: &Assembly, node_actor: &Actor, node_
         match asm
             .topo_mgr
             .add_linked_node(
+                ops,
                 &psnap,
                 &asm.actor_mgr,
                 node_actor,
@@ -937,9 +1007,14 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         let node_zpr_addr = self.remote.ip();
         info!(target: API, "node {} requests open from addr {} (CONNECT_TYPE={:?})", vs_connect_request.cn, node_zpr_addr, vs_connect_request.ctype);
 
-        // Load, update and re-stamp the node's own actor under the self-renewal
-        // lock (#63 review audit): a concurrent login/logout or re-authentication
-        // of this node cannot land between this load and these writes.
+        // Topology operation lock (see TopoOps): held from the actor lookup through
+        // the session persist, so an overlapping authenticate, open, disconnect or
+        // link-state report sees this node's session either before or after it, and
+        // session generations are persisted in the order they are minted. Inside
+        // it, the load -> write of the node's own actor also runs under the node
+        // commit lock (#63 review audit): a concurrent login/logout of this node
+        // cannot land between them. Order: topology lock, then node commit lock.
+        let ops = self.asm.topo_mgr.ops().await;
         let existing_actor = match resume_node_actor_for_open(
             &self.asm,
             node_zpr_addr,
@@ -954,6 +1029,8 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         if matches!(vs_connect_request.ctype, ConnectType::Reset) {
             warn!(target: API, "{} requests RESET: not yet implemented", vs_connect_request.cn);
         }
+
+        drop(ops);
 
         // Skip ahead to the handle:
         let vs_handle: vsapi::v_s_handle::Client =
@@ -1099,7 +1176,7 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
             Some(addr) => addr.clone(),
             None => {
                 error!(target: API, "auth subsystem failed to set a ZPR address on an authenticated node");
-                undo.undo(&self.asm).await;
+                undo.undo(&self.asm, None).await;
                 return self.ok_with_authenticate_error(
                     results,
                     vsapi::ErrorCode::Internal,
@@ -1128,7 +1205,7 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         // at an address it cannot use.
         if node_zpr_addr != self.req_zpr_addr && net_mgr::is_zpr_addr(&self.remote.ip()) {
             warn!(target: API, "node {} requested addr {} but policy granted {}: rejecting, it joined over a link at the requested addr", self.remote_cn, self.req_zpr_addr, node_zpr_addr);
-            undo.undo(&self.asm).await;
+            undo.undo(&self.asm, None).await;
             return self.ok_with_authenticate_error(
                 results,
                 vsapi::ErrorCode::AuthError,
@@ -1140,7 +1217,7 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
             Some(cn) => cn.to_owned(),
             None => {
                 error!(target: API, "auth subsystem failed to set a CN on an authenticated node");
-                undo.undo(&self.asm).await;
+                undo.undo(&self.asm, None).await;
                 return self.ok_with_authenticate_error(
                     results,
                     vsapi::ErrorCode::Internal,
@@ -1164,25 +1241,43 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
             .add_attribute(Attribute::builder(key::AAA_NET).value(node_aaa_net.to_string()))
             .unwrap();
 
+        // Note that the node may have services on it in addition to its node-ness.
+
+        // Topology operation lock (see TopoOps): held from the policy recheck and the
+        // session stamp through the policy link install, so a policy install or
+        // revalidation, a link-state report, an `open` or a disconnect cannot
+        // interleave with this node's state being rebuilt. Undo calls inside this
+        // span pass the guard; the lock is not re-entrant.
+        let ops = self.asm.topo_mgr.ops().await;
+
+        // The node was approved (above, outside the lock: authentication can query
+        // trusted services) under the policy current then. If a newer policy has
+        // been installed since, its pass may already have run without this node, so
+        // refuse; the node retries and is judged under the current policy. Installs
+        // commit under the guard, so the answer holds until it is dropped.
+        if !approved_under_current_policy(&self.asm, &node_actor) {
+            warn!(target: API, "policy changed while authenticating {:?}; refusing, node to retry", &node_cn);
+            undo.undo(&self.asm, Some(&ops)).await;
+            return self.ok_with_authenticate_error(
+                results,
+                vsapi::ErrorCode::TemporarilyUnavailable,
+                "policy changed during authentication; retry",
+            );
+        }
+
         // Bind the handle we are about to mint to THIS authentication
         // (zipline#123, PR #41 review): a fresh session generation is stamped
         // before the actor is persisted, so any handle from a previous
-        // session at this address fails the liveness gate from here on.
+        // session at this address fails the liveness gate from here on. Stamped
+        // under the guard, so generations are persisted in the order minted.
         VSHandleImpl::stamp_new_session(&mut node_actor);
 
-        // TODO: The policy may have changed since started the authentication. Once we add the node
-        // it is part of the ZPRnet.  The add_node should check the visa vinst used to grant access
-        // and we should make sure we do not allow add_node and update_policy to run concurrently.
-        // If add_node runs first, then update policy can catch the issue.  If update_policy runs
-        // first, then add_node will see the new version and should not allow the node to be added.
-
-        // Note that the node may have services on it in addition to its node-ness.
-
         // A Reset's teardown of the node's old state runs inside
-        // add_node_serialized, after the generation recheck (#63 review).
+        // add_node_serialized, under the topology guard held here and the node
+        // commit lock it takes, after the generation recheck (#63 review).
         // The add_node call will clean up after ifself if it fails.
-        if let Err(e) = add_node_serialized(&self.asm, &node_actor, self.reconnect).await {
-            undo.undo(&self.asm).await;
+        if let Err(e) = add_node_serialized(&self.asm, &ops, &node_actor, self.reconnect).await {
+            undo.undo(&self.asm, Some(&ops)).await;
             if let ServiceError::ApiResponse(api) = e {
                 info!(target: API, "authentication of node {:?} refused at commit: {}", &node_cn, api.message);
                 return self.ok_with_authenticate_error(results, api.code.into(), &api.message);
@@ -1220,7 +1315,7 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                             .await
                         {
                             error!(target: API, "failed to set VS docking node to {:?}: {}", &node_cn, e);
-                            undo.undo(&self.asm).await;
+                            undo.undo(&self.asm, Some(&ops)).await;
                             return self.ok_with_authenticate_error(
                                 results,
                                 vsapi::ErrorCode::Internal,
@@ -1234,19 +1329,20 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         }
 
         // Add the node to the router, preserving restored links if it already exists.
-        if !undo.add_node_to_router_and_track_if_added(&self.asm.topo_mgr, node_zpr_addr) {
+        if !undo.add_node_to_router_and_track_if_added(&self.asm.topo_mgr, &ops, node_zpr_addr) {
             // Node exists already.
             info!(target: API, "node {:?} already present in router on (re)connect; keeping existing node and links", &node_cn);
         }
 
         // Install the node's policy-declared links to already-connected peers. Must happen
         // before ActorJoins: that event drives the topology fan-out, which reads the router.
-        install_policy_links_for_node(&self.asm, &node_actor, &node_zpr_addr).await;
+        install_policy_links_for_node(&self.asm, &ops, &node_actor, &node_zpr_addr).await;
+        drop(ops);
 
         let evt = VsEvent::ActorJoins(node_zpr_addr);
         if let Err(e) = self.asm.event_mgr.record_event(evt).await {
             error!(target: API, "failed to record actor joins event for node {:?}: {}", &node_cn, e);
-            undo.undo(&self.asm).await;
+            undo.undo(&self.asm, None).await;
             return self.ok_with_authenticate_error(
                 results,
                 vsapi::ErrorCode::Internal,
@@ -1342,13 +1438,44 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         let saddr: SocketAddr = vss_sockaddr.into();
         let amgr_asm = self.asm.clone();
 
-        let initial_visas = match self
+        let prepared = self
             .asm
             .visa_mgr
             .post_register_vss_visas_for_node(amgr_asm, node_zpr_addr, &saddr)
-            .await
-        {
-            Ok(visas) => visas,
+            .await;
+
+        // Topology operation lock (see TopoOps), taken after the visa preparation
+        // above (which can wait on the visa request queue and remote attribute
+        // services, so it stays outside): the caller's liveness is rechecked under it
+        // and it is held through the local registration and worker start, so a
+        // handle whose node reconnected or disconnected meanwhile cannot register a
+        // VSS for the new session or for a node that is gone.
+        let ops = self.asm.topo_mgr.ops().await;
+        if !self.node_is_live().await {
+            warn!(target: API, "register_vss from superseded handle {:?}: refused", self.node.get_cn());
+            let res_builder = res.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
+        // A superseded handle is told to re-authenticate (above) before it hears
+        // about a preparation failure.
+        // The visas were prepared before the guard: drop any revoked, acknowledged or
+        // quarantined meanwhile (a link-down report can revoke one while preparation
+        // waits), so a revoked visa is never granted again.
+        let initial_visas = match prepared {
+            Ok(visas) => visas
+                .into_iter()
+                .filter(|v| {
+                    self.asm
+                        .visa_mgr
+                        .still_grantable(v.issuer_id, node_zpr_addr)
+                })
+                .collect::<Vec<_>>(),
             Err(e) => {
                 error!(target: API, "failed to initialize node VSS for {:?}: {}", self.node.get_cn(), e);
                 let res_builder = res.get().init_res();
@@ -1429,6 +1556,7 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         if let Err(e) = start_result {
             warn!(target: API, "failed to start VSS worker for node {:?}: {}", self.node.get_cn(), e);
         }
+        drop(ops);
 
         Ok(())
     }
@@ -1494,19 +1622,36 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
 
         let actor_addr = actor.get_zpr_addr().unwrap().clone(); // MUST have an addr by now.
 
+        // Topology operation lock (see TopoOps): from the admission recheck through
+        // the node's link install or the adapter's actor write. Authentication above
+        // ran outside it (it can query trusted services), so recheck here that the
+        // calling session is still live and the policy is still the one `actor` was
+        // approved under; a superseded handle must not mutate the new session's state.
+        let ops = self.asm.topo_mgr.ops().await;
+        if let Err((code, msg)) = self.admit_under_guard(&ops, &actor).await {
+            warn!(target: API, "authorize_connect for {:?} via {:?} refused under lock: {msg}", actor.get_cn(), connect_via);
+            // Release the address only if it is not live elsewhere (a node already in
+            // the router keeps it).
+            if !self.asm.topo_mgr.has_node(&actor_addr)
+                && self.asm.net_mgr.is_managed_address(&actor_addr)
+            {
+                if let Err(e) = self.asm.net_mgr.release_zpr_addr(actor_addr) {
+                    warn!(target: API, "failed to release address, actor={}: {}", actor_addr, e);
+                }
+            }
+            let mut err_builder = results.get().init_resp().init_error();
+            write_error(&mut err_builder, code, msg);
+            self.asm.counters.incr(CounterType::AuthorizeConnectFailed);
+            return Ok(());
+        }
+
         if actor.is_node() {
-            // Capture a policy snapshot right before installing the topology link so the
-            // link description is read from one consistent view.
-            //
-            // TODO: Plumb the auth-time policy vinst through this path and detect/retry if
-            // policy changed underneath us while adding a new node. Authentication reads
-            // policy earlier in authorize_connect, so this snapshot does not yet close that
-            // window. ( https://github.com/org-zpr/zpr-visaservice/issues/232 )
             let psnap = self.asm.policy_mgr.get_current_snapshot();
             if let Err(add_err) = self
                 .asm
                 .topo_mgr
                 .add_linked_node(
+                    &ops,
                     &psnap,
                     &self.asm.actor_mgr,
                     &actor,
@@ -1563,6 +1708,10 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
                 return Ok(());
             }
         }
+
+        // Released before the denylist re-check, which may disconnect (and so take
+        // the lock itself), and before the event-queue send below.
+        drop(ops);
 
         // PR #42 review (P1): the actor is persisted — re-check the denylist
         // to close the check-then-persist race with an admin revocation. On a
@@ -1755,6 +1904,22 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         // breaking the SECURITY_MODEL.md Case 2 containment. An unknown target
         // has no docking entry and so falls out here as a refusal, which is
         // the safe default. Mirrors the session bindings `reauthorize` has.
+        //
+        // Topology operation lock (see TopoOps): the caller's liveness is rechecked
+        // and the scope decided under it, and the teardown runs under it, so a handle
+        // whose node reconnected meanwhile cannot tear down the new session's state.
+        let ops = self.asm.topo_mgr.ops().await;
+        if !self.node_is_live().await {
+            warn!(target: API, "notify_disconnect from superseded handle {:?}: refused", self.node.get_cn());
+            let res_builder = resp.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
         let caller_addr = self.node.get_zpr_addr();
         let in_scope = match caller_addr {
             Some(caller) => {
@@ -1788,13 +1953,16 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             self.node.get_cn(), zpr_addr, reason
         );
 
-        // The disconnect call updates our state database.
-        match self
+        // The disconnect call updates our state database. The VSS worker of a
+        // disconnected node is stopped after the guard is released.
+        let (vss, result) = self
             .asm
             .cc
-            .disconnect(self.asm.clone(), zpr_addr, reason)
-            .await
-        {
+            .disconnect_locked(&ops, &self.asm, zpr_addr, reason)
+            .await;
+        drop(ops);
+        crate::connection_control::ConnectionControl::stop_vss_worker(vss, &zpr_addr).await;
+        match result {
             Ok(()) => (),
             Err(e) => {
                 warn!(target: API, "error processing disconnect of {}: {}", zpr_addr, e);
@@ -1814,6 +1982,119 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         }
         let mut res_builder = resp.get().init_res();
         res_builder.set_ok(());
+        Ok(())
+    }
+
+    /// A node reports which of its links are up (zl-zipline#224). The call carries a
+    /// snapshot: every link the node has, by peer CN, replacing its previous report.
+    /// The visa service routes over a link only while both ends report it up; a link
+    /// that goes down has the visas crossing it revoked, so their flows re-request and
+    /// get a route around it. A link coming up affects new visas only.
+    ///
+    /// Errors: `authRequired` on a dead handle; `paramError` for more entries than the
+    /// node's policy-declared links, an empty peerCn, or a peerCn listed twice.
+    async fn report_link_states(
+        self: Rc<Self>,
+        params: vsapi::v_s_handle::ReportLinkStatesParams,
+        mut results: vsapi::v_s_handle::ReportLinkStatesResults,
+    ) -> Result<(), capnp::Error> {
+        /// Answer with an error and log why.
+        fn refuse(
+            results: &mut vsapi::v_s_handle::ReportLinkStatesResults,
+            code: vsapi::ErrorCode,
+            msg: &str,
+        ) {
+            let mut err_builder = results.get().init_res().init_error();
+            write_error(&mut err_builder, code, msg);
+        }
+
+        // Topology operation lock (see TopoOps), taken before this call's first await
+        // and held through the last revocation. Taking it first keeps reports a node
+        // pipelines on one handle in the order they arrived: the lock is FIFO and the
+        // RPC system starts handlers in arrival order, so a later snapshot can never
+        // apply before an earlier one. Under it, the liveness check, validation and
+        // application cannot interleave with a disconnect, reconnect or policy pass.
+        let ops = self.asm.topo_mgr.ops().await;
+        if !self.node_is_live().await {
+            warn!(target: API, "report_link_states from disconnected node {:?}: refused", self.node.get_cn());
+            refuse(
+                &mut results,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
+        let Some(reporter) = self.node.get_zpr_addr().cloned() else {
+            refuse(
+                &mut results,
+                vsapi::ErrorCode::InvalidOperation,
+                "node has no ZPR address assigned",
+            );
+            return Ok(());
+        };
+
+        // Decode, then validate at the trust boundary before storing anything.
+        let mut entries = Vec::new();
+        for reader in params.get()?.get_links()?.iter() {
+            match LinkStateReport::try_from(reader) {
+                Ok(e) => entries.push(e),
+                Err(e) => {
+                    warn!(target: API, "report_link_states from {reporter}: undecodable entry: {e}");
+                    refuse(
+                        &mut results,
+                        vsapi::ErrorCode::ParamError,
+                        "undecodable link-state entry",
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        let psnap = self.asm.policy_mgr.get_current_snapshot();
+        let declared_peers = psnap.policy().get_peers_for_node(&reporter).unwrap_or(&[]);
+        let entries = match validate_snapshot(entries, declared_peers.len()) {
+            Ok(entries) => entries,
+            Err(why) => {
+                warn!(target: API, "report_link_states from {reporter}: {why}");
+                refuse(&mut results, vsapi::ErrorCode::ParamError, &why);
+                return Ok(());
+            }
+        };
+
+        // Entries that match no declared peer's CN are kept (they are harmless and may
+        // race a policy change) but can never make a link usable; note them.
+        let cn_of = TopologyMgr::policy_cn_lookup(&psnap);
+        for e in &entries {
+            let known = declared_peers
+                .iter()
+                .any(|p| cn_of(&p.remote_zpr_addr).as_deref() == Some(e.peer_cn.as_str()));
+            if !known {
+                debug!(target: API, "report_link_states from {reporter}: peerCn '{}' matches no declared peer", e.peer_cn);
+            }
+        }
+
+        // Apply the report with the CNs of the policy current at application time, not
+        // the snapshot captured above: a policy update whose revalidation finishes in
+        // between would otherwise be overwritten with old-policy CNs. record_link_states
+        // loads that snapshot once, inside its table lock (which revalidation also
+        // holds), and evaluates every CN against it. `get_current_snapshot` is a
+        // lock-free load, so there is no lock-order concern.
+        let current_policy = || self.asm.policy_mgr.get_current_snapshot();
+        let went_down = self.asm.topo_mgr.record_link_states(
+            &ops,
+            &reporter,
+            self.session.as_deref(),
+            entries,
+            &current_policy,
+        );
+        // Revoke the visas crossing every link that just went down. A visa whose
+        // revocation write fails is quarantined and retried per visa (VisaMgr), so the
+        // report itself succeeds either way.
+        for (a, b) in went_down {
+            let _ = revoke_visas_over_link(&self.asm, &a, &b).await;
+        }
+        drop(ops);
+
+        results.get().init_res().set_ok(());
         Ok(())
     }
 
@@ -2229,6 +2510,33 @@ mod tests {
         );
     }
 
+    /// Authentication's policy recheck under the topology lock (round 13): an
+    /// actor approved under the current policy passes; one approved under an older
+    /// policy, or carrying no `zpr.vinst`, does not.
+    #[tokio::test]
+    async fn test_approved_under_current_policy() {
+        let asm = crate::assembly::tests::new_assembly_for_tests(None).await;
+        let current = asm.policy_mgr.get_current_snapshot().vinst();
+        let with_vinst = |v: u64| {
+            let mut a = Actor::new();
+            a.add_attribute(Attribute::builder(key::VINST).value(v.to_string()))
+                .unwrap();
+            a
+        };
+        assert!(approved_under_current_policy(&asm, &with_vinst(current)));
+        assert!(!approved_under_current_policy(
+            &asm,
+            &with_vinst(current + 1)
+        ));
+        if current > 0 {
+            assert!(!approved_under_current_policy(
+                &asm,
+                &with_vinst(current - 1)
+            ));
+        }
+        assert!(!approved_under_current_policy(&asm, &Actor::new()) || current == 0);
+    }
+
     /// A device-only actor (no user authority) gets its device-authority
     /// expiry as authExpires. Since zipline#119 the bootstrap stamp is
     /// far-future, so a bootstrap-only endpoint's authExpires is far-future
@@ -2339,6 +2647,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(crate::db::ActorRepo::new(asm.state_db.clone())),
             None,
+            crate::config::VSConfig::default().get_vs_addr(),
         )
         .await
         .unwrap();
@@ -2354,7 +2663,7 @@ mod tests {
         }
         let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
 
-        install_policy_links_for_node(&asm, &actor_b, &b).await;
+        install_policy_links_for_node(&asm, &asm.topo_mgr.ops_now(), &actor_b, &b).await;
 
         assert_eq!(
             asm.topo_mgr.get_peers(&b),
@@ -2374,7 +2683,7 @@ mod tests {
         async fn test_noop() {
             let asm = Arc::new(new_assembly_for_tests(None).await);
             let undo = AuthenticateUndo::default();
-            undo.undo(&asm).await; // must not panic
+            undo.undo(&asm, None).await; // must not panic
         }
 
         #[tokio::test]
@@ -2384,7 +2693,7 @@ mod tests {
 
             let mut undo = AuthenticateUndo::default();
             undo.took_zpr_addr(&addr);
-            undo.undo(&asm).await;
+            undo.undo(&asm, None).await;
 
             // Address was released back to the pool, so take_zpr_addr should succeed.
             assert!(
@@ -2400,10 +2709,14 @@ mod tests {
 
             let mut undo = AuthenticateUndo::default();
             assert!(
-                undo.add_node_to_router_and_track_if_added(&asm.topo_mgr, addr),
+                undo.add_node_to_router_and_track_if_added(
+                    &asm.topo_mgr,
+                    &asm.topo_mgr.ops_now(),
+                    addr
+                ),
                 "new router node should be reported as added"
             );
-            undo.undo(&asm).await;
+            undo.undo(&asm, None).await;
 
             // Node was removed, so add_node must succeed again.
             assert!(
@@ -2420,13 +2733,17 @@ mod tests {
             asm.topo_mgr.add_node(addr).unwrap();
 
             let mut undo = AuthenticateUndo::default();
-            let added = undo.add_node_to_router_and_track_if_added(&asm.topo_mgr, addr);
+            let added = undo.add_node_to_router_and_track_if_added(
+                &asm.topo_mgr,
+                &asm.topo_mgr.ops_now(),
+                addr,
+            );
 
             assert!(
                 !added,
                 "pre-existing router node should not be reported as newly added"
             );
-            undo.undo(&asm).await;
+            undo.undo(&asm, None).await;
             assert!(
                 asm.topo_mgr.add_node(addr).is_err(),
                 "undo must not remove a node it did not add"
@@ -2447,7 +2764,7 @@ mod tests {
 
             let mut undo = AuthenticateUndo::default();
             undo.added_node_to_actor_mgr(&addr);
-            undo.undo(&asm).await;
+            undo.undo(&asm, None).await;
 
             let result = asm.actor_mgr.get_actor_by_zpr_addr(&addr).await.unwrap();
             assert!(
@@ -2472,16 +2789,22 @@ mod tests {
             undo.took_zpr_addr(&addr);
             undo.added_node_to_actor_mgr(&addr);
             assert!(
-                undo.add_node_to_router_and_track_if_added(&asm.topo_mgr, addr),
+                undo.add_node_to_router_and_track_if_added(
+                    &asm.topo_mgr,
+                    &asm.topo_mgr.ops_now(),
+                    addr
+                ),
                 "new router node should be reported as added"
             );
-            undo.undo(&asm).await;
+            undo.undo(&asm, None).await;
 
             assert!(
                 asm.topo_mgr.add_node(addr).is_ok(),
                 "node should have been removed from router"
             );
-            asm.topo_mgr.remove_node(&addr).await;
+            asm.topo_mgr
+                .remove_node(&asm.topo_mgr.ops_now(), &addr)
+                .await;
 
             let actor_result = asm.actor_mgr.get_actor_by_zpr_addr(&addr).await.unwrap();
             assert!(
@@ -2528,7 +2851,9 @@ mod tests {
             let visa_id = create_sweep_visa(&asm, &node_a, 0).await;
 
             // What the authenticate handler does for a Reset connect.
-            reset_node_state(&asm, &node_b).await.unwrap();
+            reset_node_state(&asm, &asm.topo_mgr.ops_now(), &node_b)
+                .await
+                .unwrap();
             let node_b_actor = asm
                 .actor_mgr
                 .get_actor_by_zpr_addr(&node_b)
@@ -2610,7 +2935,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            reset_node_state(&asm, &node_a).await.unwrap();
+            reset_node_state(&asm, &asm.topo_mgr.ops_now(), &node_a)
+                .await
+                .unwrap();
 
             assert!(
                 asm.actor_mgr
@@ -2645,7 +2972,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            reset_node_state(&asm, &node_a).await.unwrap();
+            reset_node_state(&asm, &asm.topo_mgr.ops_now(), &node_a)
+                .await
+                .unwrap();
 
             assert!(
                 asm.actor_mgr
@@ -2931,6 +3260,45 @@ mod tests {
                 "the reconnect's own handle must be live"
             );
         }
+
+        /// Round 14 (Codex P1): `authorize_connect` rechecks the calling handle's
+        /// session under the topology lock. A handle superseded by a reconnect while
+        /// it authenticated the newcomer is refused with `authRequired`, so it cannot
+        /// install the newcomer through the reconnected node's router entry; the live
+        /// handle is admitted.
+        #[tokio::test]
+        async fn test_admission_under_guard_rejects_a_superseded_handle() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let mut node = make_node_actor_defexp(NODE, "node-k3", "[fd5a:5052:3000::101]:1234");
+            VSHandleImpl::stamp_new_session(&mut node);
+            asm.actor_mgr
+                .add_node(&node, false, &Default::default())
+                .await
+                .unwrap();
+            let old_handle = VSHandleImpl::new(asm.clone(), node);
+
+            // An adapter the old handle has just authenticated (policy-current).
+            let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+            let mut newcomer = Actor::new();
+            newcomer
+                .add_attribute(Attribute::builder(key::VINST).value(vinst.to_string()))
+                .unwrap();
+
+            let mut renewed = make_node_actor_defexp(NODE, "node-k3", "[fd5a:5052:3000::101]:1234");
+            VSHandleImpl::stamp_new_session(&mut renewed);
+            asm.actor_mgr
+                .add_node(&renewed, true, &Default::default())
+                .await
+                .unwrap();
+            let new_handle = VSHandleImpl::new(asm.clone(), renewed);
+
+            let ops = asm.topo_mgr.ops().await;
+            assert!(matches!(
+                old_handle.admit_under_guard(&ops, &newcomer).await,
+                Err((vsapi::ErrorCode::AuthRequired, _))
+            ));
+            assert!(new_handle.admit_under_guard(&ops, &newcomer).await.is_ok());
+        }
     }
 
     /// zipline#182: `notifyDisconnect` must be scoped to the calling node.
@@ -2999,6 +3367,108 @@ mod tests {
                 vsapi::ok_or_error::Which::Ok(_) => Ok(()),
                 vsapi::ok_or_error::Which::Error(err) => Err(err.unwrap().get_code().unwrap()),
             }
+        }
+
+        /// Round 14: `registerVss` rechecks the caller's session under the topology
+        /// lock: a handle whose node reconnected while the call waited is refused
+        /// with `authRequired`.
+        #[tokio::test]
+        async fn register_vss_from_a_superseded_handle_is_refused() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, _rx) = new_assembly_with_event_rx(None).await;
+                    let asm = Arc::new(asm);
+                    let node_addr: std::net::IpAddr = NODE_A.parse().unwrap();
+                    let mut node_a =
+                        make_node_actor_defexp(NODE_A, "node-a", "[fd5a:5052:3000::101]:1234");
+                    VSHandleImpl::stamp_new_session(&mut node_a);
+                    asm.actor_mgr
+                        .add_node(&node_a, false, &Default::default())
+                        .await
+                        .unwrap();
+                    let handle: vsapi::v_s_handle::Client =
+                        capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), node_a));
+                    let mut req = handle.register_vss_request();
+                    {
+                        let mut sa = req.get().init_addr();
+                        node_addr.write_to(&mut sa.reborrow().init_addr());
+                        sa.set_port(8183);
+                    }
+
+                    let held = asm.topo_mgr.ops().await;
+                    let call = tokio::task::spawn_local(async move {
+                        let resp = req.send().promise.await.unwrap();
+                        let res = resp.get().unwrap().get_res().unwrap();
+                        match res.which().unwrap() {
+                            vsapi::result::Which::Ok(_) => Ok(()),
+                            vsapi::result::Which::Error(err) => {
+                                Err(err.unwrap().get_code().unwrap())
+                            }
+                        }
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let mut renewed =
+                        make_node_actor_defexp(NODE_A, "node-a", "[fd5a:5052:3000::101]:1234");
+                    VSHandleImpl::stamp_new_session(&mut renewed);
+                    asm.actor_mgr
+                        .add_node(&renewed, true, &Default::default())
+                        .await
+                        .unwrap();
+                    drop(held);
+
+                    assert_eq!(call.await.unwrap(), Err(vsapi::ErrorCode::AuthRequired));
+                })
+                .await;
+        }
+
+        /// Round 14: `notifyDisconnect` checks the caller's session under the
+        /// topology lock, right before the teardown. A handle whose node reconnected
+        /// while the call waited is refused with `authRequired` and cannot tear down
+        /// the new session's state.
+        #[tokio::test]
+        async fn notify_disconnect_from_a_superseded_handle_is_refused() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, _rx) = new_assembly_with_event_rx(None).await;
+                    let asm = Arc::new(asm);
+                    let node_addr: std::net::IpAddr = NODE_A.parse().unwrap();
+                    let mut node_a =
+                        make_node_actor_defexp(NODE_A, "node-a", "[fd5a:5052:3000::101]:1234");
+                    VSHandleImpl::stamp_new_session(&mut node_a);
+                    asm.actor_mgr
+                        .add_node(&node_a, false, &Default::default())
+                        .await
+                        .unwrap();
+                    let handle: vsapi::v_s_handle::Client =
+                        capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), node_a));
+
+                    let held = asm.topo_mgr.ops().await;
+                    let call = tokio::task::spawn_local({
+                        let handle = handle.clone();
+                        async move { send_notify_disconnect(&handle, None).await }
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    // The node reconnects meanwhile: a new session is persisted.
+                    let mut renewed =
+                        make_node_actor_defexp(NODE_A, "node-a", "[fd5a:5052:3000::101]:1234");
+                    VSHandleImpl::stamp_new_session(&mut renewed);
+                    asm.actor_mgr
+                        .add_node(&renewed, true, &Default::default())
+                        .await
+                        .unwrap();
+                    drop(held);
+
+                    assert_eq!(call.await.unwrap(), Err(vsapi::ErrorCode::AuthRequired));
+                    assert!(
+                        asm.actor_mgr
+                            .get_actor_by_zpr_addr(&node_addr)
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        "the new session's node must survive"
+                    );
+                })
+                .await;
         }
 
         /// Node A names an adapter docked at node B: refused, the adapter's
@@ -3260,6 +3730,304 @@ mod tests {
         }
     }
 
+    /// zl-zipline#224: `reportLinkStates` validates the snapshot, refuses a dead
+    /// handle, and drives the router's link flag.
+    mod link_state_reports {
+        use super::*;
+        use crate::assembly::tests::new_assembly_for_tests;
+        use crate::db::PolicyRepo;
+        use crate::policy_mgr::PolicyMgr;
+        use crate::test_helpers::{
+            FakeResolver, make_node_actor_defexp, make_peering, policy_with_peerings_and_node_cns,
+        };
+        use crate::trusted_services::TrustedServicesMgr;
+        use libeval::route::LinkId;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use zpr::vsapi::v1::DisconnectReason;
+        use zpr::vsapi_types::LinkState;
+        use zpr::write_to::WriteTo;
+
+        const NODE_A: &str = "fd5a:5052:3000::1";
+        const NODE_B: &str = "fd5a:5052:3000::2";
+        const NODE_C: &str = "fd5a:5052:3000::3";
+
+        /// Policy declares A-B and A-C (C never connects). A and B are connected nodes
+        /// with their A-B link in the router. Returns node A's capnp handle.
+        async fn build() -> (Arc<Assembly>, vsapi::v_s_handle::Client) {
+            build_with_cns(false).await
+        }
+
+        /// As [build]; with `cns`, the policy also maps A and B to the CNs
+        /// "node-a" and "node-b", so reports naming them resolve.
+        async fn build_with_cns(cns: bool) -> (Arc<Assembly>, vsapi::v_s_handle::Client) {
+            let (a, b, c): (IpAddr, IpAddr, IpAddr) = (
+                NODE_A.parse().unwrap(),
+                NODE_B.parse().unwrap(),
+                NODE_C.parse().unwrap(),
+            );
+            let node_cns: &[(IpAddr, &str)] = if cns {
+                &[(a, "node-a"), (b, "node-b")]
+            } else {
+                &[]
+            };
+            let mut asm = new_assembly_for_tests(None).await;
+            asm.policy_mgr = PolicyMgr::new_with_initial_policy(
+                policy_with_peerings_and_node_cns(
+                    &[
+                        make_peering(a, b, "link-ab", vec![]),
+                        make_peering(a, c, "link-ac", vec![]),
+                    ],
+                    node_cns,
+                ),
+                PolicyRepo::new(asm.state_db.clone()),
+                Arc::new(FakeResolver::ip_only()),
+                Arc::new(TrustedServicesMgr::new()),
+                PathBuf::from("."),
+                PathBuf::from("."),
+                Arc::new(crate::db::ActorRepo::new(asm.state_db.clone())),
+                None,
+                crate::config::VSConfig::default().get_vs_addr(),
+            )
+            .await
+            .unwrap();
+            let node_a = make_node_actor_defexp(NODE_A, "node-a", "[fd5a:5052::101]:1234");
+            for actor in [
+                node_a.clone(),
+                make_node_actor_defexp(NODE_B, "node-b", "[fd5a:5052::102]:1234"),
+            ] {
+                asm.actor_mgr
+                    .add_node(&actor, false, &Default::default())
+                    .await
+                    .unwrap();
+            }
+            asm.topo_mgr.add_node(a).unwrap();
+            asm.topo_mgr.add_node(b).unwrap();
+            asm.topo_mgr
+                .add_link(a, b, LinkId("link-ab".into()), vec![], 1)
+                .unwrap();
+            let asm = Arc::new(asm);
+            let handle = capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), node_a));
+            (asm, handle)
+        }
+
+        /// Send a snapshot and return Ok(()) or the error code the VS answered with.
+        async fn send_report(
+            handle: &vsapi::v_s_handle::Client,
+            entries: &[LinkStateReport],
+        ) -> Result<(), vsapi::ErrorCode> {
+            let mut req = handle.report_link_states_request();
+            {
+                let mut list = req.get().init_links(entries.len() as u32);
+                for (i, e) in entries.iter().enumerate() {
+                    e.write_to(&mut list.reborrow().get(i as u32));
+                }
+            }
+            let resp = req.send().promise.await.unwrap();
+            let res = resp.get().unwrap().get_res().unwrap();
+            match res.which().unwrap() {
+                vsapi::ok_or_error::Which::Ok(_) => Ok(()),
+                vsapi::ok_or_error::Which::Error(err) => Err(err.unwrap().get_code().unwrap()),
+            }
+        }
+
+        fn entry(cn: &str, state: LinkState) -> LinkStateReport {
+            LinkStateReport {
+                peer_cn: cn.to_string(),
+                state,
+            }
+        }
+
+        fn ab_route_exists(asm: &Assembly) -> bool {
+            asm.topo_mgr
+                .get_best_route(&NODE_A.parse().unwrap(), &NODE_B.parse().unwrap())
+                .is_some()
+        }
+
+        /// The report handler runs under the topology operation lock (TopoOps): while
+        /// another operation holds it, the report applies nothing; once released, it
+        /// applies. Guards the round-12 class -- a report interleaving a policy pass,
+        /// disconnect or reconnect between that operation's read and its write.
+        #[tokio::test]
+        async fn report_waits_for_the_topology_operation_lock() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build().await;
+                    let held = asm.topo_mgr.ops().await;
+                    let report = tokio::task::spawn_local({
+                        let handle = handle.clone();
+                        async move { send_report(&handle, &[]).await }
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    assert!(!report.is_finished(), "report must wait for the lock");
+                    assert!(
+                        ab_route_exists(&asm),
+                        "nothing applied while the lock is held"
+                    );
+                    drop(held);
+                    assert_eq!(report.await.unwrap(), Ok(()));
+                    assert!(!ab_route_exists(&asm));
+                })
+                .await;
+        }
+
+        /// `open` reads the node's actor and persists its new session under the
+        /// topology operation lock (round 13, Copilot): while another operation holds
+        /// it, `open` does not complete, so overlapping opens, authentications and
+        /// report applications cannot persist sessions out of order.
+        #[tokio::test]
+        async fn open_waits_for_the_topology_operation_lock() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, _handle) = build().await;
+                    let vs: vsapi::visa_service::Client = capnp_rpc::new_client(VisaServiceImpl {
+                        asm: asm.clone(),
+                        remote: SocketAddr::new(NODE_A.parse().unwrap(), 1234),
+                    });
+                    let mut req = vs.open_request();
+                    {
+                        let mut r = req.get().init_req();
+                        r.set_cn("node-a");
+                        r.set_ctype(vsapi::VSConnT::Reconnect);
+                        let mut p = r.init_params(1).get(0);
+                        p.set_ptype(vsapi::ParamT::String);
+                        p.set_name(pname::SUBSTRATE_ADDR);
+                        p.set_value_text("[fd5a:5052::101]:1234");
+                    }
+                    let held = asm.topo_mgr.ops().await;
+                    let open =
+                        tokio::task::spawn_local(
+                            async move { req.send().promise.await.map(|_| ()) },
+                        );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    assert!(!open.is_finished(), "open must wait for the lock");
+                    drop(held);
+                    open.await.unwrap().unwrap();
+                })
+                .await;
+        }
+
+        /// Round 15 (Codex P1): reports pipelined on one handle apply in the order
+        /// they were sent. The handler takes the topology lock before its first await
+        /// (the lock is FIFO), so a later "down" snapshot cannot overtake an earlier
+        /// "up" one and leave the stale "up" applied last.
+        #[tokio::test]
+        async fn pipelined_reports_apply_in_order() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build_with_cns(true).await;
+                    let send = |entries: Vec<LinkStateReport>| {
+                        let mut req = handle.report_link_states_request();
+                        {
+                            let mut list = req.get().init_links(entries.len() as u32);
+                            for (i, e) in entries.iter().enumerate() {
+                                e.write_to(&mut list.reborrow().get(i as u32));
+                            }
+                        }
+                        req.send().promise
+                    };
+                    // Down, then up: the up snapshot is the node's latest word.
+                    let held = asm.topo_mgr.ops().await;
+                    let down = send(vec![]);
+                    let up = send(vec![entry("node-b", LinkState::Up)]);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    drop(held);
+                    down.await.unwrap();
+                    up.await.unwrap();
+                    assert!(ab_route_exists(&asm), "the later (up) snapshot wins");
+
+                    // Up, then down: the down snapshot wins.
+                    let held = asm.topo_mgr.ops().await;
+                    let up = send(vec![entry("node-b", LinkState::Up)]);
+                    let down = send(vec![]);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    drop(held);
+                    up.await.unwrap();
+                    down.await.unwrap();
+                    assert!(!ab_route_exists(&asm), "the later (down) snapshot wins");
+                })
+                .await;
+        }
+
+        /// An empty snapshot says "no link is up": A's link to B goes down.
+        #[tokio::test]
+        async fn empty_snapshot_takes_the_link_down() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build().await;
+                    assert!(ab_route_exists(&asm));
+                    assert_eq!(send_report(&handle, &[]).await, Ok(()));
+                    assert!(!ab_route_exists(&asm));
+                })
+                .await;
+        }
+
+        /// More entries than the node's declared links: paramError, nothing stored.
+        #[tokio::test]
+        async fn too_many_entries_is_param_error() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build().await;
+                    let three = [
+                        entry("b.zpr", LinkState::Up),
+                        entry("c.zpr", LinkState::Up),
+                        entry("d.zpr", LinkState::Up),
+                    ];
+                    assert_eq!(
+                        send_report(&handle, &three).await,
+                        Err(vsapi::ErrorCode::ParamError)
+                    );
+                    assert!(ab_route_exists(&asm), "a rejected report changes nothing");
+                })
+                .await;
+        }
+
+        /// A duplicate or empty peerCn: paramError, nothing stored.
+        #[tokio::test]
+        async fn duplicate_or_empty_cn_is_param_error() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build().await;
+                    let dup = [
+                        entry("b.zpr", LinkState::Up),
+                        entry("b.zpr", LinkState::Down),
+                    ];
+                    assert_eq!(
+                        send_report(&handle, &dup).await,
+                        Err(vsapi::ErrorCode::ParamError)
+                    );
+                    assert_eq!(
+                        send_report(&handle, &[entry("", LinkState::Up)]).await,
+                        Err(vsapi::ErrorCode::ParamError)
+                    );
+                    assert!(ab_route_exists(&asm));
+                })
+                .await;
+        }
+
+        /// A disconnected node's handle is refused with authRequired.
+        #[tokio::test]
+        async fn dead_handle_is_auth_required() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build().await;
+                    asm.cc
+                        .disconnect(
+                            asm.clone(),
+                            NODE_A.parse().unwrap(),
+                            DisconnectReason::Admin,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        send_report(&handle, &[]).await,
+                        Err(vsapi::ErrorCode::AuthRequired)
+                    );
+                })
+                .await;
+        }
+    }
+
     /// `getLoginNonce` (zl-zipline#232), driven through a real capnp client.
     mod login_nonce {
         use super::*;
@@ -3377,7 +4145,10 @@ mod tests {
             let guard = asm.policy_mgr.node_commit_lock.lock().await;
             let task = tokio::spawn({
                 let asm = asm.clone();
-                async move { add_node_serialized(&asm, &node, false).await }
+                async move {
+                    let ops = asm.topo_mgr.ops().await;
+                    add_node_serialized(&asm, &ops, &node, false).await
+                }
             });
             tokio::time::sleep(Duration::from_millis(200)).await;
             assert!(
@@ -3437,7 +4208,7 @@ mod tests {
             let stale = asm.policy_mgr.get_current_snapshot().vinst() + 1;
             node.add_attribute(Attribute::builder(key::VINST).value(stale.to_string()))
                 .unwrap();
-            let err = add_node_serialized(&asm, &node, false)
+            let err = add_node_serialized(&asm, &asm.topo_mgr.ops().await, &node, false)
                 .await
                 .expect_err("a stale admission must not persist");
             assert!(
@@ -3456,7 +4227,7 @@ mod tests {
             let current = asm.policy_mgr.get_current_snapshot().vinst();
             node.add_attribute(Attribute::builder(key::VINST).value(current.to_string()))
                 .unwrap();
-            add_node_serialized(&asm, &node, false)
+            add_node_serialized(&asm, &asm.topo_mgr.ops().await, &node, false)
                 .await
                 .expect("a current admission persists");
         }
@@ -3534,7 +4305,11 @@ mod tests {
             fresh
                 .add_attribute(Attribute::builder(key::VINST).value(stale.to_string()))
                 .unwrap();
-            assert!(add_node_serialized(&asm, &fresh, false).await.is_err());
+            assert!(
+                add_node_serialized(&asm, &asm.topo_mgr.ops().await, &fresh, false)
+                    .await
+                    .is_err()
+            );
             assert!(
                 adapter_present().await,
                 "a refused Reset must not tear anything down"
@@ -3544,7 +4319,7 @@ mod tests {
             fresh
                 .add_attribute(Attribute::builder(key::VINST).value(current.to_string()))
                 .unwrap();
-            add_node_serialized(&asm, &fresh, false)
+            add_node_serialized(&asm, &asm.topo_mgr.ops().await, &fresh, false)
                 .await
                 .expect("a current Reset commits");
             assert!(

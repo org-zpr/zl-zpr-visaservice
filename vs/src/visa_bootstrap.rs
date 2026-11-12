@@ -5,24 +5,32 @@
 //! over VSAPI. Policy evaluation cannot answer for it, so these visas are minted directly from
 //! the policy-declared peering, which *is* the authorization.
 //!
-//! There are two ways a bootstrap visa gets to where it is needed, and both live here:
+//! This is the defined v1 join path for a Zode (Zodes plan §5.6, zl-zipline#221), not a
+//! stopgap. Three rules keep it narrow:
+//! - **Only the visa service mints them**, here and in
+//!   `VisaMgr::vsapi_bootstrap_visa_for_future_peer`. Nothing a peer says is ever a bootstrap
+//!   visa (the dataplane accepts none from Hello; zl-zipline#222).
+//! - **Only the relay receives them**: the node the visa service docks on, which is one hop
+//!   from it (operator, pd g44 q3). Any other neighbour of a joining node gets its link but no
+//!   bootstrap visas, so an endpoint never carries a joiner's traffic (the non-transit rule).
+//!   Joining across more than one hop is deferred until the visa service runs on its own Zode.
+//! - **They travel next to the joiner's name**: only inside the `Link.visas` of the topology
+//!   link whose `zprAddr`/`peerCn` name the joining peer, so the relay can bind them to the
+//!   link whose certificate carries that CN (zl-zipline#220, #222).
+//!
+//! There are two ways a bootstrap visa gets to the relay, and both live here:
 //! - [visas_for_link] mints the peer's own visas for a topology send, which carries them to the
-//!   peer's neighbour inside `Link.visas` for hand-off when the peer shows up. These have to be
+//!   relay inside `Link.visas` for hand-off when the peer shows up. These have to be
 //!   pushed: the peer cannot ask for a visa until it has a VSAPI session, and these are what let
 //!   it open one.
-//! - [visa_for_future_peer_request] answers a *connected* node that saw the peer's traffic --
-//!   the SYN it relays, or the visa service's reply to it -- before its own queued copy landed.
+//! - [visa_for_future_peer_request] answers the relay when it sees the peer's traffic -- the
+//!   SYN it relays, or the visa service's reply to it -- before its own queued copy landed.
 //!
 //! Each direction of the session is its own visa -- see
 //! `VisaMgr::vsapi_bootstrap_visa_for_future_peer`, which does the actual minting and stays in
 //! [crate::visa_mgr] because it needs the visa store's internals.
 //!
-//! There is also support code in [crate::vss_worker] used when we send the set_topology message.
-//!
-//! TODO: This whole module is a HACK to get initial MULTINODE working, and is meant to be
-//! deleted once peers authenticate and route properly before needing VSAPI.
-//!
-//! See: https://github.com/org-zpr/zpr-visaservice/issues/301
+//! The topology send that carries them is [crate::vss_worker::topology_links].
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -43,6 +51,15 @@ use crate::visareq_worker::{VisaDecision, VisaRequestJob};
 
 /// Stands in for the ZPL source on a bootstrap visa, which has no matching com policy.
 pub const BOOTSTRAP_VISA_ZPL: &str = "<bootstrap: policy peering>";
+
+/// Whether `node` is the relay: the node the visa service docks on, the only neighbour a
+/// joining peer's bootstrap visas may go to (see the module rules). Read at run time, the same
+/// way [vs_segment] finds the visa service's path.
+fn is_relay(asm: &Assembly, node: &IpAddr) -> bool {
+    asm.actor_mgr
+        .get_docking_node_for_adapter(&asm.config.get_vs_addr())
+        .is_some_and(|dock| dock == *node)
+}
 
 /// Both directions of the peer's VSAPI flow, actualized for `future_peer`, for `via_node` to
 /// carry in the `Link.visas` of its topology message.
@@ -65,6 +82,9 @@ pub const BOOTSTRAP_VISA_ZPL: &str = "<bootstrap: policy peering>";
 /// producing a path that revisits it (`[peer, via_node, peer]`). Actualization then reads
 /// `via_node` as an intermediary and pushes it a forwarding-only visa for a flow it terminates.
 ///
+/// Returns no visas when `via_node` is not the relay: a joining peer reaches the visa service
+/// only through the relay, never through another neighbour (module rules).
+///
 /// Minting is idempotent, so calling this on every topology send is free after the first.
 ///
 /// `policy` is the view the caller picked the link out of, threaded through so the minted
@@ -75,6 +95,10 @@ pub async fn visas_for_link(
     future_peer: &IpAddr,
     via_node: &IpAddr,
 ) -> Result<Vec<Visa>, ServiceError> {
+    if !is_relay(asm, via_node) {
+        debug!(target: VSS, "node {via_node} is not the relay: no bootstrap visas for its peer {future_peer}");
+        return Ok(Vec::new());
+    }
     if asm
         .actor_mgr
         .get_actor_by_zpr_addr(future_peer)
@@ -118,8 +142,8 @@ pub async fn visas_for_link(
 /// direction of travel. The direction detected here is what selects the right one. Minting is
 /// idempotent, so a repeated ask returns the same visa.
 ///
-/// Returns `None` when this is not that flow (including on a mint failure), leaving the
-/// request to normal evaluation.
+/// Returns `None` when this is not that flow, when the requesting node is not the relay, or on
+/// a mint failure, leaving the request to normal evaluation.
 pub async fn visa_for_future_peer_request(
     asm: &Arc<Assembly>,
     job: &VisaRequestJob,
@@ -144,6 +168,11 @@ pub async fn visa_for_future_peer_request(
             return None;
         };
     if !peer_actor_missing {
+        return None;
+    }
+    // Only the relay may relay a joiner's VSAPI traffic (module rules).
+    if !is_relay(asm, &job.requesting_node) {
+        debug!(target: VREQ, "node {} asked about VSAPI flow with unconnected {peer_addr} but is not the relay: not a bootstrap request", job.requesting_node);
         return None;
     }
 
@@ -305,15 +334,40 @@ mod tests {
     /// peering, and `via_node` is connected and docks the visa service. The peer is left
     /// unconnected (no actor, no route) -- callers that want it connected add its actor.
     async fn build_bootstrap_test_asm(via_node: IpAddr, future_peer: IpAddr) -> Assembly {
+        build_bootstrap_test_asm_with_cns(via_node, &[future_peer], &[]).await
+    }
+
+    /// As [build_bootstrap_test_asm], with one peering from `via_node` to each of
+    /// `future_peers` (link ids `link-vp`, `link-vp1`, ...), and node join policies declaring
+    /// the given node CNs (what `Policy::node_cn_for_addr` reads).
+    async fn build_bootstrap_test_asm_with_cns(
+        via_node: IpAddr,
+        future_peers: &[IpAddr],
+        node_cns: &[(IpAddr, &str)],
+    ) -> Assembly {
         use crate::db::PolicyRepo;
         use crate::policy_mgr::PolicyMgr;
-        use crate::test_helpers::{FakeResolver, make_peering, policy_with_peerings};
+        use crate::test_helpers::{FakeResolver, make_peering, policy_with_peerings_and_node_cns};
         use crate::trusted_services::TrustedServicesMgr;
         use std::path::PathBuf;
 
         let mut asm = new_assembly_for_tests(None).await;
         asm.policy_mgr = PolicyMgr::new_with_initial_policy(
-            policy_with_peerings(&[make_peering(via_node, future_peer, "link-vp", vec![])]),
+            policy_with_peerings_and_node_cns(
+                &future_peers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, peer)| {
+                        let link_id = if i == 0 {
+                            "link-vp".to_string()
+                        } else {
+                            format!("link-vp{i}")
+                        };
+                        make_peering(via_node, *peer, &link_id, vec![])
+                    })
+                    .collect::<Vec<_>>(),
+                node_cns,
+            ),
             PolicyRepo::new(asm.state_db.clone()),
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
@@ -321,6 +375,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(crate::db::ActorRepo::new(asm.state_db.clone())),
             None,
+            crate::config::VSConfig::default().get_vs_addr(),
         )
         .await
         .unwrap();
@@ -430,53 +485,32 @@ mod tests {
         assert_eq!(pending, expected);
     }
 
-    /// The route returned with a bootstrap visa names the links the traffic really crosses: the
-    /// peer's own link, which only policy knows about, plus the routed segment on to the visa
-    /// service's docking node -- ordered from the ingress end of the direction asked about.
+    /// The bootstrap route is the joiner's own link to the relay, in both directions. Before
+    /// zl-zipline#221 it could also run on from a non-relay neighbour to the docking node;
+    /// that join path is gone (see `no_bootstrap_visas_through_a_neighbour_that_is_not_the_relay`).
     #[tokio::test]
-    async fn bootstrap_visa_route_spans_peer_link_and_routed_segment() {
-        let via_node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
-        let dock_node: IpAddr = "fd5a:5052:3000::2".parse().unwrap(); // docks the VS, one hop on
+    async fn bootstrap_visa_route_is_the_peers_link_to_the_relay() {
+        let relay: IpAddr = "fd5a:5052:3000::1".parse().unwrap(); // docks the VS
         let future_peer: IpAddr = "fd5a:5052:3000::7".parse().unwrap();
-
-        let asm = build_bootstrap_test_asm(via_node, future_peer).await;
-        asm.topo_mgr.add_node(dock_node).unwrap();
-        asm.topo_mgr
-            .add_link(via_node, dock_node, LinkId("link-vd".into()), vec![], 1)
-            .unwrap();
-        asm.actor_mgr
-            .hack_set_vs_docking_node(&dock_node)
-            .await
-            .unwrap();
-        let asm = Arc::new(asm);
+        let asm = Arc::new(build_bootstrap_test_asm(relay, future_peer).await);
         let (syn_pkt, reply_pkt) = bootstrap_flow_packets(&asm, &future_peer);
 
-        let syn_route = match process_visa_request_for_test(asm.clone(), via_node, syn_pkt).await {
-            VisaDecision::Allow(_, route) => route,
-            VisaDecision::Deny(code) => panic!("expected allow for SYN direction, got {code:?}"),
-        };
-        assert!(
-            matches!(syn_route.kind, RouteKind::Multihop),
-            "the peer's own link is always crossed, so this is never a direct route"
-        );
-        assert_eq!(
-            syn_route.links,
-            vec![LinkId("link-vp".into()), LinkId("link-vd".into())],
-            "peer's link first, then the routed segment to the docking node"
-        );
-        assert_eq!(syn_route.cost, 2, "one policy link plus one router link");
-
-        let reply_route = match process_visa_request_for_test(asm.clone(), via_node, reply_pkt)
-            .await
-        {
-            VisaDecision::Allow(_, route) => route,
-            VisaDecision::Deny(code) => panic!("expected allow for reply direction, got {code:?}"),
-        };
-        assert_eq!(
-            reply_route.links,
-            vec![LinkId("link-vd".into()), LinkId("link-vp".into())],
-            "the reply crosses the same links from the other end"
-        );
+        for (pkt, what) in [(syn_pkt, "SYN"), (reply_pkt, "reply")] {
+            let route = match process_visa_request_for_test(asm.clone(), relay, pkt).await {
+                VisaDecision::Allow(_, route) => route,
+                VisaDecision::Deny(code) => panic!("expected allow for {what}, got {code:?}"),
+            };
+            assert!(
+                matches!(route.kind, RouteKind::Multihop),
+                "the peer's own link is always crossed, so this is never a direct route"
+            );
+            assert_eq!(
+                route.links,
+                vec![LinkId("link-vp".into())],
+                "{what}: only the peer's link"
+            );
+            assert_eq!(route.cost, 1, "{what}: one policy link");
+        }
     }
 
     /// A topology send carries both directions of the peer's VSAPI flow, and re-sending
@@ -617,5 +651,162 @@ mod tests {
             ),
             "a connected peer must not get a bootstrap visa"
         );
+    }
+
+    /// The `(link_id, substrate)` pairs `send_topology` would resolve for `node`, read the same
+    /// way: from the current snapshot.
+    fn resolved_peers(asm: &Assembly, node: &IpAddr) -> Vec<crate::policy_mgr::ResolvedPeer> {
+        asm.policy_mgr
+            .get_current_snapshot()
+            .resolved_peers_for_node(node)
+    }
+
+    /// Every link of a topology send names its peer's CN, read from the peer's node join
+    /// policy (zl-zipline#221): the CN the peer's link certificate must carry.
+    #[tokio::test]
+    async fn topology_links_carry_the_peer_cn_from_policy() {
+        let via_node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let future_peer: IpAddr = "fd5a:5052:3000::7".parse().unwrap();
+        let asm = Arc::new(
+            build_bootstrap_test_asm_with_cns(
+                via_node,
+                &[future_peer],
+                &[(via_node, "relay.zpr"), (future_peer, "laptop-a.zpr")],
+            )
+            .await,
+        );
+        let links = crate::vss_worker::topology_links(
+            &asm,
+            &asm.policy_mgr.get_current(),
+            &via_node,
+            resolved_peers(&asm, &via_node),
+        )
+        .await
+        .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].zpr_addr, future_peer);
+        assert_eq!(links[0].peer_cn, "laptop-a.zpr");
+    }
+
+    /// A peer whose CN policy does not declare is left out of the topology send (operator,
+    /// pd g44 q2): its node would refuse an unnamed peer anyway (zl-zipline#220), and its
+    /// bootstrap visas would have no CN to be bound to.
+    #[tokio::test]
+    async fn topology_links_skip_a_peer_without_a_cn() {
+        let via_node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let future_peer: IpAddr = "fd5a:5052:3000::7".parse().unwrap();
+        let asm = Arc::new(
+            build_bootstrap_test_asm_with_cns(via_node, &[future_peer], &[(via_node, "relay.zpr")])
+                .await,
+        );
+        let links = crate::vss_worker::topology_links(
+            &asm,
+            &asm.policy_mgr.get_current(),
+            &via_node,
+            resolved_peers(&asm, &via_node),
+        )
+        .await
+        .unwrap();
+        assert!(
+            links.is_empty(),
+            "no CN for {future_peer}: link skipped, got {links:?}"
+        );
+    }
+
+    /// Bootstrap visas go only to the node the visa service docks on -- the relay (plan §5.6,
+    /// operator pd g44 q3). A connected node that is not the relay but is declared to link
+    /// with an unconnected peer (an endpoint with a direct link to a laptop that has not
+    /// joined yet) gets neither the pushed visas nor the pulled ones: carrying the joiner's
+    /// VSAPI traffic would make it a transit node.
+    #[tokio::test]
+    async fn no_bootstrap_visas_through_a_neighbour_that_is_not_the_relay() {
+        let endpoint: IpAddr = "fd5a:5052:3000::1".parse().unwrap(); // connected, not the relay
+        let relay: IpAddr = "fd5a:5052:3000::9".parse().unwrap(); // connected, docks the VS
+        let joiner: IpAddr = "fd5a:5052:3000::7".parse().unwrap(); // no actor, no route
+        let asm = build_bootstrap_test_asm(endpoint, joiner).await;
+        asm.topo_mgr.add_node(relay).unwrap();
+        asm.topo_mgr
+            .add_link(endpoint, relay, LinkId("link-er".into()), vec![], 1)
+            .unwrap();
+        asm.actor_mgr
+            .hack_set_vs_docking_node(&relay)
+            .await
+            .unwrap();
+        let asm = Arc::new(asm);
+
+        assert!(
+            visas_for_link(&asm, &asm.policy_mgr.get_current(), &joiner, &endpoint)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a non-relay neighbour must not be pushed bootstrap visas"
+        );
+        assert!(
+            asm.visa_mgr
+                .get_pending_visa_ids_for_node(&joiner)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing may be minted for the joiner on a non-relay link"
+        );
+        let (syn_pkt, reply_pkt) = bootstrap_flow_packets(&asm, &joiner);
+        for pkt in [syn_pkt, reply_pkt] {
+            assert!(
+                matches!(
+                    process_visa_request_for_test(asm.clone(), endpoint, pkt).await,
+                    VisaDecision::Deny(_)
+                ),
+                "a non-relay neighbour must not pull a bootstrap visa"
+            );
+        }
+    }
+
+    /// CN-mismatch guard (zl-zipline#221): with two joiners behind the relay, each link's
+    /// bootstrap visas belong to that link's own peer -- the one its `zprAddr` and `peerCn`
+    /// name -- so the relay can bind them to the link whose certificate carries that CN, and
+    /// no joiner's visas ever ride on another joiner's link.
+    #[tokio::test]
+    async fn bootstrap_visas_ride_only_on_their_own_peers_link() {
+        let relay: IpAddr = "fd5a:5052:3000::1".parse().unwrap(); // connected, docks the VS
+        let a: IpAddr = "fd5a:5052:3000::a".parse().unwrap();
+        let b: IpAddr = "fd5a:5052:3000::b".parse().unwrap();
+        let asm = Arc::new(
+            build_bootstrap_test_asm_with_cns(
+                relay,
+                &[a, b],
+                &[(relay, "relay.zpr"), (a, "a.zpr"), (b, "b.zpr")],
+            )
+            .await,
+        );
+        let links = crate::vss_worker::topology_links(
+            &asm,
+            &asm.policy_mgr.get_current(),
+            &relay,
+            resolved_peers(&asm, &relay),
+        )
+        .await
+        .unwrap();
+        assert_eq!(links.len(), 2);
+        for link in &links {
+            let expected_cn = if link.zpr_addr == a { "a.zpr" } else { "b.zpr" };
+            assert_eq!(
+                link.peer_cn, expected_cn,
+                "link {} names the wrong CN",
+                link.link_id
+            );
+            assert_eq!(link.visas.len(), 2, "both directions for {}", link.zpr_addr);
+            for visa in &link.visas {
+                let pep = visa
+                    .dock_pep
+                    .as_ref()
+                    .expect("bootstrap visas are full visas");
+                assert!(
+                    pep.source_addr == link.zpr_addr || pep.dest_addr == link.zpr_addr,
+                    "visa {} on the link to {} is for another peer",
+                    visa.issuer_id,
+                    link.zpr_addr
+                );
+            }
+        }
     }
 }

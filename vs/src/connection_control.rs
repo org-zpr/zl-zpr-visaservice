@@ -44,8 +44,10 @@ use crate::login_nonce::LoginNonceStore;
 use crate::net_mgr;
 use crate::oidc::{NonceExpectation, OidcError, OidcTrustedService, validate_id_token};
 use crate::policy_mgr::PolicySnapshot;
+use crate::topology_mgr::TopoOps;
 use crate::trusted_services::{TrustedServicesMgr, derive_user_authority, lookup_identities};
 use crate::visa_reconciler::{SweepReason, revalidate_visas};
+use crate::vss_mgr::VssHandle;
 
 // TODO: move to libeval
 const CLASS_DEVICE: &str = "device";
@@ -1626,6 +1628,7 @@ impl ConnectionControl {
             // - the node commit lock is released BEFORE awaiting the bounded
             //   event queue -- its worker may need that lock -- and the visa
             //   reconciliation is handed to the event manager.
+            let mut disconnect_node = false;
             if user_change == UserNamespaceChange::Gain
                 && let Err(re) = asm
                     .actor_mgr
@@ -1633,22 +1636,22 @@ impl ConnectionControl {
                     .await
             {
                 error!(target: CC, "rollback of {zpr_addr}'s failed login failed ({re}); disconnecting the node");
-                if let Err(de) = self
-                    .disconnect_impl(
-                        asm.clone(),
-                        zpr_addr,
-                        vsapi::DisconnectReason::Admin,
-                        self_reauth_guard.is_some(),
-                    )
-                    .await
-                {
-                    error!(target: CC, "failed to disconnect {zpr_addr} after a failed login rollback: {de}");
-                }
+                disconnect_node = true;
             }
             if user_change != UserNamespaceChange::Keep && logout_without_enrichment {
                 asm.ts_mgr.invalidate_actor_revisions(&zpr_addr);
             }
+            // Release the node commit lock before disconnecting: a disconnect
+            // takes the topology lock, and the lock order is topology lock, then
+            // node commit lock (see `PolicyMgr::node_commit_lock`).
             drop(self_reauth_guard);
+            if disconnect_node
+                && let Err(de) = self
+                    .disconnect(asm.clone(), zpr_addr, vsapi::DisconnectReason::Admin)
+                    .await
+            {
+                error!(target: CC, "failed to disconnect {zpr_addr} after a failed login rollback: {de}");
+            }
             if user_change != UserNamespaceChange::Keep {
                 warn!(target: CC, "write of {zpr_addr}'s namespace change failed ({e}); queueing an attribute-change reconcile");
                 if let Err(qe) = asm
@@ -1667,11 +1670,19 @@ impl ConnectionControl {
         // update_actor could race the enforcement sweep's removal (the sweep
         // revokes the OLD record while this write re-persists the actor);
         // this closes that window. Same uniform rejection as the pre-check.
-        if let Err(e) = self
-            .enforce_denylist_after_persist_impl(&asm, &renewed, self_reauth_guard.is_some())
-            .await
-        {
-            info!(target: CC, "SS reauth rejected post-persist: {e}");
+        if Self::denylisted_after_persist(&asm, &renewed).await {
+            // Undo the renewal by disconnecting -- after releasing the node
+            // commit lock, because a disconnect takes the topology lock (lock
+            // order: topology lock, then node commit lock).
+            drop(self_reauth_guard);
+            if let Some(addr) = renewed.get_zpr_addr()
+                && let Err(e) = self
+                    .disconnect(asm.clone(), *addr, vsapi::DisconnectReason::Admin)
+                    .await
+            {
+                error!(target: CC, "failed to disconnect revoked actor {addr} after persist: {e}; the denylist sweep will retry");
+            }
+            info!(target: CC, "SS reauth rejected post-persist: cn revoked");
             return Err(ApiResponseError::new_code_msg(
                 ErrorCode::AuthError,
                 "authentication rejected",
@@ -1858,50 +1869,12 @@ impl ConnectionControl {
         asm: &Arc<Assembly>,
         actor: &Actor,
     ) -> Result<(), ServiceError> {
-        self.enforce_denylist_after_persist_impl(asm, actor, false)
-            .await
-    }
-
-    /// [Self::enforce_denylist_after_persist] for a caller that may hold the
-    /// self-renewal lock already (a node's reauthorization of its own actor);
-    /// passed through to [Self::disconnect_impl].
-    async fn enforce_denylist_after_persist_impl(
-        &self,
-        asm: &Arc<Assembly>,
-        actor: &Actor,
-        node_commit_lock_held: bool,
-    ) -> Result<(), ServiceError> {
-        // Same gating as sweep_denylisted_actors: only a bootstrap-admitted
-        // device authority is subject to the bootstrap-key denylist, and the
-        // VS's own actor is exempt.
-        let bootstrap_admitted = actor
-            .get_attribute(key::DEVICE_AUTHORITY)
-            .and_then(|a| a.get_single_value().ok())
-            .is_some_and(|method| method == key::AUTHORITY_METHOD_BOOTSTRAP);
-        if !bootstrap_admitted {
+        if !Self::denylisted_after_persist(asm, actor).await {
             return Ok(());
         }
-        let Some(cn) = actor.get_cn() else {
-            return Ok(());
-        };
-        if cn == config::VS_CN {
-            return Ok(());
-        }
-        if Self::check_bootstrap_denylist(asm, cn).await.is_ok() {
-            return Ok(());
-        }
-        // Revoked mid-connect: undo the admission. The actor is persisted, so
-        // the full disconnect teardown applies (actor record, visas, topology
-        // for a node, managed-address release) — the same path the sweep uses.
-        warn!(target: CC, "cn {cn} was revoked during connection setup; undoing the admission (zipline#136, PR #42 review)");
         if let Some(addr) = actor.get_zpr_addr() {
             if let Err(e) = self
-                .disconnect_impl(
-                    asm.clone(),
-                    *addr,
-                    vsapi::DisconnectReason::Admin,
-                    node_commit_lock_held,
-                )
+                .disconnect(asm.clone(), *addr, vsapi::DisconnectReason::Admin)
                 .await
             {
                 // The refusal stands either way; the periodic sweep retries
@@ -1910,6 +1883,38 @@ impl ConnectionControl {
             }
         }
         Err(ServiceError::AuthenticationFailed("not authorized".into()))
+    }
+
+    /// The check half of [Self::enforce_denylist_after_persist]: whether the
+    /// just-persisted actor's bootstrap CN has been denylisted (or the denylist is
+    /// unreadable -- fail closed). It disconnects nothing, so a caller holding the
+    /// node commit lock (`reauthorize`) can check under it and disconnect after
+    /// releasing it (lock order: topology lock, then node commit lock).
+    async fn denylisted_after_persist(asm: &Arc<Assembly>, actor: &Actor) -> bool {
+        // Same gating as sweep_denylisted_actors: only a bootstrap-admitted
+        // device authority is subject to the bootstrap-key denylist, and the
+        // VS's own actor is exempt.
+        let bootstrap_admitted = actor
+            .get_attribute(key::DEVICE_AUTHORITY)
+            .and_then(|a| a.get_single_value().ok())
+            .is_some_and(|method| method == key::AUTHORITY_METHOD_BOOTSTRAP);
+        if !bootstrap_admitted {
+            return false;
+        }
+        let Some(cn) = actor.get_cn() else {
+            return false;
+        };
+        if cn == config::VS_CN {
+            return false;
+        }
+        if Self::check_bootstrap_denylist(asm, cn).await.is_ok() {
+            return false;
+        }
+        // Revoked mid-connect: the caller undoes the admission with the full
+        // disconnect teardown (actor record, visas, topology for a node,
+        // managed-address release) -- the same path the sweep uses.
+        warn!(target: CC, "cn {cn} was revoked during connection setup; undoing the admission (zipline#136, PR #42 review)");
+        true
     }
 
     /// Preform authentication of an adapter or a node, then run through policy.
@@ -2380,6 +2385,12 @@ impl ConnectionControl {
     /// This is used only for policy disconnect calls over the VSAPI or for a policy instigated disconnect.
     /// In both cases, it is safe to remove all state for the disconnecting actor.
     ///
+    /// A topology operation (TopoOps invariant): the local teardown runs under one
+    /// guard, from the actor lookup to the last state removal, so a reconnect of the
+    /// same node is either fully before it or fully after it and its state is never
+    /// torn down by a disconnect that started earlier. A node's VSS worker is stopped
+    /// after the guard is released, since stopping waits on that worker.
+    ///
     /// ### Errors
     /// Most cleanup failures are logged and swallowed (the caller can't act on them). Only these
     /// propagate as `Err`:
@@ -2393,30 +2404,59 @@ impl ConnectionControl {
         zpr_addr: IpAddr,
         reason: vsapi::DisconnectReason,
     ) -> Result<(), ServiceError> {
-        self.disconnect_impl(asm, zpr_addr, reason, false).await
+        let ops = asm.topo_mgr.ops().await;
+        let (vss, result) = self.disconnect_locked(&ops, &asm, zpr_addr, reason).await;
+        drop(ops);
+        Self::stop_vss_worker(vss, &zpr_addr).await;
+        result
     }
 
-    /// [Self::disconnect], for a caller that may already hold the self-renewal
-    /// lock. The actor record is removed under `node_commit_lock` (#63
-    /// review): a node's reauthorization of its own actor holds that lock from
-    /// its session check to its write, so a removal landing in between would
-    /// be undone by that write, reviving the disconnected node. The rest of the
-    /// teardown runs without the lock. `node_commit_lock_held` is true only on
-    /// the reauthorize path's post-persist denylist re-check, which runs under
-    /// the lock already (tokio's mutex is not re-entrant).
-    async fn disconnect_impl(
+    /// Stop a disconnected node's VSS worker, if it had one. Call with no
+    /// [TopoOps] held.
+    pub async fn stop_vss_worker(vss: Option<VssHandle>, zpr_addr: &IpAddr) {
+        if let Some(vss_hndl) = vss {
+            if let Err(e) = vss_hndl.stop().await {
+                error!(target: CC, "failed to stop VSS worker for disconnected node at addr {zpr_addr}: {e}");
+            }
+        }
+    }
+
+    /// The local teardown of [Self::disconnect], under the caller's topology guard
+    /// (for a caller that already holds one, such as the policy pass). Returns the
+    /// node's VSS worker handle, which the caller stops with [Self::stop_vss_worker]
+    /// after releasing the guard, and the teardown result.
+    pub async fn disconnect_locked(
         &self,
-        asm: Arc<Assembly>,
+        ops: &TopoOps<'_>,
+        asm: &Arc<Assembly>,
         zpr_addr: IpAddr,
         reason: vsapi::DisconnectReason,
-        node_commit_lock_held: bool,
+    ) -> (Option<VssHandle>, Result<(), ServiceError>) {
+        let mut vss = None;
+        let result = self
+            .teardown_actor(ops, asm, zpr_addr, reason, &mut vss)
+            .await;
+        (vss, result)
+    }
+
+    /// Body of [Self::disconnect_locked]; sets `vss` to the node's VSS worker handle.
+    async fn teardown_actor(
+        &self,
+        ops: &TopoOps<'_>,
+        asm: &Arc<Assembly>,
+        zpr_addr: IpAddr,
+        reason: vsapi::DisconnectReason,
+        vss: &mut Option<VssHandle>,
     ) -> Result<(), ServiceError> {
         info!(target: CC, "disconnect actor at {} for reason {:?}", zpr_addr, reason);
-        let removal_guard = if node_commit_lock_held {
-            None
-        } else {
-            Some(asm.policy_mgr.node_commit_lock.lock().await)
-        };
+        // The actor record is removed under the node commit lock too (#63
+        // review): a node's reauthorization of its own actor holds it from its
+        // session check to its write, so a removal landing in between would be
+        // undone by that write. Taken inside the caller's topology guard -- lock
+        // order: topology lock, then node commit lock -- and never by a path
+        // that already holds the node commit lock (`reauthorize` disconnects
+        // only after releasing it).
+        let removal_guard = asm.policy_mgr.node_commit_lock.lock().await;
 
         let maybe_actor = asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await?;
         if maybe_actor.is_none() {
@@ -2442,12 +2482,9 @@ impl ConnectionControl {
 
         if let Some(actor) = maybe_actor {
             if actor.is_node() {
-                asm.topo_mgr.remove_node(&zpr_addr).await;
-                if let Some(vss_hndl) = asm.vss_mgr.get_handle(&zpr_addr) {
-                    if let Err(e) = vss_hndl.stop().await {
-                        error!(target: CC, "failed to stop VSS worker for disconnected node at addr {zpr_addr}: {e}");
-                    }
-                } else {
+                asm.topo_mgr.remove_node(ops, &zpr_addr).await;
+                *vss = asm.vss_mgr.get_handle(&zpr_addr);
+                if vss.is_none() {
                     debug!(target: CC, "no VSS worker found for disconnected node at addr {zpr_addr}");
                 }
                 let connected_adapters = match asm
@@ -2462,7 +2499,7 @@ impl ConnectionControl {
                     }
                 };
                 removed_zpr_addrs.extend(
-                    self.remove_departed_adapters(&asm, &connected_adapters)
+                    self.remove_departed_adapters(asm, &connected_adapters)
                         .await,
                 );
                 asm.actor_mgr.remove_node(&zpr_addr).await?;
@@ -2642,6 +2679,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(crate::db::ActorRepo::new(asm.state_db.clone())),
             None,
+            crate::config::VSConfig::default().get_vs_addr(),
         )
         .await
         .unwrap();
@@ -3729,6 +3767,55 @@ mod tests {
             ["hr".to_string()],
             "exactly the user-vending source names the authority"
         );
+    }
+
+    /// Disconnect removes the node from the router under the topology operation lock
+    /// (TopoOps), so it cannot interleave with a link-state report or policy pass.
+    #[tokio::test]
+    async fn disconnect_waits_for_the_topology_operation_lock() {
+        use crate::test_helpers::make_node_actor_defexp;
+
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = Arc::new(make_cc("test-vs"));
+        let node_addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        asm.topo_mgr.add_node(node_addr).unwrap();
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let held = asm.topo_mgr.ops().await;
+                let dc = tokio::task::spawn_local({
+                    let (asm, cc) = (asm.clone(), cc.clone());
+                    async move {
+                        cc.disconnect(asm, node_addr, vsapi::DisconnectReason::Admin)
+                            .await
+                    }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(!dc.is_finished(), "disconnect must wait for the lock");
+                assert!(
+                    asm.topo_mgr.has_node(&node_addr),
+                    "router untouched while held"
+                );
+                // The whole local teardown is under the guard (round 13, Copilot):
+                // a disconnect that has not started cannot have removed the actor.
+                assert!(
+                    asm.actor_mgr
+                        .get_actor_by_zpr_addr(&node_addr)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "actor untouched while held"
+                );
+                drop(held);
+                dc.await.unwrap().unwrap();
+                assert!(!asm.topo_mgr.has_node(&node_addr));
+            })
+            .await;
     }
 
     /// Disconnect purges recorded trusted-service revisions for the actor AND for every
@@ -7864,6 +7951,7 @@ mod tests {
                 PathBuf::from("."),
                 Arc::new(crate::db::ActorRepo::new(asm_inner.state_db.clone())),
                 None,
+                crate::config::VSConfig::default().get_vs_addr(),
             )
             .await
             .unwrap();
@@ -8906,15 +8994,20 @@ mod tests {
         assert!(has_user_attrs(&stale));
         zode_logout(&asm, &cc, addr, &privkey, cn).await;
 
-        let result = crate::actor_attributes::persist_refreshed_actor(
-            &asm,
-            &stale,
-            asm.policy_mgr.get_current_snapshot().vinst(),
-        )
-        .await;
+        // The stale copy's refresh re-fetched a user attribute it held.
+        let mut refreshed = stale.clone();
+        refreshed
+            .add_attribute(
+                AttributeSource::new("hr")
+                    .builder("user.groups")
+                    .expires_in(Duration::from_secs(600))
+                    .value("engineering"),
+            )
+            .unwrap();
+        let result = crate::actor_attributes::commit_refresh(&asm, &stale, &mut refreshed).await;
         assert!(
-            matches!(result, Err(ServiceError::AttributesIndeterminate(_))),
-            "a stale refresh must be refused, got {result:?}"
+            matches!(result, Ok(false)),
+            "a stale refresh must not commit (the node was re-authorized), got {result:?}"
         );
         let stored = asm
             .actor_mgr
@@ -8934,13 +9027,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        crate::actor_attributes::persist_refreshed_actor(
-            &asm,
-            &current,
-            asm.policy_mgr.get_current_snapshot().vinst(),
-        )
-        .await
-        .expect("a refresh of the current copy persists");
+        let mut refreshed = current.clone();
+        assert!(
+            crate::actor_attributes::commit_refresh(&asm, &current, &mut refreshed)
+                .await
+                .expect("a refresh of the current copy persists"),
+            "the current copy commits"
+        );
     }
 
     /// Review fix (#63 round 5, Codex P1): when the logout's visa sweep
@@ -9379,21 +9472,25 @@ mod tests {
         );
     }
 
-    /// #63 audit: a node's attribute refresh is not written back when the
-    /// node's session changed, or the policy moved, since the refresh began.
+    /// #63 audit, after the merge with #224: a node's attribute refresh
+    /// commits under the topology lock and the node commit lock. A reconnect
+    /// (new session, same identity token) is merged into -- #224's
+    /// `commit_refresh` applies only the changed attributes onto the actor as
+    /// stored -- while a re-authorization (identity token re-minted, so
+    /// `same_actor` fails) commits nothing. A policy install cannot land mid-commit: it publishes under
+    /// both locks.
     #[tokio::test]
-    async fn test_refresh_write_rechecks_session_and_generation() {
+    async fn test_refresh_commit_merges_reconnect_refuses_reauthorization() {
         let cn = "zode-ah.zpr";
-        let (asm, _cc, addr, privkey) = zode_fixture(cn).await;
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
         let copy = asm
             .actor_mgr
             .get_actor_by_zpr_addr(&addr)
             .await
             .unwrap()
             .unwrap();
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
 
-        // Session changed (the node re-authenticated) since the copy was taken.
+        // A reconnect (open) writes a new session since the copy was read.
         let mut stored = copy.clone();
         stored
             .add_attribute(Attribute::builder(key::SESSION).value("a-newer-session"))
@@ -9402,33 +9499,48 @@ mod tests {
             .update_actor(&stored, &Default::default())
             .await
             .unwrap();
-        let result = crate::actor_attributes::persist_refreshed_actor(&asm, &copy, vinst).await;
+        let mut refreshed = copy.clone();
         assert!(
-            matches!(result, Err(ServiceError::AttributesIndeterminate(_))),
-            "got {result:?}"
+            crate::actor_attributes::commit_refresh(&asm, &copy, &mut refreshed)
+                .await
+                .expect("a reconnect is merged into")
         );
+        let session = |a: &Actor| {
+            a.get_attribute(key::SESSION)
+                .and_then(|s| s.get_single_value().ok())
+                .map(|s| s.to_string())
+        };
+        assert_eq!(session(&refreshed).as_deref(), Some("a-newer-session"));
 
-        // Session current again, but the policy moved since the refresh began.
+        // A re-authorization (a device-only renewal re-mints the token).
+        let read_before = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ss = read_before.clone();
+        ss.add_attribute(Attribute::builder(key::SESSION).value(ZODE_SESSION))
+            .unwrap();
         asm.actor_mgr
-            .update_actor(&copy, &Default::default())
+            .update_actor(&ss, &Default::default())
             .await
             .unwrap();
-        let pubkey_der = privkey.public_key_to_der().unwrap();
-        asm.policy_mgr
-            .update_policy_from_container_bytes(make_zode_oidc_policy(cn, &pubkey_der))
-            .await
-            .expect("a new policy installs");
-        let result = crate::actor_attributes::persist_refreshed_actor(&asm, &copy, vinst).await;
+        cc.reauthorize_actor(
+            asm.clone(),
+            addr,
+            vec![make_fresh_ss_blob(&privkey, cn)],
+            &addr,
+            Some(ZODE_SESSION),
+        )
+        .await
+        .expect("a device-only renewal");
+        let mut refreshed = ss.clone();
+        let result = crate::actor_attributes::commit_refresh(&asm, &ss, &mut refreshed).await;
         assert!(
-            matches!(result, Err(ServiceError::AttributesIndeterminate(_))),
-            "got {result:?}"
+            matches!(result, Ok(false)),
+            "a refresh read before a re-authorization must not commit, got {result:?}"
         );
-
-        // Both current: the write goes through.
-        let current = asm.policy_mgr.get_current_snapshot().vinst();
-        crate::actor_attributes::persist_refreshed_actor(&asm, &copy, current)
-            .await
-            .expect("a current refresh persists");
     }
 
     /// #63 review: a fallback logout invalidates the actor's source revisions
@@ -9570,6 +9682,134 @@ mod tests {
         assert!(
             stored.as_ref().is_none_or(|a| !has_user_attrs(a)),
             "no stored actor may hold the failed login's user attributes"
+        );
+    }
+
+    /// A trusted service that, the first time it is queried -- during a
+    /// renewal's attribute fetch, while the renewal holds the node commit lock
+    /// -- denylists `cn` and starts a task that takes the topology lock and
+    /// then waits for the node commit lock, the order a policy install or a
+    /// refresh commit uses. It gives that task time to take the topology lock
+    /// before the renewal continues.
+    struct LockOrderProbeTs {
+        asm: std::sync::Mutex<Option<Arc<Assembly>>>,
+        cn: String,
+        task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::trusted_services::TrustedServiceInterface for LockOrderProbeTs {
+        async fn get_attributes_for_actor(
+            &self,
+            _identities: &[(String, String)],
+        ) -> Result<Vec<Attribute>, ServiceError> {
+            let asm = self.asm.lock().unwrap().take();
+            if let Some(asm) = asm {
+                crate::db::BootstrapDenylist::new(asm.state_db.clone())
+                    .add(&self.cn)
+                    .await
+                    .unwrap();
+                let task = tokio::spawn(async move {
+                    let _topology = asm.topo_mgr.ops().await;
+                    let _commit = asm.policy_mgr.node_commit_lock.lock().await;
+                });
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+                *self.task.lock().unwrap() = Some(task);
+            }
+            Ok(Vec::new())
+        }
+
+        async fn flush(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn current_revision(&self) -> u64 {
+            1
+        }
+
+        fn get_source_id(&self) -> &str {
+            "lock-order-probe"
+        }
+    }
+
+    /// #224 merge: the lock order is topology lock, then node commit lock. A
+    /// renewal holding the node commit lock that must then disconnect (its CN
+    /// was denylisted mid-renewal) releases the commit lock first, so it
+    /// cannot deadlock with a task that holds the topology lock and waits for
+    /// the commit lock. Taking the topology lock under the commit lock (the
+    /// wrong order) deadlocks here, which the timeout turns into a failure.
+    #[tokio::test]
+    async fn test_lock_order_no_deadlock_on_post_persist_disconnect() {
+        let cn = "zode-an.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        let probe = Arc::new(LockOrderProbeTs {
+            asm: std::sync::Mutex::new(Some(asm.clone())),
+            cn: cn.to_string(),
+            task: std::sync::Mutex::new(None),
+        });
+        asm.policy_mgr.add_trusted_service_for_tests(probe.clone());
+
+        let renewal = tokio::time::timeout(
+            Duration::from_secs(5),
+            cc.reauthorize_actor(
+                asm.clone(),
+                addr,
+                vec![make_fresh_ss_blob(&privkey, cn)],
+                &addr,
+                Some(ZODE_SESSION),
+            ),
+        )
+        .await
+        .expect("no deadlock between the topology lock and the node commit lock");
+        assert_auth_rejected(api_err(renewal));
+        let task = probe.task.lock().unwrap().take().expect("the probe ran");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the topology-then-commit task completes")
+            .unwrap();
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .is_none(),
+            "the revoked node was disconnected"
+        );
+    }
+
+    /// #224 merge: a node's refresh commit waits for the node commit lock
+    /// (inside the topology guard), so it cannot land between a self-renewal's
+    /// read and its write.
+    #[tokio::test]
+    async fn test_node_refresh_commit_waits_for_node_commit_lock() {
+        let cn = "zode-ao.zpr";
+        let (asm, _cc, addr, _privkey) = zode_fixture(cn).await;
+        let copy = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        let guard = asm.policy_mgr.node_commit_lock.lock().await;
+        let task = tokio::spawn({
+            let asm = asm.clone();
+            async move {
+                let mut refreshed = copy.clone();
+                crate::actor_attributes::commit_refresh(&asm, &copy, &mut refreshed).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !task.is_finished(),
+            "the refresh commit must wait for the node commit lock"
+        );
+        drop(guard);
+        assert!(
+            task.await
+                .unwrap()
+                .expect("the commit completes once the lock is free")
         );
     }
 

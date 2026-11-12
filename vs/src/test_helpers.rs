@@ -24,7 +24,6 @@ use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, PacketDesc, TcpUdpPep, Vi
 use zpr::write_to::WriteTo;
 
 use crate::assembly::Assembly;
-use crate::assembly::tests::new_assembly_for_tests;
 use crate::error::{ResolverError, ServiceError};
 use crate::policy_mgr::DnsResolver;
 
@@ -627,6 +626,16 @@ pub fn make_peering(node_a: IpAddr, node_b: IpAddr, link_id: &str, attrs: Vec<At
 /// Build the container bytes of a policy whose topology is the given peerings
 /// (an empty slice gives a valid policy with no topology).
 pub fn policy_with_peerings(peerings: &[Peering]) -> Vec<u8> {
+    policy_with_peerings_and_node_cns(peerings, &[])
+}
+
+/// As [policy_with_peerings], plus one node join policy per `(zpr_addr, cn)`, in the shape
+/// the compiler emits for a node: match `device.zpr.adapter.cn eq <cn>` and
+/// `zpr.addr eq <zpr_addr>`, flagged `node`. This is what `Policy::node_cn_for_addr` reads.
+pub fn policy_with_peerings_and_node_cns(
+    peerings: &[Peering],
+    node_cns: &[(IpAddr, &str)],
+) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
     {
         let mut policy = msg.init_root::<capnp_policy::policy::Builder>();
@@ -635,6 +644,24 @@ pub fn policy_with_peerings(peerings: &[Peering]) -> Vec<u8> {
             let mut topo = policy.reborrow().init_topology(peerings.len() as u32);
             for (i, p) in peerings.iter().enumerate() {
                 p.write_to(&mut topo.reborrow().get(i as u32));
+            }
+        }
+        if !node_cns.is_empty() {
+            let mut jps = policy.reborrow().init_join_policies(node_cns.len() as u32);
+            for (i, (addr, cn)) in node_cns.iter().enumerate() {
+                let mut jp = jps.reborrow().get(i as u32);
+                {
+                    let mut matches = jp.reborrow().init_match(2);
+                    let mut cn_cond = matches.reborrow().get(0);
+                    cn_cond.set_key(key::CN);
+                    cn_cond.set_op(capnp_policy::AttrOp::Eq);
+                    cn_cond.init_value(1).set(0, cn);
+                    let mut addr_cond = matches.reborrow().get(1);
+                    addr_cond.set_key(key::ZPR_ADDR);
+                    addr_cond.set_op(capnp_policy::AttrOp::Eq);
+                    addr_cond.init_value(1).set(0, addr.to_string());
+                }
+                jp.init_flags(1).set(0, capnp_policy::JoinFlag::Node);
             }
         }
     }
@@ -674,7 +701,19 @@ pub fn make_container_bytes(maj: u32, min: u32, patch: u32, policy: &[u8]) -> Ve
 /// The default (empty) policy denies everything (NoMatch), so with a route
 /// present the eval still denies — either way the sweep sees a deny.
 pub async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
-    build_sweep_asm_on(new_assembly_for_tests(None).await, with_link).await
+    let (asm, node_a, _db) = build_sweep_asm_with_db(with_link).await;
+    (asm, node_a)
+}
+
+/// As [build_sweep_asm], but also hands back the [crate::db::FakeDb] so a test can
+/// inject state-DB faults.
+pub async fn build_sweep_asm_with_db(
+    with_link: bool,
+) -> (Arc<Assembly>, IpAddr, Arc<crate::db::FakeDb>) {
+    let (asm, event_rx, db) = crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+    std::mem::forget(event_rx);
+    let (asm, node_a) = build_sweep_asm_on(asm, with_link).await;
+    (asm, node_a, db)
 }
 
 /// As [build_sweep_asm], on a caller-built assembly (e.g. one whose fake DB and
@@ -747,12 +786,25 @@ pub async fn create_routed_sweep_visa(asm: &Arc<Assembly>, req: &IpAddr, vinst: 
 
 /// Create the sweep visa (`::4000::a` -> `::4000::b`, TCP 80) held by `req` on
 /// `route`, seeded at `vinst`. Returns its id.
-async fn create_sweep_visa_on_route(
+pub async fn create_sweep_visa_on_route(
     asm: &Arc<Assembly>,
     req: &IpAddr,
     vinst: u64,
     route: &Route,
 ) -> u64 {
+    try_create_sweep_visa_on_route(asm, req, vinst, route)
+        .await
+        .unwrap()
+}
+
+/// As [create_sweep_visa_on_route], but returns the issuance result instead of
+/// unwrapping it.
+pub async fn try_create_sweep_visa_on_route(
+    asm: &Arc<Assembly>,
+    req: &IpAddr,
+    vinst: u64,
+    route: &Route,
+) -> Result<u64, crate::error::ServiceError> {
     let pdesc = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 1234, 80).unwrap();
     let hit = Hit::new_no_signal(0, Direction::Forward);
     let vwmd = asm
@@ -768,9 +820,8 @@ async fn create_sweep_visa_on_route(
             vinst,
             SystemTime::now() + DEFAULT_EXPIRES,
         )
-        .await
-        .unwrap();
-    vwmd.visa.issuer_id
+        .await?;
+    Ok(vwmd.visa.issuer_id)
 }
 
 // ---- attribute-change sweep ----

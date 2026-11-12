@@ -18,7 +18,6 @@ use libeval::policy::Policy;
 use tracing::{debug, warn};
 
 use crate::assembly::Assembly;
-use crate::connection_control::{ATTR_KEY_VS_IDENT, CommitRecheck, recheck_before_commit};
 use crate::error::ServiceError;
 use crate::logging::targets::VREQ;
 use crate::trusted_services::{
@@ -82,14 +81,23 @@ pub(crate) async fn refresh_and_persist_actor(
     asm: &Assembly,
     actor: &mut Actor,
 ) -> Result<bool, ServiceError> {
-    let psnap = asm.policy_mgr.get_current_snapshot();
-    let policy = psnap.policy_arc();
+    let policy = asm.policy_mgr.get_current();
+    // The actor as read, before the refresh: its trusted services are queried outside
+    // the topology lock, so the commit below applies only what the refresh changed.
+    let read_before = actor.clone();
     let outcome =
         refresh_expired_attributes(&asm.ts_mgr, &policy.lookup_identity_keys(), actor).await;
     if outcome.changed {
-        // The attributes moved, so the services they grant may have too.
-        restamp_services(&policy, actor);
-        persist_refreshed_actor(asm, actor, psnap.vinst()).await?;
+        // The attributes moved, so the services they grant may have too: the commit
+        // recomputes them under the policy current then.
+        if !commit_refresh(asm, &read_before, actor).await? {
+            // The actor left while the refresh was in flight: nothing to write back,
+            // and no revision to record against a departed actor.
+            return Err(ServiceError::Internal(format!(
+                "actor {:?} left during attribute refresh",
+                actor.get_zpr_addr()
+            )));
+        }
     }
 
     // No ZPR address means refresh_expired_attributes did nothing at all (an actor
@@ -110,62 +118,90 @@ pub(crate) async fn refresh_and_persist_actor(
     Ok(outcome.changed)
 }
 
-/// Write back an actor whose attributes were just refreshed.
+/// Write a refreshed actor back under the topology operation lock
+/// ([crate::topology_mgr::TopoOps]): re-read the actor as stored now and apply to it
+/// only the attributes the refresh changed (`refreshed` against `read_before`), so a
+/// session, substrate claim or anything else written meanwhile -- by a reconnect, say
+/// -- is not rolled back to the copy the refresh started from. The services the
+/// merged actor provides are then recomputed under the policy current at commit
+/// (stable while the guard is held), not carried over from the policy the refresh
+/// started under. `actor` (`refreshed`) becomes the merged result.
 ///
-/// A node's own actor can be re-authorized (a Zode login or logout through
-/// `reauthorize`, or a re-authentication) while a refresh holds a copy loaded
-/// earlier; writing that copy back would undo the re-authorization -- e.g.
-/// restore the `user.*` attributes a logout removed (#63 review). So for a node
-/// the write takes the self-renewal lock (`PolicyMgr::node_commit_lock`,
-/// held by those paths from load to persist) and is refused when the stored
-/// actor's VS identity token (`zpr.vs.bootstrap.ident`, re-minted by every
-/// reauthorize and authenticate) differs from the copy's, or when the shared
-/// commit-time recheck (`connection_control::recheck_before_commit`, #63
-/// review audit) finds the node's session changed or the policy generation
-/// moved since `prepared_vinst`, the generation the services were restamped
-/// under. The refusal is `AttributesIndeterminate`, which callers treat as a
-/// denial; the next request reloads the actor.
+/// Returns false, writing nothing, if no actor is stored at the address any more or
+/// a different one is (the address was recycled while the refresh was in flight: its
+/// attributes were queried with the old actor's identities). A reconnect of the same
+/// actor (same identity, CN and role; a new session) is merged into.
 ///
-/// ponytail: nodes only, one global lock; adapters are not renewed by
-/// themselves, so their refresh race with reauthorize is unchanged.
-pub(crate) async fn persist_refreshed_actor(
+/// For a node, the commit also takes the node commit lock
+/// (`PolicyMgr::node_commit_lock`, inside the topology guard -- lock order:
+/// topology lock, then node commit lock), which a node's `reauthorize` of its
+/// own actor holds from its read through its write (#63 review). Without it a
+/// refresh could read the pre-login actor, a login commit, and the refresh then
+/// write its merge over the login. A node re-authorized since `read_before` was
+/// read (a login, logout or renewal) fails [same_actor] -- its identity values
+/// begin with the re-minted VS identity token -- so nothing is written, and a
+/// refreshed `user.*` attribute of a pre-logout copy is never put back.
+pub(crate) async fn commit_refresh(
     asm: &Assembly,
-    actor: &Actor,
-    prepared_vinst: u64,
-) -> Result<(), ServiceError> {
-    let _guard = if actor.is_node() {
+    read_before: &Actor,
+    refreshed: &mut Actor,
+) -> Result<bool, ServiceError> {
+    let Some(zpr_addr) = refreshed.get_zpr_addr().copied() else {
+        return Ok(false);
+    };
+    let ops = asm.topo_mgr.ops().await;
+    let node_commit = if read_before.is_node() {
         Some(asm.policy_mgr.node_commit_lock.lock().await)
     } else {
         None
     };
-    if let (true, Some(addr)) = (actor.is_node(), actor.get_zpr_addr()) {
-        let ident_of = |a: &Actor| {
-            a.get_attribute(ATTR_KEY_VS_IDENT)
-                .and_then(|i| i.get_single_value().ok())
-                .map(|s| s.to_string())
-        };
-        let stored = asm.actor_mgr.get_actor_by_zpr_addr(addr).await?;
-        if stored.as_ref().map(ident_of) != Some(ident_of(actor)) {
-            warn!(target: VREQ, "refresh of node {addr} discarded: it was re-authorized since the copy was loaded");
-            return Err(ServiceError::AttributesIndeterminate(format!(
-                "node {addr} was re-authorized during an attribute refresh"
-            )));
-        }
-        let copy_session = actor
-            .get_attribute(key::SESSION)
-            .and_then(|s| s.get_single_value().ok());
-        let recheck =
-            recheck_before_commit(asm, addr, copy_session.as_deref(), Some(prepared_vinst)).await;
-        if !matches!(recheck, Ok(CommitRecheck::Current)) {
-            warn!(target: VREQ, "refresh of node {addr} discarded: its session changed or the policy moved since the copy was refreshed");
-            return Err(ServiceError::AttributesIndeterminate(format!(
-                "node {addr} changed during an attribute refresh"
-            )));
+    let Some(mut stored) = asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await? else {
+        return Ok(false);
+    };
+    if !same_actor(read_before, &stored) {
+        debug!(target: VREQ, "not committing attribute refresh for {zpr_addr}: the address now holds a different actor");
+        return Ok(false);
+    }
+    apply_changed_attributes(read_before, refreshed, &mut stored)?;
+    restamp_services(&asm.policy_mgr.get_current(), &mut stored);
+    asm.actor_mgr
+        .update_actor(&stored, &asm.policy_service_names())
+        .await?;
+    drop(node_commit);
+    drop(ops);
+    *refreshed = stored;
+    Ok(true)
+}
+
+/// Whether `a` and `b` are the same actor: same identity values, CN and role. A
+/// reconnect keeps all three; an address recycled to another actor does not.
+fn same_actor(a: &Actor, b: &Actor) -> bool {
+    a.get_identity() == b.get_identity() && a.get_cn() == b.get_cn() && a.is_node() == b.is_node()
+}
+
+/// Apply to `target` every attribute that differs between `before` and `after`:
+/// changed or added ones are set, removed ones are removed. Attributes the two agree
+/// on are left as `target` has them.
+fn apply_changed_attributes(
+    before: &Actor,
+    after: &Actor,
+    target: &mut Actor,
+) -> Result<(), libeval::actor::AttributeError> {
+    let keys: HashSet<String> = before
+        .attrs_iter()
+        .chain(after.attrs_iter())
+        .map(|a| a.get_key().to_string())
+        .collect();
+    for k in keys {
+        match (before.get_attribute(&k), after.get_attribute(&k)) {
+            (b, a) if b == a => {}
+            (_, Some(a)) => target.add_attribute(a.clone())?,
+            (_, None) => {
+                target.remove_attribute(&k);
+            }
         }
     }
-    asm.actor_mgr
-        .update_actor(actor, &asm.policy_service_names())
-        .await
+    Ok(())
 }
 
 /// Recompute the services the actor provides ([key::SERVICES]) from its current
@@ -1218,6 +1254,189 @@ mod tests {
                  hash-order-dependent promotion, zipline#26 Codex P1)"
             );
         }
+    }
+}
+
+/// Commit of a refresh against concurrent actor writes (round 15).
+#[cfg(test)]
+mod refresh_commit {
+    use super::*;
+    use crate::test_helpers::{
+        TS_KEY, build_sweep_asm, register_ts, seed_source_attr, stored_attr,
+    };
+
+    const ACTOR: &str = "fd5a:5052:4000::a";
+
+    /// Round 15 (Copilot): the refresh queries trusted services outside the topology
+    /// lock with an actor read before them. Its commit applies only the attributes the
+    /// refresh changed onto the actor as stored now, so a session a reconnect
+    /// persisted meanwhile survives, and the refreshed attribute still lands.
+    #[tokio::test]
+    async fn test_refresh_commit_keeps_a_newer_session() {
+        let (asm, _node) = build_sweep_asm(false).await;
+        register_ts(&asm, &[(TS_KEY, "engineering")]);
+        seed_source_attr(&asm, ACTOR, TS_KEY, "sales").await;
+        let addr: IpAddr = ACTOR.parse().unwrap();
+        let mut read_before = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A reconnect persists a new session while the refresh is in flight.
+        let mut reconnected = read_before.clone();
+        reconnected
+            .add_attribute(Attribute::builder(key::SESSION).value("99-new"))
+            .unwrap();
+        asm.actor_mgr
+            .update_actor(&reconnected, &asm.policy_service_names())
+            .await
+            .unwrap();
+
+        assert!(
+            refresh_and_persist_actor(&asm, &mut read_before)
+                .await
+                .unwrap()
+        );
+
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.get_attribute(key::SESSION).unwrap().get_value(),
+            ["99-new".to_string()],
+            "the newer session must survive the refresh commit"
+        );
+        assert_eq!(
+            stored_attr(&asm, ACTOR, TS_KEY).await,
+            Some("engineering".to_string())
+        );
+    }
+
+    /// Round 16 (Codex P1): if the address was recycled to a different actor while
+    /// the refresh was in flight, the commit applies nothing to the newcomer: the
+    /// attributes were queried with the old actor's identities.
+    #[tokio::test]
+    async fn test_refresh_commit_skips_a_recycled_address() {
+        let (asm, _node) = build_sweep_asm(false).await;
+        let addr: IpAddr = ACTOR.parse().unwrap();
+        let read_before = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut refreshed = read_before.clone();
+        refreshed
+            .add_attribute(Attribute::builder(TS_KEY).value("engineering"))
+            .unwrap();
+        // The old actor left and a different one now holds the address.
+        let newcomer = crate::test_helpers::make_adapter_actor_defexp(ACTOR, "someone-else");
+        asm.actor_mgr
+            .update_actor(&newcomer, &asm.policy_service_names())
+            .await
+            .unwrap();
+
+        assert!(
+            !commit_refresh(&asm, &read_before, &mut refreshed)
+                .await
+                .unwrap()
+        );
+        assert_eq!(stored_attr(&asm, ACTOR, TS_KEY).await, None);
+    }
+
+    /// Round 16 (Codex P1): services are recomputed at commit under the current
+    /// policy, not carried from the policy the refresh started under. Here the
+    /// refresh computed "web" under a policy that hosts it on `device.tags:server`;
+    /// a newer policy that hosts it elsewhere landed before the commit.
+    #[tokio::test]
+    async fn test_refresh_commit_restamps_services_under_the_current_policy() {
+        use crate::test_helpers::make_attr_hosted_service_policy;
+        use zpr::policy_types::PFlags;
+        let (asm, _node) = build_sweep_asm(false).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_attr_hosted_service_policy(
+                "web",
+                80,
+                "device.tags",
+                "server",
+                PFlags::default(),
+            ))
+            .await
+            .unwrap();
+        let addr: IpAddr = ACTOR.parse().unwrap();
+        let read_before = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut refreshed = read_before.clone();
+        refreshed
+            .add_attribute(Attribute::builder("device.tags").value("server"))
+            .unwrap();
+        restamp_services(&asm.policy_mgr.get_current(), &mut refreshed);
+        assert!(
+            refreshed.provides("web"),
+            "precondition: granted under the old policy"
+        );
+
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_attr_hosted_service_policy(
+                "web",
+                80,
+                "device.tags",
+                "other",
+                PFlags::default(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            commit_refresh(&asm, &read_before, &mut refreshed)
+                .await
+                .unwrap()
+        );
+
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored.provides("web"),
+            "the current policy does not grant it"
+        );
+    }
+
+    /// A refresh never writes back an actor that left while it was in flight.
+    #[tokio::test]
+    async fn test_refresh_commit_does_not_resurrect_a_departed_actor() {
+        let (asm, _node) = build_sweep_asm(false).await;
+        register_ts(&asm, &[(TS_KEY, "engineering")]);
+        seed_source_attr(&asm, ACTOR, TS_KEY, "sales").await;
+        let addr: IpAddr = ACTOR.parse().unwrap();
+        let mut read_before = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await.unwrap();
+
+        let _ = refresh_and_persist_actor(&asm, &mut read_before).await;
+
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
 

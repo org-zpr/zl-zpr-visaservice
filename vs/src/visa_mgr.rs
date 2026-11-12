@@ -1,7 +1,8 @@
 //! Manage the creating, storage and retrieval of visas for the visa service.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tracing::{debug, error, warn};
 
@@ -21,7 +22,7 @@ use crate::visareq_worker::{VisaDecision, request_visa_wait_response};
 
 use libeval::eval_result::{Direction, Hit};
 use libeval::policy::Policy;
-use libeval::route::{NodeId, Route};
+use libeval::route::{LinkId, NodeId, Route};
 use zpr::vsapi_types::vsapi_ip_number as ip_proto;
 use zpr::vsapi_types::{
     CommFlag, DockPep, DockPepType, EndpointT, FwdPep, FwdPepStyle, IcmpPep, KeySet, PacketDesc,
@@ -36,6 +37,10 @@ pub struct VisaMgr {
     /// Serializes the check-then-create in [VisaMgr::vsapi_bootstrap_visa_for_future_peer].
     /// Behind an `Arc` so every clone of the manager shares the one lock.
     bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Visas whose revocation write failed, at commit ([VisaMgr::revoke_if_route_down])
+    /// or when a link went down (`revoke_visas_over_link`). They are never handed out,
+    /// and their revocation is retried on every [VisaMgr::get_pending_visas_for_node].
+    quarantine: Arc<Mutex<HashSet<u64>>>,
 }
 
 pub struct VisaWithMetadata {
@@ -142,6 +147,7 @@ impl VisaMgr {
         VisaMgr {
             repo: db,
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quarantine: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -517,18 +523,93 @@ impl VisaMgr {
         expiration_time: SystemTime,
     ) -> Result<VisaWithMetadata, ServiceError> {
         let path = path_for_flow(asm, &pdesc.five_tuple.source_addr, route).await?;
-        self.create_visa_with_path(
+        let vwmd = self
+            .create_visa_with_path(
+                asm,
+                requesting_node,
+                pdesc,
+                hit,
+                path,
+                source_zpl,
+                policy_version,
+                vinst,
+                expiration_time,
+            )
+            .await?;
+
+        // The path was derived from the live router after the route was chosen, so it
+        // must also still end where the destination is docked now.
+        let egress = match &vwmd.metadata.path {
+            Some(_) => {
+                crate::visa_policy::docking_node_for_addr(asm, &pdesc.five_tuple.dest_addr).await
+            }
+            None => None,
+        };
+        self.revoke_if_route_down(
             asm,
-            requesting_node,
-            pdesc,
-            hit,
-            path,
-            source_zpl,
-            policy_version,
-            vinst,
-            expiration_time,
+            vwmd.visa.issuer_id,
+            &route.links,
+            vwmd.metadata.path.as_deref(),
+            egress,
         )
-        .await
+        .await?;
+        Ok(vwmd)
+    }
+
+    /// Commit-time check for a just-stored visa (zl-zipline#224). A link on its route
+    /// may have gone down, or its id moved to another edge, after the route was chosen
+    /// and before the visa was stored; `path` is the visa's recorded node path, against
+    /// which each route link's endpoints are checked, and `egress` the destination's
+    /// docking node, at which that path must end;
+    /// the link-down revocation pass lists the visas stored when it ran, so it can miss
+    /// this one. Called once the visa is committed: if the link went down before this
+    /// check, the check catches it; if it goes down after, the pass finds the visa.
+    ///
+    /// A stale visa is marked `PendingRevoke` and an error is returned either way, so
+    /// `create_visa` never hands it out. If the revocation write fails, the visa is also
+    /// quarantined -- never handed out by [VisaMgr::get_pending_visas_for_node], which
+    /// also retries the revocation -- and an error is returned so `create_visa` does not
+    /// return it either. This works whether a route link went down or was removed.
+    pub(crate) async fn revoke_if_route_down(
+        &self,
+        asm: &Assembly,
+        visa_id: u64,
+        links: &[LinkId],
+        path: Option<&[IpAddr]>,
+        egress: Option<IpAddr>,
+    ) -> Result<(), ServiceError> {
+        // With a recorded path, it must end at the destination's docking node
+        // (`egress`, looked up afresh): the path itself was derived from the mutable
+        // router after the route was chosen, so a link id moved in between would
+        // otherwise validate against a path to the wrong node.
+        let ends_ok = match (path, egress) {
+            (Some(p), Some(e)) => p.last() == Some(&e),
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if ends_ok && asm.topo_mgr.route_still_valid(links, path) {
+            // The route looks valid now, but a link may have gone down and come back
+            // up since the visa was stored: its revocation pass then revoked the visa
+            // already, and link recovery must not make it issuable again.
+            if !self.repo.is_issuable(visa_id) {
+                return Err(ServiceError::Internal(format!(
+                    "visa {visa_id}: revoked while it was issued"
+                )));
+            }
+            return Ok(());
+        }
+        warn!(target: VISA, "visa {visa_id}: a link on its route went down while it was issued; revoking it");
+        if let Err(e) = self.mark_visa_revoked(visa_id).await {
+            self.quarantine(visa_id);
+            return Err(ServiceError::Internal(format!(
+                "visa {visa_id}: its route went down while it was issued and revoking it failed: {e}"
+            )));
+        }
+        // Revoked, but never hand it out: the requester would otherwise get an Allow
+        // and a visa on a route that is already down.
+        Err(ServiceError::Internal(format!(
+            "visa {visa_id}: its route went down while it was issued; revoked"
+        )))
     }
 
     /// As [VisaMgr::create_visa], but with the node path supplied rather than derived from
@@ -644,14 +725,59 @@ impl VisaMgr {
         Ok(VisaWithMetadata::new(visa, metadata))
     }
 
+    /// Visas waiting to be installed on `node_addr`. Quarantined visas (see
+    /// [VisaMgr::revoke_if_route_down]) are never returned; this call also retries
+    /// their revocation, so housekeeping drives the retry.
     pub async fn get_pending_visas_for_node(
         &self,
         node_addr: &IpAddr,
     ) -> Result<Vec<Visa>, ServiceError> {
+        self.retry_quarantined_revocations().await;
+        let quarantined = self.quarantine.lock().unwrap().clone();
         let visas = self
             .repo
-            .get_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)?;
+            .get_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)?
+            .into_iter()
+            .filter(|v| !quarantined.contains(&v.issuer_id))
+            .collect();
         Ok(visas)
+    }
+
+    /// Whether `visa_id` may still be granted to `node_addr`: staged there as
+    /// `PendingInstall` or `Installed`, and not quarantined. For visas prepared before
+    /// a caller took the topology lock (`register_vss`): one revoked, acknowledged or
+    /// quarantined meanwhile must not be granted again.
+    pub fn still_grantable(&self, visa_id: u64, node_addr: &IpAddr) -> bool {
+        let staged = matches!(
+            self.repo.get_node_visa_state(visa_id, node_addr),
+            Some(db::NodeVisaState::PendingInstall | db::NodeVisaState::Installed)
+        );
+        staged && !self.quarantine.lock().unwrap().contains(&visa_id)
+    }
+
+    /// Quarantine a visa whose revocation write failed: it is never handed out by
+    /// [VisaMgr::get_pending_visas_for_node], which also retries the revocation until
+    /// it succeeds. Covers visas installed or pending on any route, whatever later
+    /// happens to the link that made them stale.
+    pub(crate) fn quarantine(&self, visa_id: u64) {
+        self.quarantine.lock().unwrap().insert(visa_id);
+    }
+
+    /// Try again to revoke every quarantined visa; drop each one whose revocation
+    /// now succeeds (or that no longer exists).
+    async fn retry_quarantined_revocations(&self) {
+        let ids: Vec<u64> = self.quarantine.lock().unwrap().iter().copied().collect();
+        for visa_id in ids {
+            match self.mark_visa_revoked(visa_id).await {
+                Ok(_) => {
+                    self.quarantine.lock().unwrap().remove(&visa_id);
+                    info!(target: VISA, "visa {visa_id}: quarantined stale visa revoked on retry");
+                }
+                Err(e) => {
+                    warn!(target: VISA, "visa {visa_id}: quarantined stale visa still not revoked: {e}")
+                }
+            }
+        }
     }
 
     pub async fn get_pending_visa_ids_for_node(

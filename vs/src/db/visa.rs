@@ -470,7 +470,9 @@ impl VisaRepo {
     /// No-ops (`Ok(false)`) when the visa is absent/expired or `vinst` is not
     /// newer than `checked_vinst`. Otherwise marks every node `PendingRevoke`,
     /// stamping `revoke_vinst = vinst` only where it exceeds the existing stamp
-    /// (a revoke decision overwrites `PendingInstall`/`Installed` freely). One
+    /// (a revoke decision overwrites `PendingInstall`/`Installed` freely). A node
+    /// already revoked unconditionally (`PendingRevoke`, no stamp) stays unstamped,
+    /// so a later allow cannot cancel it. One
     /// rewrite. `checked_vinst` is not bumped (only allow bumps it).
     pub async fn record_deny_verdict(&self, visa_id: u64, vinst: u64) -> Result<bool, StoreError> {
         // INVARIANT A: backing held for the whole write.
@@ -490,6 +492,12 @@ impl VisaRepo {
             let ttl = remaining_secs(entry.deadline);
             let mut new_states = entry.node_states.clone();
             for ns in new_states.values_mut() {
+                // Already revoked unconditionally (PendingRevoke with no stamp, see
+                // mark_visa_revoked): keep it unstamped, so no later allow can
+                // cancel it.
+                if ns.state == NodeVisaState::PendingRevoke && ns.revoke_vinst.is_none() {
+                    continue;
+                }
                 ns.state = NodeVisaState::PendingRevoke;
                 if ns.revoke_vinst.is_none_or(|rv| vinst > rv) {
                     ns.revoke_vinst = Some(vinst); // still revoked!
@@ -512,10 +520,11 @@ impl VisaRepo {
     }
 
     /// Mark every node of a live visa `PendingRevoke`, unconditionally (no vinst
-    /// gate, no `checked_vinst` bump). For actor/node departure: the visa is
-    /// invalid regardless of policy, so leave each node's `revoke_vinst`
-    /// untouched -- a fresh revoke keeps `None`, which `record_allow_verdict`'s
-    /// `rv < vinst` test can never cancel, so a later allow cannot resurrect it.
+    /// gate, no `checked_vinst` bump). For actor/node departure, a link going down
+    /// or an attribute change: the visa is invalid regardless of policy, so clear each
+    /// node's `revoke_vinst` to `None`, which `record_allow_verdict`'s `rv < vinst`
+    /// test can never cancel -- a later allow cannot resurrect it, even when an
+    /// earlier policy deny had stamped it.
     /// No-ops (`Ok(false)`) when the visa is absent/expired.
     pub async fn mark_visa_revoked(&self, visa_id: u64) -> Result<bool, StoreError> {
         // INVARIANT A: backing held for the whole write.
@@ -529,7 +538,8 @@ impl VisaRepo {
             let ttl = remaining_secs(entry.deadline);
             let mut new_states = entry.node_states.clone();
             for ns in new_states.values_mut() {
-                ns.state = NodeVisaState::PendingRevoke; // revoke_vinst left as-is
+                ns.state = NodeVisaState::PendingRevoke;
+                ns.revoke_vinst = None; // not cancellable by a later allow
             }
             let record = build_record(&entry.visa, &entry.metadata, &new_states)?;
             (serde_json::to_string(&record)?, ttl, new_states)
@@ -640,6 +650,20 @@ impl VisaRepo {
         unindex_node(&mut store, &node_addr, visa_id);
         debug!(target: DB, "removed pending-revoke node={node_addr} from visa={visa_id}");
         Ok(true)
+    }
+
+    /// Whether a visa can still be handed out: it is live and no node holds it as
+    /// `PendingRevoke`. A revocation (by policy, departure or a link going down) marks
+    /// its nodes `PendingRevoke`, and an acknowledged one removes them, so a revoked
+    /// visa never reads as issuable again.
+    pub fn is_issuable(&self, visa_id: u64) -> bool {
+        let store = self.inner.store.read().unwrap();
+        live_entry(&store, visa_id).is_some_and(|e| {
+            !e.node_states.is_empty()
+                && e.node_states
+                    .values()
+                    .all(|ns| ns.state != NodeVisaState::PendingRevoke)
+        })
     }
 
     /// Whether a given live visa still references any node.
@@ -2190,8 +2214,8 @@ mod test {
         );
     }
 
-    /// `mark_visa_revoked` flips every node PendingRevoke (leaving revoke_vinst
-    /// untouched), keeps Redis and memory in agreement, and no-ops on a missing
+    /// `mark_visa_revoked` flips every node PendingRevoke (with no revoke_vinst
+    /// stamp), keeps Redis and memory in agreement, and no-ops on a missing
     /// id.
     #[tokio::test]
     async fn test_mark_visa_revoked_write_through() {
@@ -2218,5 +2242,60 @@ mod test {
 
         // Missing id is a no-op.
         assert!(!repo.mark_visa_revoked(999).await.unwrap());
+    }
+
+    /// An unconditional revocation (link down, departure) is not cancelled by a later
+    /// allow verdict, even on a visa an earlier policy deny had stamped (round 13,
+    /// Copilot): `mark_visa_revoked` clears the stamp, so `record_allow_verdict`'s
+    /// `rv < vinst` test can never match.
+    #[tokio::test]
+    async fn test_mark_visa_revoked_is_not_cancelled_by_a_later_allow() {
+        let db = Arc::new(FakeDb::new());
+        let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
+        let req: IpAddr = "fd5a:5052::f0".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::f1".parse().unwrap();
+        let c: IpAddr = "fd5a:5052::f2".parse().unwrap();
+        store_three_node(&repo, 810, req, b, c, 5).await;
+
+        assert!(repo.record_deny_verdict(810, 6).await.unwrap());
+        assert!(repo.mark_visa_revoked(810).await.unwrap());
+        assert!(repo.record_allow_verdict(810, 7).await.unwrap());
+        {
+            let store = repo.inner.store.read().unwrap();
+            let e = store.visas.get(&810).unwrap();
+            for n in [req, b, c] {
+                let ns = e.node_states.get(&n).unwrap();
+                assert_eq!(ns.state, NodeVisaState::PendingRevoke);
+                assert_eq!(ns.revoke_vinst, None);
+            }
+        }
+        assert_memory_matches_redis(&repo, &db, 810).await;
+    }
+
+    /// Round 14 (Copilot): an unconditional revocation also survives a policy deny
+    /// followed by an allow. The deny must not stamp a `revoke_vinst` onto it, or the
+    /// newer allow could cancel it.
+    #[tokio::test]
+    async fn test_unconditional_revocation_survives_deny_then_allow() {
+        let db = Arc::new(FakeDb::new());
+        let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
+        let req: IpAddr = "fd5a:5052::f0".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::f1".parse().unwrap();
+        let c: IpAddr = "fd5a:5052::f2".parse().unwrap();
+        store_three_node(&repo, 820, req, b, c, 5).await;
+
+        assert!(repo.mark_visa_revoked(820).await.unwrap());
+        assert!(repo.record_deny_verdict(820, 6).await.unwrap());
+        assert!(repo.record_allow_verdict(820, 7).await.unwrap());
+        {
+            let store = repo.inner.store.read().unwrap();
+            let e = store.visas.get(&820).unwrap();
+            for n in [req, b, c] {
+                let ns = e.node_states.get(&n).unwrap();
+                assert_eq!(ns.state, NodeVisaState::PendingRevoke);
+                assert_eq!(ns.revoke_vinst, None);
+            }
+        }
+        assert_memory_matches_redis(&repo, &db, 820).await;
     }
 }
