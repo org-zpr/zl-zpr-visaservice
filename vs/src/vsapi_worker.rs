@@ -1934,6 +1934,13 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             write_error(&mut err_builder, code, msg);
         }
 
+        // Topology operation lock (see TopoOps), taken before this call's first await
+        // and held through the last revocation. Taking it first keeps reports a node
+        // pipelines on one handle in the order they arrived: the lock is FIFO and the
+        // RPC system starts handlers in arrival order, so a later snapshot can never
+        // apply before an earlier one. Under it, the liveness check, validation and
+        // application cannot interleave with a disconnect, reconnect or policy pass.
+        let ops = self.asm.topo_mgr.ops().await;
         if !self.node_is_live().await {
             warn!(target: API, "report_link_states from disconnected node {:?}: refused", self.node.get_cn());
             refuse(
@@ -1998,21 +2005,6 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         // holds), and evaluates every CN against it. `get_current_snapshot` is a
         // lock-free load, so there is no lock-order concern.
         let current_policy = || self.asm.policy_mgr.get_current_snapshot();
-        // Topology operation lock (see TopoOps): held from the liveness re-check through
-        // the last revocation, so a disconnect, reconnect or policy revalidation cannot
-        // interleave between deciding which links went down and revoking their visas.
-        let ops = self.asm.topo_mgr.ops().await;
-        // The session may have ended while this report was validated. Re-check it right
-        // before applying; record_link_states additionally drops a report for a node
-        // that has left the router.
-        if !self.node_is_live().await {
-            refuse(
-                &mut results,
-                vsapi::ErrorCode::AuthRequired,
-                "node is no longer connected; re-authenticate",
-            );
-            return Ok(());
-        }
         let went_down = self.asm.topo_mgr.record_link_states(
             &ops,
             &reporter,
@@ -3607,7 +3599,7 @@ mod tests {
         use crate::db::PolicyRepo;
         use crate::policy_mgr::PolicyMgr;
         use crate::test_helpers::{
-            FakeResolver, make_node_actor_defexp, make_peering, policy_with_peerings,
+            FakeResolver, make_node_actor_defexp, make_peering, policy_with_peerings_and_node_cns,
         };
         use crate::trusted_services::TrustedServicesMgr;
         use libeval::route::LinkId;
@@ -3624,17 +3616,31 @@ mod tests {
         /// Policy declares A-B and A-C (C never connects). A and B are connected nodes
         /// with their A-B link in the router. Returns node A's capnp handle.
         async fn build() -> (Arc<Assembly>, vsapi::v_s_handle::Client) {
+            build_with_cns(false).await
+        }
+
+        /// As [build]; with `cns`, the policy also maps A and B to the CNs
+        /// "node-a" and "node-b", so reports naming them resolve.
+        async fn build_with_cns(cns: bool) -> (Arc<Assembly>, vsapi::v_s_handle::Client) {
             let (a, b, c): (IpAddr, IpAddr, IpAddr) = (
                 NODE_A.parse().unwrap(),
                 NODE_B.parse().unwrap(),
                 NODE_C.parse().unwrap(),
             );
+            let node_cns: &[(IpAddr, &str)] = if cns {
+                &[(a, "node-a"), (b, "node-b")]
+            } else {
+                &[]
+            };
             let mut asm = new_assembly_for_tests(None).await;
             asm.policy_mgr = PolicyMgr::new_with_initial_policy(
-                policy_with_peerings(&[
-                    make_peering(a, b, "link-ab", vec![]),
-                    make_peering(a, c, "link-ac", vec![]),
-                ]),
+                policy_with_peerings_and_node_cns(
+                    &[
+                        make_peering(a, b, "link-ab", vec![]),
+                        make_peering(a, c, "link-ac", vec![]),
+                    ],
+                    node_cns,
+                ),
                 PolicyRepo::new(asm.state_db.clone()),
                 Arc::new(FakeResolver::ip_only()),
                 Arc::new(TrustedServicesMgr::new()),
@@ -3758,6 +3764,48 @@ mod tests {
                     assert!(!open.is_finished(), "open must wait for the lock");
                     drop(held);
                     open.await.unwrap().unwrap();
+                })
+                .await;
+        }
+
+        /// Round 15 (Codex P1): reports pipelined on one handle apply in the order
+        /// they were sent. The handler takes the topology lock before its first await
+        /// (the lock is FIFO), so a later "down" snapshot cannot overtake an earlier
+        /// "up" one and leave the stale "up" applied last.
+        #[tokio::test]
+        async fn pipelined_reports_apply_in_order() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, handle) = build_with_cns(true).await;
+                    let send = |entries: Vec<LinkStateReport>| {
+                        let mut req = handle.report_link_states_request();
+                        {
+                            let mut list = req.get().init_links(entries.len() as u32);
+                            for (i, e) in entries.iter().enumerate() {
+                                e.write_to(&mut list.reborrow().get(i as u32));
+                            }
+                        }
+                        req.send().promise
+                    };
+                    // Down, then up: the up snapshot is the node's latest word.
+                    let held = asm.topo_mgr.ops().await;
+                    let down = send(vec![]);
+                    let up = send(vec![entry("node-b", LinkState::Up)]);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    drop(held);
+                    down.await.unwrap();
+                    up.await.unwrap();
+                    assert!(ab_route_exists(&asm), "the later (up) snapshot wins");
+
+                    // Up, then down: the down snapshot wins.
+                    let held = asm.topo_mgr.ops().await;
+                    let up = send(vec![entry("node-b", LinkState::Up)]);
+                    let down = send(vec![]);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    drop(held);
+                    up.await.unwrap();
+                    down.await.unwrap();
+                    assert!(!ab_route_exists(&asm), "the later (down) snapshot wins");
                 })
                 .await;
         }
