@@ -235,23 +235,26 @@ fn classify_user_namespace_change(
 }
 
 /// The actor a logout persists when its policy re-run failed (#63 review): the
-/// loaded actor with every `user.*` attribute removed, still a node (its role is
-/// fixed at connect), granting only the services a node gets from the claims
-/// that remain. Everything else -- address, session, device authority, VS
-/// identity token -- is unchanged.
+/// loaded actor reduced by the same carry-over rule as a normal logout
+/// ([survives_logout]: only internal-source attributes, nothing in `user.`),
+/// so no trusted-service attribute -- keyed on the dropped subject or not,
+/// inside `user.*` or mapped elsewhere -- survives. Only identity keys whose
+/// attribute survives are kept. The actor stays a node (its role is fixed at
+/// connect) and is granted only the services a node gets from what remains.
+/// Address, session, device authority, CN and VS identity token are internal
+/// and unchanged; trusted-service attributes come back on the next refresh.
 fn logout_without_reauthorization(actor: &Actor, policy: &Policy) -> Actor {
     let mut reduced = Actor::new();
     for attr in actor
         .attrs_iter()
-        .filter(|a| !a.get_key().starts_with("user."))
+        .filter(|a| survives_logout(a) || a.get_key() == key::ROLE)
     {
         let _ = reduced.add_attribute(attr.clone());
     }
-    for identity_key in actor
-        .identity_keys_iter()
-        .filter(|k| !k.starts_with("user."))
-    {
-        let _ = reduced.add_identity_key(usize::MAX, identity_key);
+    for identity_key in actor.identity_keys_iter() {
+        if reduced.get_attribute(identity_key).is_some() {
+            let _ = reduced.add_identity_key(usize::MAX, identity_key);
+        }
     }
     let claims: Vec<Attribute> = reduced
         .attrs_iter()
@@ -8950,6 +8953,51 @@ mod tests {
         assert!(
             !has_user_attrs(&stored),
             "the logout must persist despite the failure"
+        );
+    }
+
+    /// Review fix (#63 round 9, Copilot): the outage fallback carries over
+    /// only internal-source attributes, so a subject-keyed trusted-service
+    /// attribute mapped outside `user.*` does not survive the logout either.
+    #[tokio::test]
+    async fn test_outage_logout_drops_non_user_ts_attributes() {
+        let cn = "zode-ac.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        let mut actor = zode_login(&asm, &cc, addr, &privkey, cn).await;
+        actor
+            .add_attribute(
+                AttributeSource::new("hr")
+                    .builder("device.clearance")
+                    .expires_in(Duration::from_secs(600))
+                    .value("secret"),
+            )
+            .unwrap();
+        asm.actor_mgr
+            .update_actor(&actor, &Default::default())
+            .await
+            .unwrap();
+
+        let current = asm.policy_mgr.get_current_snapshot();
+        let mut services = current.trusted_services().to_vec();
+        services.push(Arc::new(FailingTrustedService));
+        asm.policy_mgr
+            .set_current_snapshot_for_tests(&PolicySnapshot::for_tests(
+                current.policy_arc(),
+                services,
+            ));
+
+        let renewed = zode_logout(&asm, &cc, addr, &privkey, cn).await;
+        assert!(renewed.get_attribute("device.clearance").is_none());
+        assert!(
+            renewed.get_attribute(key::DEVICE_AUTHORITY).is_some(),
+            "the device authority stays"
+        );
+        assert!(renewed.get_cn().is_some(), "the authenticated CN stays");
+        assert!(
+            renewed
+                .identity_keys_iter()
+                .all(|k| renewed.get_attribute(k).is_some()),
+            "every identity key must name a surviving attribute"
         );
     }
 
