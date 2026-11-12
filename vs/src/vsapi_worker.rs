@@ -463,7 +463,10 @@ async fn mint_login_nonce_for_handle(
 /// `zpr.vinst`; if an install landed since, the authentication is refused
 /// (`temporarilyUnavailable`) and the node authenticates again under the new
 /// policy, rather than persisting an admission that install's reconciliation
-/// never saw.
+/// never saw. A fresh (`Reset`, `!reconnect`) connect tears the node's old
+/// state down ([reset_node_state]) only after that recheck and under the same
+/// lock, so a refused authentication never leaves the old node with its
+/// adapters, visas and topology destroyed (#63 review).
 async fn add_node_serialized(
     asm: &Assembly,
     node_actor: &Actor,
@@ -475,6 +478,9 @@ async fn add_node_serialized(
             == CommitRecheck::PolicyMoved
     {
         return Err(policy_moved_error());
+    }
+    if !reconnect && let Some(addr) = node_actor.get_zpr_addr() {
+        reset_node_state(asm, addr).await?;
     }
     asm.actor_mgr
         .add_node(node_actor, reconnect, &asm.policy_service_names())
@@ -1172,18 +1178,8 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
 
         // Note that the node may have services on it in addition to its node-ness.
 
-        if !self.reconnect {
-            if let Err(e) = reset_node_state(&self.asm, &node_zpr_addr).await {
-                error!(target: API, "failed to clear node state for {:?}: {}", &node_cn, e);
-                undo.undo(&self.asm).await;
-                return self.ok_with_authenticate_error(
-                    results,
-                    vsapi::ErrorCode::Internal,
-                    "failed to clear node state",
-                );
-            }
-        }
-
+        // A Reset's teardown of the node's old state runs inside
+        // add_node_serialized, after the generation recheck (#63 review).
         // The add_node call will clean up after ifself if it fails.
         if let Err(e) = add_node_serialized(&self.asm, &node_actor, self.reconnect).await {
             undo.undo(&self.asm).await;
@@ -3499,6 +3495,62 @@ mod tests {
             task.await
                 .unwrap()
                 .expect("open's state update completes once the lock is free");
+        }
+
+        /// #63 review (Codex P1): a Reset authentication tears the node's old
+        /// state down only inside the locked commit, after the generation
+        /// recheck: refused under a moved generation, the old state (here, a
+        /// docked adapter) is untouched; accepted, it is torn down.
+        #[tokio::test]
+        async fn test_reset_teardown_only_after_generation_recheck() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let node_addr: std::net::IpAddr = NODE.parse().unwrap();
+            let old = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
+            asm.actor_mgr
+                .add_node(&old, false, &Default::default())
+                .await
+                .unwrap();
+            asm.actor_mgr
+                .add_adapter_via_node(
+                    &crate::test_helpers::make_adapter_actor_defexp("fd5a:5052:4000::a", "dock"),
+                    &node_addr,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            // The docked adapter's actor record: only the Reset teardown removes it.
+            let adapter: std::net::IpAddr = "fd5a:5052:4000::a".parse().unwrap();
+            let adapter_present = || async {
+                asm.actor_mgr
+                    .get_actor_by_zpr_addr(&adapter)
+                    .await
+                    .unwrap()
+                    .is_some()
+            };
+
+            let mut fresh = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
+            VSHandleImpl::stamp_new_session(&mut fresh);
+            let stale = asm.policy_mgr.get_current_snapshot().vinst() + 1;
+            fresh
+                .add_attribute(Attribute::builder(key::VINST).value(stale.to_string()))
+                .unwrap();
+            assert!(add_node_serialized(&asm, &fresh, false).await.is_err());
+            assert!(
+                adapter_present().await,
+                "a refused Reset must not tear anything down"
+            );
+
+            let current = asm.policy_mgr.get_current_snapshot().vinst();
+            fresh
+                .add_attribute(Attribute::builder(key::VINST).value(current.to_string()))
+                .unwrap();
+            add_node_serialized(&asm, &fresh, false)
+                .await
+                .expect("a current Reset commits");
+            assert!(
+                !adapter_present().await,
+                "an accepted Reset tears the old state down"
+            );
         }
 
         /// Test 19: a dead handle (node disconnected) gets `authRequired`.

@@ -1610,9 +1610,31 @@ impl ConnectionControl {
             let _ = renewed.add_identity_key(0, ATTR_KEY_VS_IDENT);
         }
 
-        asm.actor_mgr
+        if let Err(e) = asm
+            .actor_mgr
             .update_actor(&renewed, &asm.policy_service_names())
-            .await?;
+            .await
+        {
+            // The write can fail after the attributes were committed (a later
+            // metadata write failed). For a login or logout, do not drop the
+            // follow-up with the error (#63 review): invalidate the revisions a
+            // reduced logout dropped, and hand the visa reconciliation to the
+            // event manager, which refreshes and re-sweeps.
+            if user_change != UserNamespaceChange::Keep {
+                if logout_without_enrichment {
+                    asm.ts_mgr.invalidate_actor_revisions(&zpr_addr);
+                }
+                warn!(target: CC, "write of {zpr_addr}'s namespace change failed ({e}); queueing an attribute-change reconcile");
+                if let Err(qe) = asm
+                    .event_mgr
+                    .record_event(crate::event_mgr::VsEvent::TrustedServiceChange)
+                    .await
+                {
+                    error!(target: CC, "failed to queue the reconcile after a failed write for {zpr_addr}: {qe}");
+                }
+            }
+            return Err(e);
+        }
 
         // PR #42 review (P1): re-check the denylist now that the renewal is
         // persisted. A revocation landing between the pre-check above and
@@ -9427,6 +9449,39 @@ mod tests {
                 .iter()
                 .any(|(source, _)| source == "hr"),
             "the source stays stale until a post-logout pass commits"
+        );
+    }
+
+    /// #63 review (Copilot): a logout whose actor write fails part-way (the
+    /// attributes may already be committed) still hands its follow-up -- the
+    /// visa reconciliation -- to the event manager before returning the error.
+    #[tokio::test]
+    async fn test_failed_logout_write_queues_reconcile() {
+        let (asm, mut event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let cn = "zode-ak.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        while event_rx.try_recv().is_ok() {}
+
+        db.set_hset_fault(crate::db::FaultMode::Reject);
+        let result = cc
+            .reauthorize_actor(
+                asm.clone(),
+                addr,
+                vec![make_fresh_ss_blob(&privkey, cn)],
+                &addr,
+                Some(ZODE_SESSION),
+            )
+            .await;
+        assert!(result.is_err(), "the failed write is reported");
+        let mut requeued = false;
+        while let Ok(evt) = event_rx.try_recv() {
+            requeued |= matches!(evt, crate::event_mgr::VsEvent::TrustedServiceChange);
+        }
+        assert!(
+            requeued,
+            "a failed logout write must still queue the reconcile"
         );
     }
 
