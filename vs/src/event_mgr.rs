@@ -54,6 +54,13 @@ impl EventMgr {
         EventMgr { event_queue }
     }
 
+    /// Non-blocking enqueue; false when the queue is full. Test-only: lets a
+    /// test fill the bounded queue.
+    #[cfg(test)]
+    pub fn try_record_event_for_tests(&self, event: VsEvent) -> bool {
+        self.event_queue.try_send(event).is_ok()
+    }
+
     pub async fn record_event(&self, event: VsEvent) -> Result<(), ServiceError> {
         if let Err(e) = self.event_queue.send(event).await {
             error!(target: EVENT, "failed to send to event-queue: {}", e);

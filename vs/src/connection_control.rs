@@ -1617,13 +1617,39 @@ impl ConnectionControl {
         {
             // The write can fail after the attributes were committed (a later
             // metadata write failed). For a login or logout, do not drop the
-            // follow-up with the error (#63 review): invalidate the revisions a
-            // reduced logout dropped, and hand the visa reconciliation to the
-            // event manager, which refreshes and re-sweeps.
-            if user_change != UserNamespaceChange::Keep {
-                if logout_without_enrichment {
-                    asm.ts_mgr.invalidate_actor_revisions(&zpr_addr);
+            // follow-up with the error (#63 review):
+            // - a login is rolled back to the loaded, pre-login actor so no
+            //   login without session anchors stays active; if the rollback
+            //   fails too, the node is disconnected (fail closed) and must
+            //   re-authenticate;
+            // - the revisions a reduced logout dropped are invalidated;
+            // - the node commit lock is released BEFORE awaiting the bounded
+            //   event queue -- its worker may need that lock -- and the visa
+            //   reconciliation is handed to the event manager.
+            if user_change == UserNamespaceChange::Gain
+                && let Err(re) = asm
+                    .actor_mgr
+                    .update_actor(&actor, &asm.policy_service_names())
+                    .await
+            {
+                error!(target: CC, "rollback of {zpr_addr}'s failed login failed ({re}); disconnecting the node");
+                if let Err(de) = self
+                    .disconnect_impl(
+                        asm.clone(),
+                        zpr_addr,
+                        vsapi::DisconnectReason::Admin,
+                        self_reauth_guard.is_some(),
+                    )
+                    .await
+                {
+                    error!(target: CC, "failed to disconnect {zpr_addr} after a failed login rollback: {de}");
                 }
+            }
+            if user_change != UserNamespaceChange::Keep && logout_without_enrichment {
+                asm.ts_mgr.invalidate_actor_revisions(&zpr_addr);
+            }
+            drop(self_reauth_guard);
+            if user_change != UserNamespaceChange::Keep {
                 warn!(target: CC, "write of {zpr_addr}'s namespace change failed ({e}); queueing an attribute-change reconcile");
                 if let Err(qe) = asm
                     .event_mgr
@@ -9482,6 +9508,68 @@ mod tests {
         assert!(
             requeued,
             "a failed logout write must still queue the reconcile"
+        );
+    }
+
+    /// #63 review (Copilot): a failed namespace-change write releases the
+    /// node commit lock before it awaits the (bounded) event queue, so a
+    /// full queue whose worker needs that lock cannot deadlock.
+    #[tokio::test]
+    async fn test_failed_write_releases_lock_before_queueing() {
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let cn = "zode-al.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        // Fill the event queue; nothing drains it, so the next send waits.
+        while asm
+            .event_mgr
+            .try_record_event_for_tests(crate::event_mgr::VsEvent::TrustedServiceChange)
+        {}
+        db.set_hset_fault(crate::db::FaultMode::Reject);
+        let cc = Arc::new(cc);
+        let task = tokio::spawn({
+            let (asm, cc) = (asm.clone(), cc.clone());
+            let blobs = vec![make_fresh_ss_blob(&privkey, cn)];
+            async move {
+                cc.reauthorize_actor(asm, addr, blobs, &addr, Some(ZODE_SESSION))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!task.is_finished(), "the send waits on the full queue");
+        assert!(
+            asm.policy_mgr.node_commit_lock.try_lock().is_ok(),
+            "the node commit lock must be free while the send waits"
+        );
+        task.abort();
+    }
+
+    /// #63 review (Codex P1): a login whose actor write fails part-way never
+    /// leaves an active login behind: the visa service rolls back to the
+    /// pre-login actor or, if that fails too, disconnects the node.
+    #[tokio::test]
+    async fn test_failed_login_write_leaves_no_active_login() {
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let cn = "zode-am.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        db.set_hset_fault(crate::db::FaultMode::ApplyThenError);
+        let nonce = mint_zode_nonce(&cc, addr);
+        let result = cc
+            .reauthorize_actor(
+                asm.clone(),
+                addr,
+                zode_login_blobs(&privkey, cn, &nonce, oidc_base_claims()),
+                &addr,
+                Some(ZODE_SESSION),
+            )
+            .await;
+        assert!(result.is_err(), "the failed write is reported");
+        let stored = asm.actor_mgr.get_actor_by_zpr_addr(&addr).await.unwrap();
+        assert!(
+            stored.as_ref().is_none_or(|a| !has_user_attrs(a)),
+            "no stored actor may hold the failed login's user attributes"
         );
     }
 
