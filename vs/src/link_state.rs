@@ -95,8 +95,12 @@ impl LinkStateTable {
     /// already list as failed. A snapshot sends every link again, so a repeated `failed`
     /// is the failure already accounted for; if the pair has been cleared since (the
     /// peer reconnected and the link is being proposed again), re-marking it would leave
-    /// the link out of the very topology that asks the owner to retry. The owner's entry
-    /// leaves `failed` when it retries, and a retry that fails is new again.
+    /// the link out of the very topology that asks the owner to retry.
+    ///
+    /// This relies on the reporting contract (vs.capnp `LinkState`, ZODE_LINKS.md R6):
+    /// the owner lists a link as `failed` only once the link-up window has passed
+    /// without it coming up. While a retry is under way the entry is not `failed` (the
+    /// link is simply not listed), so a retry that fails again is a new failure.
     pub fn record_failures(&mut self, reporter: IpAddr, failed_peers: &[IpAddr]) -> Vec<IpAddr> {
         let mut newly_marked = Vec::new();
         for peer in failed_peers {
