@@ -158,6 +158,22 @@ mod tests {
     use crate::test_helpers::{build_sweep_asm, create_sweep_visa};
     use std::net::IpAddr;
 
+    /// #63 review: an actor-store read error is a sweep failure, not an
+    /// unresolved actor -- otherwise a logout's sweep could report success and
+    /// stop retrying while a visa it should revoke stays live.
+    #[tokio::test]
+    async fn test_actor_read_error_counts_as_sweep_failure() {
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let (asm, node_a) = crate::test_helpers::build_sweep_asm_on(asm, false).await;
+        create_sweep_visa(&asm, &node_a, 0).await;
+        db.set_exists_fault(crate::db::FaultMode::Reject);
+
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let failures = revalidate_visas(&asm, &psnap, SweepReason::AttributeChange).await;
+        assert_eq!(failures, 1, "the unreadable actor must count as a failure");
+    }
+
     /// A denied visa is marked PendingRevoke on its holder node (target policy
     /// still live). Uses the no-route assembly so eval falls out as a deny.
     #[tokio::test]

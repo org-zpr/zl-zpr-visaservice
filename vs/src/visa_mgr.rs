@@ -835,9 +835,12 @@ impl VisaMgr {
         let src_zpr = metadata.five_tuple.source_addr;
         let dst_zpr = metadata.five_tuple.dest_addr;
 
-        let (Ok(Some(src)), Ok(Some(dst))) = (
-            asm.actor_mgr.get_actor_by_zpr_addr(&src_zpr).await,
-            asm.actor_mgr.get_actor_by_zpr_addr(&dst_zpr).await,
+        // A genuinely absent actor is unresolved (skipped); a store read error
+        // is propagated, so a sweep counts it as a failure and keeps the work
+        // for a retry instead of treating the visa as settled (#63 review).
+        let (Some(src), Some(dst)) = (
+            asm.actor_mgr.get_actor_by_zpr_addr(&src_zpr).await?,
+            asm.actor_mgr.get_actor_by_zpr_addr(&dst_zpr).await?,
         ) else {
             return Ok(VisaRecheck::SkipUnresolvedActor);
         };

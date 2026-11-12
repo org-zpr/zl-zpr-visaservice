@@ -133,6 +133,32 @@ impl TrustedServicesMgr {
         self.actor_revisions.remove(zpr_addr);
     }
 
+    /// Invalidate every recorded source revision of the actor at `zpr_addr`
+    /// without resetting its invalidation generation (#63 review): each current
+    /// source's record has its revision cleared (stale) and its generation
+    /// bumped, created when absent. A refresh pass already in flight captured
+    /// the old generation, so its commit ([Self::record_revision_at_generation])
+    /// is refused and cannot mark data read before this point as current.
+    /// [Self::forget_actor_revisions] instead deletes the records -- right for a
+    /// disconnect (the address is recycled), wrong here, because a deleted
+    /// record reads as generation 0 again.
+    pub fn invalidate_actor_revisions(&self, zpr_addr: &IpAddr) {
+        let services = self.services.load_full();
+        let mut revisions = self.actor_revisions.entry(*zpr_addr).or_default();
+        for record in revisions.values_mut() {
+            record.revision = None;
+            record.generation += 1;
+        }
+        for service in services.iter() {
+            revisions
+                .entry(service.get_source_id().to_string())
+                .or_insert(RevisionRecord {
+                    revision: None,
+                    generation: 1,
+                });
+        }
+    }
+
     /// Drop the recorded revision for exactly one (actor, source) pair
     /// (zipline#79): a targeted change notification names the actors whose
     /// data changed at one source, so only that record may go stale — the

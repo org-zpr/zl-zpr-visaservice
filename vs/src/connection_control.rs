@@ -1657,7 +1657,7 @@ impl ConnectionControl {
         // indeterminate and denied, instead of proceeding as if the dropped
         // attributes were known to be absent (#63 review).
         if logout_without_enrichment {
-            asm.ts_mgr.forget_actor_revisions(&zpr_addr);
+            asm.ts_mgr.invalidate_actor_revisions(&zpr_addr);
         }
 
         // A logout also forgets the dropped login's session anchors, so a
@@ -9341,6 +9341,53 @@ mod tests {
         crate::actor_attributes::persist_refreshed_actor(&asm, &copy, current)
             .await
             .expect("a current refresh persists");
+    }
+
+    /// #63 review: a fallback logout invalidates the actor's source revisions
+    /// without resetting their generations, so a refresh pass that captured a
+    /// generation before the logout cannot record its (pre-logout) revision
+    /// afterwards.
+    #[tokio::test]
+    async fn test_fallback_logout_blocks_in_flight_revision_commit() {
+        let cn = "zode-ai.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        crate::test_helpers::register_ts(&asm, &[("device.blocked", "true")]);
+        let mut stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::actor_attributes::refresh_and_persist_actor(&asm, &mut stored)
+            .await
+            .expect("a healthy refresh records the source revision");
+        // An in-flight refresh pass captures its generation now ...
+        let captured = asm.ts_mgr.invalidation_generation(&addr, "hr");
+
+        // ... then a logout persists without re-enrichment.
+        let current = asm.policy_mgr.get_current_snapshot();
+        let mut services = current.trusted_services().to_vec();
+        services.push(Arc::new(FailingTrustedService));
+        asm.policy_mgr
+            .set_current_snapshot_for_tests(&PolicySnapshot::for_tests(
+                current.policy_arc(),
+                services,
+            ));
+        zode_logout(&asm, &cc, addr, &privkey, cn).await;
+
+        assert!(
+            !asm.ts_mgr
+                .record_revision_at_generation(&addr, "hr", 1, captured),
+            "a commit captured before the logout must be refused"
+        );
+        assert!(
+            asm.ts_mgr
+                .stale_sources_for_actor(&addr)
+                .iter()
+                .any(|(source, _)| source == "hr"),
+            "the source stays stale until a post-logout pass commits"
+        );
     }
 
     /// The namespace-change decision table (vs.capnp "Re-Authorization").
