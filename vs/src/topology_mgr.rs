@@ -108,6 +108,12 @@ impl TopologyMgr {
     /// Store `reporter`'s link-state snapshot (already validated, see
     /// `link_state::validate_snapshot`) and re-evaluate every router link incident to it.
     ///
+    /// `current_policy` returns the policy snapshot current at the time of the call. It
+    /// is called once, inside the link-state table lock, and every CN of the evaluation
+    /// comes from that one snapshot: CNs come from policy, and mixing two policies'
+    /// CNs in one edge could enable a link neither policy would. Revalidation holds the
+    /// same lock with the new policy, so whichever applies second sees it.
+    ///
     /// Returns the links that went from up to down, as `(reporter, peer)`, so the caller
     /// can revoke the visas that use them. A link coming up is not returned: it affects
     /// new visas only (Zodes plan §5.8).
@@ -115,12 +121,42 @@ impl TopologyMgr {
         &self,
         reporter: &IpAddr,
         entries: Vec<LinkStateReport>,
+        current_policy: &dyn Fn() -> PolicySnapshot,
+    ) -> Vec<(IpAddr, IpAddr)> {
+        let mut table = self.link_state.lock().unwrap();
+        let snapshot = current_policy();
+        self.record_locked(
+            &mut table,
+            reporter,
+            entries,
+            &Self::policy_cn_lookup(&snapshot),
+        )
+    }
+
+    /// As [Self::record_link_states], with a fixed node-address -> CN lookup instead of a
+    /// policy. For tests, which have no compiled policy naming CNs.
+    #[cfg(test)]
+    pub fn record_link_states_with_cns(
+        &self,
+        reporter: &IpAddr,
+        entries: Vec<LinkStateReport>,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
     ) -> Vec<(IpAddr, IpAddr)> {
-        // One critical section from storing the snapshot through the last router update,
-        // so two overlapping reports cannot interleave and leave an older evaluation's
-        // flag on the router (table, then router: the same order as installs).
         let mut table = self.link_state.lock().unwrap();
+        self.record_locked(&mut table, reporter, entries, cn_of)
+    }
+
+    /// Body of [Self::record_link_states], with the table locked by the caller: one
+    /// critical section from storing the snapshot through the last router update, so
+    /// two overlapping reports cannot interleave and leave an older evaluation's flag
+    /// on the router (table, then router: the same order as installs).
+    fn record_locked(
+        &self,
+        table: &mut LinkStateTable,
+        reporter: &IpAddr,
+        entries: Vec<LinkStateReport>,
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
+    ) -> Vec<(IpAddr, IpAddr)> {
         // A report from a node that is no longer in the router -- a stale handle whose
         // node was disconnected meanwhile -- is dropped: storing it would let a
         // pre-disconnect snapshot govern the link after the node reconnects.
@@ -130,7 +166,7 @@ impl TopologyMgr {
             return Vec::new();
         }
         table.set_snapshot(*reporter, entries);
-        self.refresh_links_locked(&table, reporter, cn_of)
+        self.refresh_links_locked(table, reporter, cn_of)
     }
 
     /// Re-evaluate every router link incident to `node`. Returns the links that went from
@@ -1548,23 +1584,27 @@ mod tests {
         let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
 
         // A says up, B has not reported (legacy): still up, nothing went down.
-        let down = topo.record_link_states(&a, vec![report("b.zpr", LinkState::Up)], &cn_of);
+        let down =
+            topo.record_link_states_with_cns(&a, vec![report("b.zpr", LinkState::Up)], &cn_of);
         assert!(down.is_empty());
         assert!(topo.router.link_between(&a, &b).unwrap().up);
 
         // B says down: the edge goes down and is reported as such, once.
-        let down = topo.record_link_states(&b, vec![report("a.zpr", LinkState::Down)], &cn_of);
+        let down =
+            topo.record_link_states_with_cns(&b, vec![report("a.zpr", LinkState::Down)], &cn_of);
         assert_eq!(down, vec![(b, a)]);
         assert!(!topo.router.link_between(&a, &b).unwrap().up);
         assert!(topo.get_best_route(&a, &b).is_none());
-        let again = topo.record_link_states(&b, vec![report("a.zpr", LinkState::Down)], &cn_of);
+        let again =
+            topo.record_link_states_with_cns(&b, vec![report("a.zpr", LinkState::Down)], &cn_of);
         assert!(
             again.is_empty(),
             "an edge already down is not reported again"
         );
 
         // B says up again: the edge comes back; coming up is not a "went down".
-        let down = topo.record_link_states(&b, vec![report("a.zpr", LinkState::Up)], &cn_of);
+        let down =
+            topo.record_link_states_with_cns(&b, vec![report("a.zpr", LinkState::Up)], &cn_of);
         assert!(down.is_empty());
         assert!(topo.router.link_between(&a, &b).unwrap().up);
         assert!(topo.get_best_route(&a, &b).is_some());
@@ -1582,7 +1622,7 @@ mod tests {
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
         topo.add_node(a).unwrap();
 
-        let down = topo.record_link_states(&a, vec![], &|_: &IpAddr| None);
+        let down = topo.record_link_states_with_cns(&a, vec![], &|_: &IpAddr| None);
         assert!(down.is_empty(), "no edge yet, so nothing went down");
 
         let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
@@ -1609,7 +1649,7 @@ mod tests {
         topo.add_node(b).unwrap();
         topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
         let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
-        topo.record_link_states(&a, vec![report("b.zpr", LinkState::Down)], &cn_of);
+        topo.record_link_states_with_cns(&a, vec![report("b.zpr", LinkState::Down)], &cn_of);
         assert!(!topo.router.link_between(&a, &b).unwrap().up);
 
         topo.remove_node(&a).await;
@@ -1641,7 +1681,7 @@ mod tests {
 
         // Under an earlier CN mapping, A's report matches B and the link is up.
         let old_cns = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
-        topo.record_link_states(&a, vec![report("b.zpr", LinkState::Up)], &old_cns);
+        topo.record_link_states_with_cns(&a, vec![report("b.zpr", LinkState::Up)], &old_cns);
         assert!(topo.router.link_between(&a, &b).unwrap().up);
 
         // The current policy no longer knows B's CN, so A's entry cannot match it.
@@ -1674,7 +1714,7 @@ mod tests {
         let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
 
         // A is not a router node: its (down) report is dropped.
-        topo.record_link_states(&a, vec![report("b.zpr", LinkState::Down)], &cn_of);
+        topo.record_link_states_with_cns(&a, vec![report("b.zpr", LinkState::Down)], &cn_of);
 
         // A reconnects and its link is installed: A is a non-reporter, so legacy-up.
         topo.add_node(a).unwrap();

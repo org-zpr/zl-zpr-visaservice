@@ -1846,18 +1846,11 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
 
         // Apply the report with the CNs of the policy current at application time, not
         // the snapshot captured above: a policy update whose revalidation finishes in
-        // between would otherwise be overwritten with old-policy CNs. The lookup runs
-        // inside record_link_states' table lock, as revalidation's does, so whichever
-        // of the two applies second sees the new policy. (`get_current_snapshot` is a
-        // lock-free load, so no lock-order concern.)
-        let live_cn_of = |addr: &IpAddr| {
-            self.asm
-                .policy_mgr
-                .get_current_snapshot()
-                .policy()
-                .node_cn_for_addr(addr)
-                .map(str::to_string)
-        };
+        // between would otherwise be overwritten with old-policy CNs. record_link_states
+        // loads that snapshot once, inside its table lock (which revalidation also
+        // holds), and evaluates every CN against it. `get_current_snapshot` is a
+        // lock-free load, so there is no lock-order concern.
+        let current_policy = || self.asm.policy_mgr.get_current_snapshot();
         // The session may have ended while this report was validated. Re-check it right
         // before applying; record_link_states additionally drops a report for a node
         // that has left the router.
@@ -1872,7 +1865,7 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         let went_down = self
             .asm
             .topo_mgr
-            .record_link_states(&reporter, entries, &live_cn_of);
+            .record_link_states(&reporter, entries, &current_policy);
         // Revoke the visas crossing every link that just went down. A visa whose
         // revocation write fails is quarantined and retried per visa (VisaMgr), so the
         // report itself succeeds either way.
