@@ -44,7 +44,10 @@ use zpr::vsapi_types::LinkStateReport;
 /// before the guard because it waits on the network -- authenticating a node, which
 /// can query trusted services -- rechecks under the guard that the policy it used is
 /// still current (`approved_under_current_policy` in `vsapi_worker`) and refuses
-/// otherwise.
+/// otherwise. Likewise a `VSHandle` call that writes on its node's behalf rechecks
+/// the handle's session (`node_is_live`) under the guard, right before the write, so
+/// a handle superseded by a reconnect while the call waited cannot act on the new
+/// session's state.
 ///
 /// Rules: never take a second guard while holding one: the lock is not re-entrant
 /// (pass the guard down instead, as `disconnect_locked` and `AuthenticateUndo::undo`

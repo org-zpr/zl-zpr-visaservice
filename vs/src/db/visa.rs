@@ -470,7 +470,9 @@ impl VisaRepo {
     /// No-ops (`Ok(false)`) when the visa is absent/expired or `vinst` is not
     /// newer than `checked_vinst`. Otherwise marks every node `PendingRevoke`,
     /// stamping `revoke_vinst = vinst` only where it exceeds the existing stamp
-    /// (a revoke decision overwrites `PendingInstall`/`Installed` freely). One
+    /// (a revoke decision overwrites `PendingInstall`/`Installed` freely). A node
+    /// already revoked unconditionally (`PendingRevoke`, no stamp) stays unstamped,
+    /// so a later allow cannot cancel it. One
     /// rewrite. `checked_vinst` is not bumped (only allow bumps it).
     pub async fn record_deny_verdict(&self, visa_id: u64, vinst: u64) -> Result<bool, StoreError> {
         // INVARIANT A: backing held for the whole write.
@@ -490,6 +492,12 @@ impl VisaRepo {
             let ttl = remaining_secs(entry.deadline);
             let mut new_states = entry.node_states.clone();
             for ns in new_states.values_mut() {
+                // Already revoked unconditionally (PendingRevoke with no stamp, see
+                // mark_visa_revoked): keep it unstamped, so no later allow can
+                // cancel it.
+                if ns.state == NodeVisaState::PendingRevoke && ns.revoke_vinst.is_none() {
+                    continue;
+                }
                 ns.state = NodeVisaState::PendingRevoke;
                 if ns.revoke_vinst.is_none_or(|rv| vinst > rv) {
                     ns.revoke_vinst = Some(vinst); // still revoked!
@@ -2248,5 +2256,32 @@ mod test {
             }
         }
         assert_memory_matches_redis(&repo, &db, 810).await;
+    }
+
+    /// Round 14 (Copilot): an unconditional revocation also survives a policy deny
+    /// followed by an allow. The deny must not stamp a `revoke_vinst` onto it, or the
+    /// newer allow could cancel it.
+    #[tokio::test]
+    async fn test_unconditional_revocation_survives_deny_then_allow() {
+        let db = Arc::new(FakeDb::new());
+        let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
+        let req: IpAddr = "fd5a:5052::f0".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::f1".parse().unwrap();
+        let c: IpAddr = "fd5a:5052::f2".parse().unwrap();
+        store_three_node(&repo, 820, req, b, c, 5).await;
+
+        assert!(repo.mark_visa_revoked(820).await.unwrap());
+        assert!(repo.record_deny_verdict(820, 6).await.unwrap());
+        assert!(repo.record_allow_verdict(820, 7).await.unwrap());
+        {
+            let store = repo.inner.store.read().unwrap();
+            let e = store.visas.get(&820).unwrap();
+            for n in [req, b, c] {
+                let ns = e.node_states.get(&n).unwrap();
+                assert_eq!(ns.state, NodeVisaState::PendingRevoke);
+                assert_eq!(ns.revoke_vinst, None);
+            }
+        }
+        assert_memory_matches_redis(&repo, &db, 820).await;
     }
 }
