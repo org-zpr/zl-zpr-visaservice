@@ -269,7 +269,10 @@ pub struct ConnectionControl {
     pub(crate) login_nonces: LoginNonceStore,
     /// Serializes a node's reauthorizations of its OWN actor across load ->
     /// classify -> persist -> record anchors, so two concurrent logins cannot
-    /// both classify as a gain and silently switch users (#63 review).
+    /// both classify as a gain and silently switch users (#63 review). A
+    /// node's authenticate persists its new `zpr.session` under the same lock
+    /// (`vsapi_worker::add_node_serialized`), so a reconnect cannot write
+    /// between a self-renewal's session check and its write.
     /// ponytail: one global lock; a per-address lock if self-renewals become
     /// frequent (today only a Zode's login and logout use them).
     pub(crate) self_reauth_lock: tokio::sync::Mutex<()>,

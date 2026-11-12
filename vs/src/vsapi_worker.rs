@@ -344,6 +344,23 @@ impl VSHandleImpl {
     }
 }
 
+/// Persist an authenticated node (its fresh `zpr.session` included) while
+/// holding the self-renewal lock (`ConnectionControl::self_reauth_lock`). A
+/// node's reauthorization of its own actor holds the same lock from loading the
+/// actor to persisting it, so this write can never land between that renewal's
+/// session check and its write and be overwritten with the old session (#63
+/// review). The lock is held only for the write, not for authentication.
+async fn add_node_serialized(
+    asm: &Assembly,
+    node_actor: &Actor,
+    reconnect: bool,
+) -> Result<(), ServiceError> {
+    let _guard = asm.cc.self_reauth_lock.lock().await;
+    asm.actor_mgr
+        .add_node(node_actor, reconnect, &asm.policy_service_names())
+        .await
+}
+
 /// Helper to write an error into a capnp error builder with a retry of zero.
 fn write_error(bldr: &mut vsapi::error::Builder, code: vsapi::ErrorCode, message: &str) {
     bldr.set_code(code);
@@ -1129,16 +1146,7 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         }
 
         // The add_node call will clean up after ifself if it fails.
-        if let Err(e) = self
-            .asm
-            .actor_mgr
-            .add_node(
-                &node_actor,
-                self.reconnect,
-                &self.asm.policy_service_names(),
-            )
-            .await
-        {
+        if let Err(e) = add_node_serialized(&self.asm, &node_actor, self.reconnect).await {
             error!(target: API, "failed to add authenticated node {:?} to actor db: {}", &node_cn, e);
             undo.undo(&self.asm).await;
             return self.ok_with_authenticate_error(
@@ -3308,6 +3316,30 @@ mod tests {
                     );
                 })
                 .await;
+        }
+
+        /// #63 review (Codex P1): a node's authenticate persists its new
+        /// session under the self-renewal lock, so a reconnect's session write
+        /// cannot land between a self-renewal's session check and its write.
+        #[tokio::test]
+        async fn test_node_persist_waits_for_self_renewal_lock() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let mut node = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
+            VSHandleImpl::stamp_new_session(&mut node);
+            let guard = asm.cc.self_reauth_lock.lock().await;
+            let task = tokio::spawn({
+                let asm = asm.clone();
+                async move { add_node_serialized(&asm, &node, false).await }
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !task.is_finished(),
+                "the node persist must wait for the lock"
+            );
+            drop(guard);
+            task.await
+                .unwrap()
+                .expect("the persist completes once the lock is free");
         }
 
         /// Test 19: a dead handle (node disconnected) gets `authRequired`.
