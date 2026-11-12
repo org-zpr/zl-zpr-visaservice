@@ -159,6 +159,10 @@ pub struct PolicyMgr {
     repo: db::PolicyRepo,
     /// Serializes concurrent policy updates; reads remain lock-free via ArcSwap.
     update_lock: tokio::sync::Mutex<()>,
+    /// The topology operation lock ([crate::topology_mgr::TopoOps]), bound once the
+    /// Assembly exists. An install commits under it, so the current policy cannot
+    /// change while a topology operation that read it is still running.
+    topology_lock: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>>,
     resolver: PolicyResolver,
     ts_mgr: Arc<TrustedServicesMgr>,
     /// Directory holding the `<service-id>.json` files for `api=file` trusted services.
@@ -608,6 +612,7 @@ impl PolicyMgr {
             state: ArcSwap::from_pointee(state),
             repo,
             update_lock: tokio::sync::Mutex::new(()),
+            topology_lock: std::sync::OnceLock::new(),
             resolver,
             ts_mgr,
             file_ts_dir,
@@ -668,6 +673,16 @@ impl PolicyMgr {
             Some(&previous),
         )
         .await?;
+
+        // Commit under the topology operation lock (taken after the network-bound
+        // build above, and only around local writes): a topology operation reads the
+        // policy under that lock and relies on it staying current until it is done.
+        // Lock order: update_lock, then the topology lock; topology operations never
+        // take update_lock.
+        let _topology = match self.topology_lock.get() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         self.repo.set_current_policy(&loaded, false).await?;
 
         self.publish(candidate.commit(Some(&previous), self.oidc_refresh));
@@ -685,6 +700,13 @@ impl PolicyMgr {
     /// hold across awaits.
     pub fn get_current_snapshot(&self) -> PolicySnapshot {
         PolicySnapshot(self.state.load_full())
+    }
+
+    /// Bind the topology operation lock ([crate::topology_mgr::TopologyMgr::ops_lock]);
+    /// from then on every install commits under it. Called once, when the Assembly is
+    /// built; a second call is ignored.
+    pub fn bind_topology_lock(&self, lock: Arc<tokio::sync::Mutex<()>>) {
+        let _ = self.topology_lock.set(lock);
     }
 
     /// Callers should drop the policy as quickly as possible to avoid missing a policy update.

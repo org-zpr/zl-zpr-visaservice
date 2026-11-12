@@ -22,6 +22,7 @@ use crate::assembly::Assembly;
 use crate::error::ServiceError;
 use crate::logging::targets::EVENT;
 use crate::policy_mgr::PolicySnapshot;
+use crate::topology_mgr::TopoOps;
 use crate::visa_reconciler::{SweepReason, revalidate_visas};
 
 #[derive(Debug)]
@@ -162,8 +163,10 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
           - TO BE SAFE: expire auth from all services - force re-auth of all existing services (after removing non-existing ones)
      */
 
-    // Grab one consistent policy snapshot and use it for the entire synchronize-to-policy
-    // pass below, so revalidation and per-node link computation all read the same view.
+    // The snapshot for the attribute and hostname reconciliation below. The
+    // topology part of the pass re-reads it under the topology operation lock, and
+    // everything from there on (node validity, links, re-auth obligation, visa sweep)
+    // uses that one consistent view.
     let psnap = asm.policy_mgr.get_current_snapshot();
 
     // PolicyUpdated(vinst) is a trigger, not a guarantee that this handler reconciles that
@@ -190,9 +193,9 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // actor in the set, sequentially -- an N x M synchronous fan-out on the event
     // handler's critical path. Once services are network-backed and actor/visa counts
     // are large this is going to be an issue.
-    let connected_node_addrs = asm.actor_mgr.list_node_addrs().await?;
+    // (The live-node set used for topology is read again under the topology lock below.)
     let mut refresh_set = live_visa_actor_addrs(asm).await;
-    refresh_set.extend(connected_node_addrs.iter().copied());
+    refresh_set.extend(asm.actor_mgr.list_node_addrs().await?);
     let (refreshed, unresolved, failed) = refresh_actors(asm, refresh_set).await;
     info!(
         target: EVENT,
@@ -219,46 +222,32 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         error!(target: EVENT, "failed to reconcile hostname claims after policy update: {e}");
     }
 
-    // The new policy may invalidate some existing nodes.
-    let (valid_node_addrs, invalid_node_addrs) =
-        revalidate_nodes(asm, &psnap, connected_node_addrs).await;
-
-    // Disconnect the nodes that are no longer approved by the new policy.
-    for naddr in &invalid_node_addrs {
-        info!(target: EVENT, "connected node {naddr} is no longer approved by policy, disconnecting");
-        // Note that the following disconnect call will also update the topology manager.
-        if let Err(e) = asm
-            .cc
-            .disconnect(asm.clone(), *naddr, DisconnectReason::Admin)
-            .await
-        {
-            error!(target: EVENT, "error processing disconnect of {naddr}: {e}");
-            // In this case we do not send an actor-leaves event.
-            // What is the state of our topology manager now?
-            // Visa service is porbably hosed.
-        }
+    // Topology operation (TopoOps invariant): one guard spans every read that
+    // decides this pass's topology writes -- the policy generation, the live-node set
+    // and node validity -- through the disconnects, the link reconciliation and the
+    // revocations it calls for. A node that disconnects or connects meanwhile is
+    // either fully before or fully after it.
+    let ops = asm.topo_mgr.ops().await;
+    let locked = policy_pass_locked(asm, &ops, snapshot_vinst).await;
+    drop(ops);
+    let LockedPass::Applied {
+        psnap,
+        valid_node_addrs,
+        stopped_workers,
+        reconciled,
+    } = locked?
+    else {
+        return Ok(());
+    };
+    // Disconnected nodes' VSS workers are stopped now that the guard is released
+    // (stopping waits on the worker), before any reconciliation error is returned:
+    // those nodes are gone either way.
+    for (vss, naddr) in stopped_workers {
+        crate::connection_control::ConnectionControl::stop_vss_worker(vss, &naddr).await;
     }
+    reconciled?;
 
-    // Only do these steps if we managed to get a set of connected nodes. If
-    // there actually are no nodes connected at the moment, then topology should
-    // have been (or will soon be) updated via other code paths.  The purpose of
-    // updating the topology when presented with a new policy is to verify that
-    // existing links are still allowed, and send out peer messages.
     if !valid_node_addrs.is_empty() {
-        info!(target: EVENT, "policy updated vinst={vinst}: revalidating topology ({} nodes)", valid_node_addrs.len());
-        let report = asm
-            .topo_mgr
-            .revalidate_against_policy(&psnap, &valid_node_addrs)
-            .await?;
-        info!(
-            target: EVENT,
-            "topology revalidated vinst={vinst}: removed={} updated={} repaired={} orphaned={}",
-            report.links_removed,
-            report.links_updated,
-            report.links_repaired,
-            report.orphaned_nodes.len()
-        );
-
         // Queue up setTopology messages in parallel.
         let futs = valid_node_addrs.iter().filter_map(|naddr| {
             let peers = psnap.resolved_peers_for_node(naddr);
@@ -319,6 +308,115 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     revalidate_visas(asm, &psnap, SweepReason::PolicyUpdate).await;
 
     Ok(())
+}
+
+/// What the guarded part of a policy pass ([policy_pass_locked]) did.
+enum LockedPass {
+    /// A newer policy was installed during the attribute refresh; nothing applied.
+    Deferred,
+    /// Applied under the current policy `psnap`.
+    Applied {
+        psnap: PolicySnapshot,
+        /// Connected nodes still valid under `psnap`.
+        valid_node_addrs: Vec<IpAddr>,
+        /// VSS workers of the nodes disconnected under the guard, for the caller to
+        /// stop once it has released it.
+        stopped_workers: Vec<(Option<crate::vss_mgr::VssHandle>, IpAddr)>,
+        /// Link reconciliation result, returned after the workers are stopped.
+        reconciled: Result<(), ServiceError>,
+    },
+}
+
+/// The topology part of a policy pass, under the caller's [TopoOps]: re-read the
+/// policy (installs commit under the same lock, so it stays current until the guard
+/// is dropped), read the live-node set and judge each node on it, disconnect the
+/// invalid ones, reconcile links and revoke visas over links taken down.
+///
+/// `refreshed_vinst` is the policy the caller refreshed actor attributes for. If a
+/// newer policy has been installed since, the actors are stale for it: judging nodes
+/// on them could disconnect one the new policy admits. Then this applies nothing and
+/// returns [LockedPass::Deferred]; the newer policy's own pass, queued behind this
+/// one (every install records a PolicyUpdated event after it commits), refreshes
+/// first and applies.
+async fn policy_pass_locked(
+    asm: &Arc<Assembly>,
+    ops: &TopoOps<'_>,
+    refreshed_vinst: u64,
+) -> Result<LockedPass, ServiceError> {
+    let psnap = asm.policy_mgr.get_current_snapshot();
+    if psnap.vinst() != refreshed_vinst {
+        info!(target: EVENT, "policy pass for vinst={refreshed_vinst} superseded by vinst={} during the attribute refresh: deferring to its pass", psnap.vinst());
+        return Ok(LockedPass::Deferred);
+    }
+    let vinst = psnap.vinst();
+
+    // The new policy may invalidate some existing nodes. Read the live-node set
+    // under the guard, so the pass cannot re-add a node that has disconnected.
+    let connected_node_addrs = asm.actor_mgr.list_node_addrs().await?;
+    let (valid_node_addrs, invalid_node_addrs) =
+        revalidate_nodes(asm, &psnap, connected_node_addrs).await;
+
+    // Disconnect the nodes that are no longer approved by the new policy, under the
+    // guard. Their VSS workers are stopped by the caller after it is released.
+    let mut stopped_workers = Vec::new();
+    for naddr in &invalid_node_addrs {
+        info!(target: EVENT, "connected node {naddr} is no longer approved by policy, disconnecting");
+        let (vss, result) = asm
+            .cc
+            .disconnect_locked(ops, asm, *naddr, DisconnectReason::Admin)
+            .await;
+        stopped_workers.push((vss, *naddr));
+        if let Err(e) = result {
+            error!(target: EVENT, "error processing disconnect of {naddr}: {e}");
+            // In this case we do not send an actor-leaves event.
+            // What is the state of our topology manager now?
+            // Visa service is porbably hosed.
+        }
+    }
+
+    // Only reconcile links if there are connected nodes. If there are none at the
+    // moment, then topology should have been (or will soon be) updated via other
+    // code paths. The purpose of updating the topology when presented with a new
+    // policy is to verify that existing links are still allowed.
+    let mut reconciled: Result<(), ServiceError> = Ok(());
+    if !valid_node_addrs.is_empty() {
+        info!(target: EVENT, "policy updated vinst={vinst}: revalidating topology ({} nodes)", valid_node_addrs.len());
+        match asm
+            .topo_mgr
+            .revalidate_against_policy(ops, &psnap, &valid_node_addrs, &|| {
+                asm.policy_mgr.get_current_snapshot()
+            })
+            .await
+        {
+            Ok(report) => {
+                info!(
+                    target: EVENT,
+                    "topology revalidated vinst={vinst}: removed={} updated={} repaired={} orphaned={}",
+                    report.links_removed,
+                    report.links_updated,
+                    report.links_repaired,
+                    report.orphaned_nodes.len()
+                );
+
+                // Links the reconciliation took down or removed: revoke the visas
+                // crossing them through the ungated link path (zl-zipline#224). The
+                // policy sweep would skip a visa committed under this policy before the
+                // link went down, because its generation gate considers it current. A
+                // visa whose revocation write fails is quarantined and retried per visa.
+                for (a, b) in &report.links_down {
+                    let _ = crate::visa_reconciler::revoke_visas_over_link(asm, a, b).await;
+                }
+            }
+            Err(e) => reconciled = Err(e),
+        }
+    }
+
+    Ok(LockedPass::Applied {
+        psnap,
+        valid_node_addrs,
+        stopped_workers,
+        reconciled,
+    })
 }
 
 /// Fan the `requestAuthentication` VSS call out to every listed node
@@ -698,6 +796,156 @@ mod tests {
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
             None,
             "unreachable service must not leave stale attributes in place"
+        );
+    }
+
+    /// A policy update revalidates the topology and revokes visas over links it takes
+    /// down under the topology operation lock (TopoOps), so it cannot interleave with a
+    /// link-state report, disconnect or authentication.
+    #[tokio::test]
+    async fn test_policy_update_waits_for_the_topology_operation_lock() {
+        let (asm, _node_a) = build_sweep_asm(false).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let held = asm.topo_mgr.ops().await;
+                let update = tokio::task::spawn_local({
+                    let asm = asm.clone();
+                    async move { handle_policy_updated(&asm, vinst).await }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(!update.is_finished(), "policy pass must wait for the lock");
+                drop(held);
+                update.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    /// A policy install commits under the topology operation lock (round 13, Codex
+    /// P1): while a topology operation holds it, the current policy cannot change, so
+    /// a policy pass that reads the policy under the lock judges nodes and links on the
+    /// policy that is current for its whole run -- it can never disconnect a node, or
+    /// remove a link, on a policy superseded mid-pass.
+    #[tokio::test]
+    async fn test_policy_install_waits_for_the_topology_operation_lock() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let before = asm.policy_mgr.get_current_snapshot().vinst();
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let held = asm.topo_mgr.ops().await;
+                let install = tokio::task::spawn_local({
+                    let asm = asm.clone();
+                    async move {
+                        asm.policy_mgr
+                            .update_policy_from_container_bytes(make_node_join_policy(None))
+                            .await
+                    }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(!install.is_finished(), "install must wait for the lock");
+                assert_eq!(asm.policy_mgr.get_current_snapshot().vinst(), before);
+                drop(held);
+                install.await.unwrap().unwrap();
+            })
+            .await;
+
+        assert_eq!(asm.policy_mgr.get_current_snapshot().vinst(), before + 1);
+    }
+
+    /// Round 14 (Copilot): a policy installed during the pass's attribute refresh
+    /// makes the guarded part defer -- it judges no node and disconnects nothing --
+    /// because the actors were refreshed for the old policy. The newer policy's own
+    /// pass, queued behind it, refreshes and applies.
+    #[tokio::test]
+    async fn test_policy_pass_superseded_during_refresh_defers() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+        let a: IpAddr = "fd5a:5052::1".parse().unwrap();
+        // A offers "svc-y": fine under the first policy, not under the second.
+        let mut node_a = make_node_actor_defexp("fd5a:5052::1", "node-a", "[fd5a:5052::101]:1234");
+        node_a
+            .add_attribute(
+                Attribute::builder(key::SERVICES)
+                    .expires_in(Duration::from_secs(3600))
+                    .value("svc-y"),
+            )
+            .unwrap();
+        asm.actor_mgr
+            .add_node(&node_a, false, &Default::default())
+            .await
+            .unwrap();
+        asm.topo_mgr.add_node(a).unwrap();
+        // The pass refreshed under this policy...
+        let refreshed_vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        // ...and a newer one, under which A is invalid, landed before its guard.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(Some(vec![svc("svc-x")])))
+            .await
+            .unwrap();
+
+        let outcome = {
+            let ops = asm.topo_mgr.ops().await;
+            policy_pass_locked(&asm, &ops, refreshed_vinst)
+                .await
+                .unwrap()
+        };
+        assert!(matches!(outcome, LockedPass::Deferred));
+        assert_eq!(asm.actor_mgr.list_node_addrs().await.unwrap(), vec![a]);
+        assert!(asm.topo_mgr.has_node(&a));
+    }
+
+    /// The live-node set is read under the topology operation lock (round 13, Codex
+    /// P2): a node that disconnects before the pass takes the lock is not put back
+    /// into the router by the pass.
+    #[tokio::test]
+    async fn test_policy_pass_does_not_resurrect_a_disconnected_node() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+        let a: IpAddr = "fd5a:5052::1".parse().unwrap();
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp("fd5a:5052::1", "node-a", "[fd5a:5052::101]:1234"),
+                false,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        asm.topo_mgr.add_node(a).unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let held = asm.topo_mgr.ops().await;
+                let pass = tokio::task::spawn_local({
+                    let asm = asm.clone();
+                    async move { handle_policy_updated(&asm, vinst).await }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // A disconnects while the pass waits: the same steps as
+                // ConnectionControl::disconnect, under the lock this test holds.
+                asm.actor_mgr.remove_actor_by_zpr_addr(&a).await.unwrap();
+                asm.actor_mgr.remove_node(&a).await.unwrap();
+                asm.topo_mgr.remove_node(&held, &a).await;
+                drop(held);
+                pass.await.unwrap().unwrap();
+            })
+            .await;
+
+        assert!(
+            !asm.topo_mgr.has_node(&a),
+            "disconnected node must stay out of the router"
         );
     }
 

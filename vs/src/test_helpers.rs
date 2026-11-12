@@ -24,7 +24,6 @@ use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, PacketDesc, TcpUdpPep, Vi
 use zpr::write_to::WriteTo;
 
 use crate::assembly::Assembly;
-use crate::assembly::tests::new_assembly_for_tests;
 use crate::error::{ResolverError, ServiceError};
 use crate::policy_mgr::DnsResolver;
 
@@ -702,7 +701,17 @@ pub fn make_container_bytes(maj: u32, min: u32, patch: u32, policy: &[u8]) -> Ve
 /// The default (empty) policy denies everything (NoMatch), so with a route
 /// present the eval still denies — either way the sweep sees a deny.
 pub async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
-    let asm = new_assembly_for_tests(None).await;
+    let (asm, node_a, _db) = build_sweep_asm_with_db(with_link).await;
+    (asm, node_a)
+}
+
+/// As [build_sweep_asm], but also hands back the [crate::db::FakeDb] so a test can
+/// inject state-DB faults.
+pub async fn build_sweep_asm_with_db(
+    with_link: bool,
+) -> (Arc<Assembly>, IpAddr, Arc<crate::db::FakeDb>) {
+    let (asm, event_rx, db) = crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+    std::mem::forget(event_rx);
     let node_a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
     let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
     asm.actor_mgr
@@ -744,7 +753,7 @@ pub async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
         )
         .await
         .unwrap();
-    (Arc::new(asm), node_a)
+    (Arc::new(asm), node_a, db)
 }
 
 /// Create a single-node visa held (PendingInstall) by `req` for the given
@@ -770,12 +779,25 @@ pub async fn create_routed_sweep_visa(asm: &Arc<Assembly>, req: &IpAddr, vinst: 
 
 /// Create the sweep visa (`::4000::a` -> `::4000::b`, TCP 80) held by `req` on
 /// `route`, seeded at `vinst`. Returns its id.
-async fn create_sweep_visa_on_route(
+pub async fn create_sweep_visa_on_route(
     asm: &Arc<Assembly>,
     req: &IpAddr,
     vinst: u64,
     route: &Route,
 ) -> u64 {
+    try_create_sweep_visa_on_route(asm, req, vinst, route)
+        .await
+        .unwrap()
+}
+
+/// As [create_sweep_visa_on_route], but returns the issuance result instead of
+/// unwrapping it.
+pub async fn try_create_sweep_visa_on_route(
+    asm: &Arc<Assembly>,
+    req: &IpAddr,
+    vinst: u64,
+    route: &Route,
+) -> Result<u64, crate::error::ServiceError> {
     let pdesc = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 1234, 80).unwrap();
     let hit = Hit::new_no_signal(0, Direction::Forward);
     let vwmd = asm
@@ -791,9 +813,8 @@ async fn create_sweep_visa_on_route(
             vinst,
             SystemTime::now() + DEFAULT_EXPIRES,
         )
-        .await
-        .unwrap();
-    vwmd.visa.issuer_id
+        .await?;
+    Ok(vwmd.visa.issuer_id)
 }
 
 // ---- attribute-change sweep ----

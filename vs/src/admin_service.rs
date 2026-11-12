@@ -1520,7 +1520,9 @@ async fn get_network(
             let mut matched = false;
             for (i, nc) in topo.iter_mut().enumerate() {
                 if nc.is_link_between(&node_addr, &peer_addr) {
-                    if i < declared {
+                    // A link that link-state reports put down stays in the router
+                    // graph (zl-zipline#224) but is not UP.
+                    if i < declared && rstate.asm.topo_mgr.link_up(&node_addr, &peer_addr) {
                         nc.set_status(ConnectionType::UP);
                     }
                     matched = true;
@@ -2704,6 +2706,49 @@ mod tests {
             assert_eq!(nc.node_a_substrate, format!("[{}]:0", nc.node_a_addr));
             assert_eq!(nc.node_b_substrate, format!("[{}]:0", nc.node_b_addr));
             assert_eq!(nc.link_attrs.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    /// A declared link whose link-state reports put it down is DOWN, even though it
+    /// stays in the router graph (zl-zipline#224).
+    async fn test_get_network_link_reported_down_is_down() {
+        use libeval::route::LinkId;
+
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let addr_a: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let addr_b: IpAddr = "fd5a:5052::11".parse().unwrap();
+        install_ab_peering(&asm, addr_a, addr_b).await;
+        for (addr, cn) in [("fd5a:5052::10", "node-a"), ("fd5a:5052::11", "node-b")] {
+            asm.actor_mgr
+                .add_node(
+                    &make_node_actor_defexp(addr, cn, "[fd5a:5052::100]:1234"),
+                    false,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        asm.topo_mgr.add_node(addr_a).unwrap();
+        asm.topo_mgr.add_node(addr_b).unwrap();
+        asm.topo_mgr
+            .add_link(addr_a, addr_b, LinkId("link-ab".into()), vec![], 1)
+            .unwrap();
+        // A reports an empty snapshot: its link to B is not up.
+        asm.topo_mgr.record_link_states_with_cns(
+            &asm.topo_mgr.ops_now(),
+            &addr_a,
+            None,
+            vec![],
+            &|_: &IpAddr| None,
+        );
+
+        let details = fetch_network(&asm).await;
+
+        assert_eq!(details.network.len(), 1);
+        for nc in &details.network {
+            assert!(nc.is_link_between(&addr_a, &addr_b));
+            assert!(matches!(nc.ctype, ConnectionType::DOWN));
         }
     }
 

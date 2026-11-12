@@ -43,7 +43,9 @@ use crate::logging::targets::CC;
 use crate::net_mgr;
 use crate::oidc::{NonceExpectation, OidcError, OidcTrustedService, validate_id_token};
 use crate::policy_mgr::PolicySnapshot;
+use crate::topology_mgr::TopoOps;
 use crate::trusted_services::{TrustedServicesMgr, derive_user_authority, lookup_identities};
+use crate::vss_mgr::VssHandle;
 
 // TODO: move to libeval
 const CLASS_DEVICE: &str = "device";
@@ -1882,6 +1884,12 @@ impl ConnectionControl {
     /// This is used only for policy disconnect calls over the VSAPI or for a policy instigated disconnect.
     /// In both cases, it is safe to remove all state for the disconnecting actor.
     ///
+    /// A topology operation (TopoOps invariant): the local teardown runs under one
+    /// guard, from the actor lookup to the last state removal, so a reconnect of the
+    /// same node is either fully before it or fully after it and its state is never
+    /// torn down by a disconnect that started earlier. A node's VSS worker is stopped
+    /// after the guard is released, since stopping waits on that worker.
+    ///
     /// ### Errors
     /// Most cleanup failures are logged and swallowed (the caller can't act on them). Only these
     /// propagate as `Err`:
@@ -1894,6 +1902,50 @@ impl ConnectionControl {
         asm: Arc<Assembly>,
         zpr_addr: IpAddr,
         reason: vsapi::DisconnectReason,
+    ) -> Result<(), ServiceError> {
+        let ops = asm.topo_mgr.ops().await;
+        let (vss, result) = self.disconnect_locked(&ops, &asm, zpr_addr, reason).await;
+        drop(ops);
+        Self::stop_vss_worker(vss, &zpr_addr).await;
+        result
+    }
+
+    /// Stop a disconnected node's VSS worker, if it had one. Call with no
+    /// [TopoOps] held.
+    pub async fn stop_vss_worker(vss: Option<VssHandle>, zpr_addr: &IpAddr) {
+        if let Some(vss_hndl) = vss {
+            if let Err(e) = vss_hndl.stop().await {
+                error!(target: CC, "failed to stop VSS worker for disconnected node at addr {zpr_addr}: {e}");
+            }
+        }
+    }
+
+    /// The local teardown of [Self::disconnect], under the caller's topology guard
+    /// (for a caller that already holds one, such as the policy pass). Returns the
+    /// node's VSS worker handle, which the caller stops with [Self::stop_vss_worker]
+    /// after releasing the guard, and the teardown result.
+    pub async fn disconnect_locked(
+        &self,
+        ops: &TopoOps<'_>,
+        asm: &Arc<Assembly>,
+        zpr_addr: IpAddr,
+        reason: vsapi::DisconnectReason,
+    ) -> (Option<VssHandle>, Result<(), ServiceError>) {
+        let mut vss = None;
+        let result = self
+            .teardown_actor(ops, asm, zpr_addr, reason, &mut vss)
+            .await;
+        (vss, result)
+    }
+
+    /// Body of [Self::disconnect_locked]; sets `vss` to the node's VSS worker handle.
+    async fn teardown_actor(
+        &self,
+        ops: &TopoOps<'_>,
+        asm: &Arc<Assembly>,
+        zpr_addr: IpAddr,
+        reason: vsapi::DisconnectReason,
+        vss: &mut Option<VssHandle>,
     ) -> Result<(), ServiceError> {
         info!(target: CC, "disconnect actor at {} for reason {:?}", zpr_addr, reason);
 
@@ -1920,12 +1972,9 @@ impl ConnectionControl {
 
         if let Some(actor) = maybe_actor {
             if actor.is_node() {
-                asm.topo_mgr.remove_node(&zpr_addr).await;
-                if let Some(vss_hndl) = asm.vss_mgr.get_handle(&zpr_addr) {
-                    if let Err(e) = vss_hndl.stop().await {
-                        error!(target: CC, "failed to stop VSS worker for disconnected node at addr {zpr_addr}: {e}");
-                    }
-                } else {
+                asm.topo_mgr.remove_node(ops, &zpr_addr).await;
+                *vss = asm.vss_mgr.get_handle(&zpr_addr);
+                if vss.is_none() {
                     debug!(target: CC, "no VSS worker found for disconnected node at addr {zpr_addr}");
                 }
                 let connected_adapters = match asm
@@ -1940,7 +1989,7 @@ impl ConnectionControl {
                     }
                 };
                 removed_zpr_addrs.extend(
-                    self.remove_departed_adapters(&asm, &connected_adapters)
+                    self.remove_departed_adapters(asm, &connected_adapters)
                         .await,
                 );
                 asm.actor_mgr.remove_node(&zpr_addr).await?;
@@ -3208,6 +3257,55 @@ mod tests {
             ["hr".to_string()],
             "exactly the user-vending source names the authority"
         );
+    }
+
+    /// Disconnect removes the node from the router under the topology operation lock
+    /// (TopoOps), so it cannot interleave with a link-state report or policy pass.
+    #[tokio::test]
+    async fn disconnect_waits_for_the_topology_operation_lock() {
+        use crate::test_helpers::make_node_actor_defexp;
+
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = Arc::new(make_cc("test-vs"));
+        let node_addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        asm.topo_mgr.add_node(node_addr).unwrap();
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let held = asm.topo_mgr.ops().await;
+                let dc = tokio::task::spawn_local({
+                    let (asm, cc) = (asm.clone(), cc.clone());
+                    async move {
+                        cc.disconnect(asm, node_addr, vsapi::DisconnectReason::Admin)
+                            .await
+                    }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(!dc.is_finished(), "disconnect must wait for the lock");
+                assert!(
+                    asm.topo_mgr.has_node(&node_addr),
+                    "router untouched while held"
+                );
+                // The whole local teardown is under the guard (round 13, Copilot):
+                // a disconnect that has not started cannot have removed the actor.
+                assert!(
+                    asm.actor_mgr
+                        .get_actor_by_zpr_addr(&node_addr)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "actor untouched while held"
+                );
+                drop(held);
+                dc.await.unwrap().unwrap();
+                assert!(!asm.topo_mgr.has_node(&node_addr));
+            })
+            .await;
     }
 
     /// Disconnect purges recorded trusted-service revisions for the actor AND for every

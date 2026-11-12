@@ -141,6 +141,60 @@ pub(crate) async fn revalidate_visas(
     );
 }
 
+/// Revoke every live visa whose path crosses the link between nodes `a` and `b` (either
+/// direction), because link-state reports say that link is down (zl-zipline#224).
+///
+/// A visa crosses the link when `a` and `b` are adjacent in its recorded node path
+/// (`VisaMetadata.path`). Each such visa is marked `PendingRevoke` on all its nodes
+/// through the ungated [VisaMgr::mark_visa_revoked] -- the same path the attribute
+/// sweep uses -- so VSS housekeeping revokes it and the flow re-requests, getting a
+/// route that avoids the link. A visa with no path (both actors on one node) never
+/// crosses a link.
+///
+/// Every crossing visa is attempted even if some writes fail. A visa whose write fails
+/// is quarantined ([VisaMgr::quarantine]): withheld from distribution and retried on
+/// every pending-visa read. Returns `Ok(marked)` when every write succeeded, or
+/// `Err(failed)` with the number quarantined.
+///
+/// [VisaMgr::quarantine]: crate::visa_mgr::VisaMgr::quarantine
+///
+/// [VisaMgr::mark_visa_revoked]: crate::visa_mgr::VisaMgr::mark_visa_revoked
+pub(crate) async fn revoke_visas_over_link(
+    asm: &Arc<Assembly>,
+    a: &std::net::IpAddr,
+    b: &std::net::IpAddr,
+) -> Result<usize, usize> {
+    let mut revoked = 0;
+    let mut failed = 0;
+    for (visa_id, metadata) in asm.visa_mgr.list_visa_metadata().await {
+        let Some(path) = &metadata.path else {
+            continue;
+        };
+        let crosses = path
+            .windows(2)
+            .any(|hop| (hop[0] == *a && hop[1] == *b) || (hop[0] == *b && hop[1] == *a));
+        if !crosses {
+            continue;
+        }
+        match asm.visa_mgr.mark_visa_revoked(visa_id).await {
+            Ok(true) => revoked += 1,
+            Ok(false) => {} // already being revoked
+            Err(e) => {
+                failed += 1;
+                // Retried per visa from now on, independent of the link or reports.
+                asm.visa_mgr.quarantine(visa_id);
+                warn!(target: VISA, "link {a} <-> {b} down: failed to revoke visa {visa_id}, quarantined for retry: {e}")
+            }
+        }
+    }
+    info!(target: VISA, "link {a} <-> {b} down: revoked {revoked} visa(s) crossing it, {failed} failed");
+    if failed == 0 {
+        Ok(revoked)
+    } else {
+        Err(failed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +393,268 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    // --- Revoke on link down (zl-zipline#224) ---
+
+    /// A visa whose path crosses the downed link is marked PendingRevoke; a visa that
+    /// does not cross it is left alone.
+    #[tokio::test]
+    async fn test_revoke_visas_over_link_hits_only_crossing_visas() {
+        use crate::test_helpers::create_routed_sweep_visa;
+        let (asm, node_a) = build_sweep_asm(true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let crossing = create_routed_sweep_visa(&asm, &node_a, 0).await;
+        let local = create_sweep_visa(&asm, &node_a, 0).await; // direct, no path
+
+        // Either argument order names the same undirected link.
+        assert_eq!(revoke_visas_over_link(&asm, &node_b, &node_a).await, Ok(1));
+
+        let revoked = asm
+            .visa_mgr
+            .get_pending_revoke_visa_ids_for_node(&node_a)
+            .await
+            .unwrap();
+        assert_eq!(revoked, vec![crossing]);
+        let pending = asm
+            .visa_mgr
+            .get_pending_visa_ids_for_node(&node_a)
+            .await
+            .unwrap();
+        assert!(pending.contains(&local), "a visa off the link stays");
+    }
+
+    /// A link between two other nodes revokes nothing.
+    #[tokio::test]
+    async fn test_revoke_visas_over_unrelated_link_revokes_nothing() {
+        use crate::test_helpers::create_routed_sweep_visa;
+        let (asm, node_a) = build_sweep_asm(true).await;
+        create_routed_sweep_visa(&asm, &node_a, 0).await;
+        let x: IpAddr = "fd5a:5052:3000::8".parse().unwrap();
+        let y: IpAddr = "fd5a:5052:3000::9".parse().unwrap();
+        assert_eq!(revoke_visas_over_link(&asm, &x, &y).await, Ok(0));
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A visa issued on a route whose link went down after the route was chosen is
+    /// revoked as it is committed, not left for a sweep that already ran.
+    #[tokio::test]
+    async fn test_visa_on_a_route_that_went_down_is_revoked_at_commit() {
+        use crate::test_helpers::try_create_sweep_visa_on_route;
+        let (asm, node_a) = build_sweep_asm(true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let route = asm.topo_mgr.get_best_route(&node_a, &node_b).unwrap();
+
+        // The link goes down between route selection and commit.
+        let down = asm.topo_mgr.record_link_states_with_cns(
+            &asm.topo_mgr.ops_now(),
+            &node_a,
+            None,
+            vec![],
+            &|_: &IpAddr| None,
+        );
+        assert_eq!(down, vec![(node_a, node_b)]);
+        assert!(
+            try_create_sweep_visa_on_route(&asm, &node_a, 0, &route)
+                .await
+                .is_err(),
+            "a visa on a route that went down is not issued, even once revoked"
+        );
+
+        let revoked = asm
+            .visa_mgr
+            .get_pending_revoke_visa_ids_for_node(&node_a)
+            .await
+            .unwrap();
+        assert_eq!(revoked.len(), 1, "the stored visa is revoked");
+    }
+
+    /// A link revocation whose state write fails quarantines the visa: it is not
+    /// handed out while the write keeps failing, and the next pending-visa read
+    /// revokes it once writes work again -- whatever happens to the link meanwhile.
+    #[tokio::test]
+    async fn test_failed_link_revocation_quarantines_the_visa() {
+        use crate::db::FaultMode;
+        use crate::test_helpers::{build_sweep_asm_with_db, create_routed_sweep_visa};
+        let (asm, node_a, db) = build_sweep_asm_with_db(true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
+
+        db.set_set_ex_fault(FaultMode::Reject);
+        assert_eq!(revoke_visas_over_link(&asm, &node_a, &node_b).await, Err(1));
+        let pending = asm
+            .visa_mgr
+            .get_pending_visas_for_node(&node_a)
+            .await
+            .unwrap();
+        assert!(pending.iter().all(|v| v.issuer_id != id), "quarantined");
+
+        db.set_set_ex_fault(FaultMode::None);
+        asm.visa_mgr
+            .get_pending_visas_for_node(&node_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap(),
+            vec![id],
+            "the quarantine retry revoked it"
+        );
+    }
+
+    /// A commit-time revocation whose state write fails quarantines the visa: the
+    /// issuance fails, the visa is not handed out, and its revocation is retried.
+    #[tokio::test]
+    async fn test_commit_time_revocation_failure_is_retained_for_retry() {
+        use crate::db::FaultMode;
+        use crate::test_helpers::{build_sweep_asm_with_db, create_routed_sweep_visa};
+        let (asm, node_a, db) = build_sweep_asm_with_db(true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let route = asm.topo_mgr.get_best_route(&node_a, &node_b).unwrap();
+        let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
+
+        // The link goes down; the commit-time check runs and its revocation fails.
+        // (Same for a route link that was removed outright: no endpoints needed.)
+        asm.topo_mgr.record_link_states_with_cns(
+            &asm.topo_mgr.ops_now(),
+            &node_a,
+            None,
+            vec![],
+            &|_: &IpAddr| None,
+        );
+        db.set_set_ex_fault(FaultMode::Reject);
+        assert!(
+            asm.visa_mgr
+                .revoke_if_route_down(&asm, id, &route.links, None, None)
+                .await
+                .is_err(),
+            "a stale visa that could not be revoked must not be issued"
+        );
+        // Quarantined: not handed out while its revocation keeps failing.
+        let pending = asm
+            .visa_mgr
+            .get_pending_visas_for_node(&node_a)
+            .await
+            .unwrap();
+        assert!(
+            pending.iter().all(|v| v.issuer_id != id),
+            "an unrevoked stale visa must not be distributed"
+        );
+
+        // Once the write works again, the next pending-visa read revokes it.
+        db.set_set_ex_fault(FaultMode::None);
+        let pending = asm
+            .visa_mgr
+            .get_pending_visas_for_node(&node_a)
+            .await
+            .unwrap();
+        assert!(pending.iter().all(|v| v.issuer_id != id));
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap(),
+            vec![id],
+            "the retry revoked it"
+        );
+
+        // A live visa whose route is still up is left alone (the revoked one above
+        // stays unissuable whatever its route does).
+        let live = crate::test_helpers::create_sweep_visa(&asm, &node_a, 1).await;
+        assert!(
+            asm.visa_mgr
+                .revoke_if_route_down(&asm, live, &[], None, None)
+                .await
+                .is_ok()
+        );
+    }
+
+    /// Round 16 (Copilot): `register_vss` prepares its visas outside the topology
+    /// lock and filters them under it with `still_grantable`: a visa revoked or
+    /// quarantined meanwhile, or no longer staged for the node, is not granted.
+    #[tokio::test]
+    async fn test_still_grantable_filters_revoked_and_quarantined_visas() {
+        let (asm, node_a) = build_sweep_asm(true).await;
+        let fresh = crate::test_helpers::create_sweep_visa(&asm, &node_a, 0).await;
+        assert!(asm.visa_mgr.still_grantable(fresh, &node_a));
+
+        let revoked = crate::test_helpers::create_sweep_visa(&asm, &node_a, 1).await;
+        assert!(asm.visa_mgr.mark_visa_revoked(revoked).await.unwrap());
+        assert!(!asm.visa_mgr.still_grantable(revoked, &node_a));
+
+        let quarantined = crate::test_helpers::create_sweep_visa(&asm, &node_a, 2).await;
+        asm.visa_mgr.quarantine(quarantined);
+        assert!(!asm.visa_mgr.still_grantable(quarantined, &node_a));
+
+        let elsewhere: IpAddr = "fd5a:5052:3000::99".parse().unwrap();
+        assert!(!asm.visa_mgr.still_grantable(fresh, &elsewhere));
+    }
+
+    /// Round 16 (Copilot): a visa revoked between being stored and the commit-time
+    /// check -- the link went down, its revocation pass marked the visa, and the link
+    /// came back up -- is not issued, although its route looks valid again. Link
+    /// recovery must not make a revoked visa issuable.
+    #[tokio::test]
+    async fn test_visa_revoked_during_issuance_is_not_issued_after_recovery() {
+        use crate::test_helpers::create_routed_sweep_visa;
+        let (asm, node_a) = build_sweep_asm(true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let route = asm.topo_mgr.get_best_route(&node_a, &node_b).unwrap();
+        let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
+        // The link-down pass revoked it; the link is up again now.
+        assert!(asm.visa_mgr.mark_visa_revoked(id).await.unwrap());
+
+        assert!(
+            asm.visa_mgr
+                .revoke_if_route_down(&asm, id, &route.links, None, None)
+                .await
+                .is_err(),
+            "a revoked visa must not be issued"
+        );
+    }
+
+    /// A path that no longer ends at the destination's docking node is stale even if
+    /// every route link is up and joins the path's hops (a link id moved before the
+    /// path was derived from the router): the visa is revoked and not issued.
+    #[tokio::test]
+    async fn test_path_not_ending_at_the_egress_node_is_rejected() {
+        use crate::test_helpers::create_routed_sweep_visa;
+        let (asm, node_a) = build_sweep_asm(true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let elsewhere: IpAddr = "fd5a:5052:3000::9".parse().unwrap();
+        let route = asm.topo_mgr.get_best_route(&node_a, &node_b).unwrap();
+        let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
+        let path = [node_a, node_b];
+
+        assert!(
+            asm.visa_mgr
+                .revoke_if_route_down(&asm, id, &route.links, Some(&path), Some(node_b))
+                .await
+                .is_ok(),
+            "path ends at the egress node: valid"
+        );
+        assert!(
+            asm.visa_mgr
+                .revoke_if_route_down(&asm, id, &route.links, Some(&path), Some(elsewhere))
+                .await
+                .is_err(),
+            "path ends somewhere else: stale"
+        );
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap(),
+            vec![id]
         );
     }
 }
