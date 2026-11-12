@@ -832,15 +832,17 @@ impl PolicyResolver {
     /// vsapi `Link` struct is deliberately deferred to the topology-message send path.
     ///
     /// A peer whose remote substrate address is not in policy (the node reports its own,
-    /// zl-zipline#225) is skipped with a warning: no link can be sent without an address
-    /// yet. zl-zipline#227 fills it in from the address the node reports.
+    /// zl-zipline#225) has nothing to resolve and is left out here; the topology send
+    /// fills its address in from the node's report (`vss_worker::topology_links`,
+    /// zl-zipline#227).
     async fn resolve_peers(&self, peers: &[Peer]) -> Result<Vec<ResolvedPeer>, ResolverError> {
         let addressed = peers.iter().filter_map(|peer| match &peer.remote_substrate {
             Some(naddr) => Some((peer, naddr)),
+            // Normal for a Zode endpoint (ZIPLINE never puts their addresses in policy).
             None => {
-                warn!(
+                debug!(
                     target: MAIN,
-                    "link {}: no substrate address in policy for peer {}; skipping it until the node reports one",
+                    "link {}: no substrate address in policy for peer {}; the topology send uses the address it reports",
                     peer.link_id, peer.remote_zpr_addr
                 );
                 None

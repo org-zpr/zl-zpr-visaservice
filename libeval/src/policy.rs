@@ -96,7 +96,8 @@ pub struct Peer {
 
     /// Substrate (physical/underlay) address used to reach the remote peer. `None` when
     /// policy gives no address for that end: the node reports its own when it
-    /// authenticates (zpr-core#1381, zl-zipline#225); zl-zipline#227 fills it in.
+    /// authenticates (zpr-core#1381, zl-zipline#225); the visa service's topology send
+    /// uses that reported address (zl-zipline#227).
     pub remote_substrate: Option<NetAddr>,
 
     /// Substrate (physical/underlay) address of *this* node (the node this peer list is

@@ -13,6 +13,7 @@ use tokio_rustls::TlsConnector;
 use tokio_util::compat::*;
 use tracing::{debug, error, info, trace, warn};
 
+use libeval::attribute::key;
 use libeval::policy::Policy;
 use zpr::vsapi::v1;
 use zpr::vsapi_types::{
@@ -584,6 +585,46 @@ fn tls_connect() -> TlsConnector {
     TlsConnector::from(Arc::new(cfg))
 }
 
+/// The substrate address `node_addr`'s peer at `peer_zpr_addr` is dialled at, for its
+/// topology `Link.peer` (zl-zipline#227):
+///
+/// 1. the address policy declares for it (`policy_addr`, DNS-resolved), if any;
+/// 2. else the address the peer reported -- the `key::SUBSTRATE_ADDR` claim of the node
+///    actor stored at its ZPR address (written by `connect`, `open` and
+///    `updateSubstrateAddr` through `accept_reported_substrate`);
+/// 3. else unspecified, `[::]:0`: the peer has not connected (pd g72 q4). The node does
+///    not dial it, and still accepts its inbound link by CN, which is how a laptop
+///    endpoint with no address in policy joins through the relay.
+///
+/// Only a node actor's claim counts. Trusting the report steers only where peers dial:
+/// the link still needs the peer's CA-signed certificate with the expected CN.
+async fn peer_substrate_addr(
+    asm: &Assembly,
+    policy_addr: Option<SocketAddr>,
+    peer_zpr_addr: &IpAddr,
+) -> SocketAddr {
+    if let Some(addr) = policy_addr {
+        return addr;
+    }
+    let reported = match asm.actor_mgr.get_actor_by_zpr_addr(peer_zpr_addr).await {
+        Ok(Some(actor)) if actor.is_node() => actor
+            .get_attribute(key::SUBSTRATE_ADDR)
+            .and_then(|a| a.get_single_value().ok().map(str::to_string))
+            .and_then(|v| v.parse::<SocketAddr>().ok()),
+        Ok(_) => None,
+        Err(e) => {
+            warn!(target: VSS, "cannot read the reported substrate address of peer {peer_zpr_addr}: {e}");
+            None
+        }
+    };
+    reported.unwrap_or(UNKNOWN_PEER_ADDR)
+}
+
+/// `Link.peer` for a peer whose address is not known yet: don't dial, accept its
+/// inbound link by CN (see [peer_substrate_addr]).
+const UNKNOWN_PEER_ADDR: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0);
+
 /// Wrap a Cap'n Proto RPC future with a timeout, mapping errors.
 async fn rpc_with_timeout<F, T>(
     name: &'static str,
@@ -823,29 +864,31 @@ async fn vss_do_set_topology(
     check_ok_or_error(set_response_ok_or_err.get_res().unwrap())
 }
 
-/// The `Link`s of `node_addr`'s topology message: one per resolved peer, each naming the
-/// peer's ZPR address and CN, and carrying the peer's bootstrap visas when it may need them
-/// (see [visa_bootstrap::visas_for_link]).
+/// The `Link`s of `node_addr`'s topology message: one per peer policy declares for it,
+/// each naming the peer's substrate address, ZPR address and CN, and carrying the peer's
+/// bootstrap visas when it may need them (see [visa_bootstrap::visas_for_link]).
 ///
-/// `policy` must be the snapshot `peers` was computed from, as for [vss_do_set_topology].
+/// `resolved` holds the DNS-resolved substrate addresses policy declares for these
+/// peers; `policy` must be the snapshot they were resolved from, as for
+/// [vss_do_set_topology]. A peer's address is read at call time ([peer_substrate_addr]),
+/// so a send after a peer reported a new address carries it.
 pub(crate) async fn topology_links(
     asm: &Arc<Assembly>,
     policy: &Arc<Policy>,
     node_addr: &IpAddr,
-    peers: Vec<ResolvedPeer>,
+    resolved: Vec<ResolvedPeer>,
 ) -> Result<Vec<Link>, VssSyncError> {
     // Both ends of an edge share a link_id, and each end's `remote_zpr_addr` is only
-    // meaningful under its own node key -- so resolve the link within `node_addr`'s peers.
+    // meaningful under its own node key -- so iterate `node_addr`'s own peer entries.
     let node_peers = policy.get_peers_for_node(node_addr).unwrap_or_default();
-    let mut links: Vec<Link> = Vec::with_capacity(peers.len());
-    for (link_id, sock_addr) in peers {
-        // `zpr_addr` is required on the wire (the reader rejects a link without it), so a
-        // link with no peer entry cannot be sent at all anymore: skip it instead of the old
-        // "send without bootstrap visas" fallback.
-        let Some(peer) = node_peers.iter().find(|p| p.link_id == link_id) else {
-            warn!(target: VSS, "no peer entry for link {link_id} under node {node_addr}; skipping it (zprAddr unknown)");
-            continue;
-        };
+    let mut links: Vec<Link> = Vec::with_capacity(node_peers.len());
+    for peer in node_peers {
+        let link_id = peer.link_id.clone();
+        let policy_addr = resolved
+            .iter()
+            .find(|(id, _)| *id == link_id)
+            .map(|(_, sock_addr)| *sock_addr);
+        let sock_addr = peer_substrate_addr(asm, policy_addr, &peer.remote_zpr_addr).await;
         // The CN the peer's link certificate must carry (zl-zipline#221). A peer policy does
         // not name is left out (operator, pd g44 q2): its node would refuse an unnamed peer
         // (zl-zipline#220), and its bootstrap visas would have no CN to be bound to.

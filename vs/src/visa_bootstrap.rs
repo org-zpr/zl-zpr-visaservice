@@ -345,29 +345,38 @@ mod tests {
         future_peers: &[IpAddr],
         node_cns: &[(IpAddr, &str)],
     ) -> Assembly {
+        use crate::test_helpers::make_peering;
+        let peerings: Vec<_> = future_peers
+            .iter()
+            .enumerate()
+            .map(|(i, peer)| {
+                let link_id = if i == 0 {
+                    "link-vp".to_string()
+                } else {
+                    format!("link-vp{i}")
+                };
+                make_peering(via_node, *peer, &link_id, vec![])
+            })
+            .collect();
+        build_bootstrap_test_asm_from_peerings(via_node, &peerings, node_cns).await
+    }
+
+    /// As [build_bootstrap_test_asm_with_cns], with the policy's peerings given as is
+    /// (so a test can leave an end's substrate address unset).
+    async fn build_bootstrap_test_asm_from_peerings(
+        via_node: IpAddr,
+        peerings: &[zpr::policy_types::Peering],
+        node_cns: &[(IpAddr, &str)],
+    ) -> Assembly {
         use crate::db::PolicyRepo;
         use crate::policy_mgr::PolicyMgr;
-        use crate::test_helpers::{FakeResolver, make_peering, policy_with_peerings_and_node_cns};
+        use crate::test_helpers::{FakeResolver, policy_with_peerings_and_node_cns};
         use crate::trusted_services::TrustedServicesMgr;
         use std::path::PathBuf;
 
         let mut asm = new_assembly_for_tests(None).await;
         asm.policy_mgr = PolicyMgr::new_with_initial_policy(
-            policy_with_peerings_and_node_cns(
-                &future_peers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, peer)| {
-                        let link_id = if i == 0 {
-                            "link-vp".to_string()
-                        } else {
-                            format!("link-vp{i}")
-                        };
-                        make_peering(via_node, *peer, &link_id, vec![])
-                    })
-                    .collect::<Vec<_>>(),
-                node_cns,
-            ),
+            policy_with_peerings_and_node_cns(peerings, node_cns),
             PolicyRepo::new(asm.state_db.clone()),
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
@@ -808,5 +817,154 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- Link.peer from the reported address (zl-zipline#227) ---
+
+    const RELAY: &str = "fd5a:5052:3000::1";
+    const LAPTOP: &str = "fd5a:5052:3000::7";
+    const LAPTOP_REPORTED: &str = "192.0.2.7:7000";
+
+    /// Relay (docks the VS) linked to a laptop; `laptop_in_policy` says whether policy
+    /// declares the laptop's substrate address (`[laptop]:0`) or leaves it unset.
+    async fn relay_laptop_asm(laptop_in_policy: bool) -> (Arc<Assembly>, IpAddr, IpAddr) {
+        use crate::test_helpers::make_peering;
+        let relay: IpAddr = RELAY.parse().unwrap();
+        let laptop: IpAddr = LAPTOP.parse().unwrap();
+        let mut peering = make_peering(relay, laptop, "link-vp", vec![]);
+        if !laptop_in_policy {
+            peering.substrate_b = None;
+        }
+        let asm = build_bootstrap_test_asm_from_peerings(
+            relay,
+            &[peering],
+            &[(relay, "relay.zpr"), (laptop, "laptop.zpr")],
+        )
+        .await;
+        (Arc::new(asm), relay, laptop)
+    }
+
+    /// Connect the laptop as a node that reported [LAPTOP_REPORTED].
+    async fn connect_laptop(asm: &Assembly) {
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp(LAPTOP, "laptop.zpr", LAPTOP_REPORTED),
+                false,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The relay's topology links, built the way `send_topology` builds them.
+    async fn relay_links(asm: &Arc<Assembly>, relay: &IpAddr) -> Vec<zpr::vsapi_types::Link> {
+        crate::vss_worker::topology_links(
+            asm,
+            &asm.policy_mgr.get_current(),
+            relay,
+            resolved_peers(asm, relay),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn sock(link: &zpr::vsapi_types::Link) -> std::net::SocketAddr {
+        std::net::SocketAddr::from(link.peer.clone())
+    }
+
+    /// A peer whose address policy declares gets the policy address, whatever its
+    /// actor reports.
+    #[tokio::test]
+    async fn topology_link_peer_is_the_policy_address_when_declared() {
+        let (asm, relay, laptop) = relay_laptop_asm(true).await;
+        connect_laptop(&asm).await;
+        let links = relay_links(&asm, &relay).await;
+        assert_eq!(links.len(), 1);
+        assert_eq!(sock(&links[0]), std::net::SocketAddr::new(laptop, 0));
+    }
+
+    /// A connected peer with no address in policy gets the address it reported.
+    #[tokio::test]
+    async fn topology_link_peer_is_the_reported_address_of_a_connected_peer() {
+        let (asm, relay, _laptop) = relay_laptop_asm(false).await;
+        connect_laptop(&asm).await;
+        let links = relay_links(&asm, &relay).await;
+        assert_eq!(links.len(), 1);
+        assert_eq!(sock(&links[0]), LAPTOP_REPORTED.parse().unwrap());
+        assert!(
+            links[0].visas.is_empty(),
+            "a connected peer needs no bootstrap visas"
+        );
+    }
+
+    /// A peer with no address in policy that has not connected yet is still sent, with
+    /// the unspecified address `[::]:0` (don't dial; accept its inbound link by CN), its
+    /// CN, and -- on the relay -- its two bootstrap visas (pd g72 q4). Before #227 the
+    /// link was left out, so such a peer could never join.
+    #[tokio::test]
+    async fn topology_link_to_an_unreported_peer_is_unspecified_and_carries_bootstrap_visas() {
+        let (asm, relay, laptop) = relay_laptop_asm(false).await;
+        let links = relay_links(&asm, &relay).await;
+        assert_eq!(links.len(), 1, "the joiner's link must be sent");
+        let link = &links[0];
+        assert_eq!(sock(link), "[::]:0".parse().unwrap());
+        assert_eq!(link.zpr_addr, laptop);
+        assert_eq!(link.peer_cn, "laptop.zpr");
+        assert_eq!(link.visas.len(), 2, "both bootstrap directions");
+    }
+
+    /// Only a node's report counts: an actor at the peer's address that is not a node
+    /// leaves the address unspecified.
+    #[tokio::test]
+    async fn topology_link_ignores_a_non_node_actor_at_the_peer_address() {
+        let (asm, relay, _laptop) = relay_laptop_asm(false).await;
+        let mut adapter = crate::test_helpers::make_adapter_actor_defexp(LAPTOP, "imposter");
+        adapter
+            .add_attribute(
+                libeval::attribute::Attribute::builder(libeval::attribute::key::SUBSTRATE_ADDR)
+                    .value(LAPTOP_REPORTED),
+            )
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&adapter, &relay, &Default::default())
+            .await
+            .unwrap();
+        let links = relay_links(&asm, &relay).await;
+        assert_eq!(sock(&links[0]), "[::]:0".parse().unwrap());
+    }
+
+    /// A direct link between two endpoints, neither with an address in policy, both
+    /// connected: each end is told the other's reported address.
+    #[tokio::test]
+    async fn topology_link_between_two_endpoints_uses_both_reported_addresses() {
+        use crate::test_helpers::make_peering;
+        let relay: IpAddr = RELAY.parse().unwrap();
+        let x: IpAddr = "fd5a:5052:3000::a".parse().unwrap();
+        let y: IpAddr = "fd5a:5052:3000::b".parse().unwrap();
+        let mut peering = make_peering(x, y, "link-xy", vec![]);
+        peering.substrate_a = None;
+        peering.substrate_b = None;
+        let asm = Arc::new(
+            build_bootstrap_test_asm_from_peerings(
+                relay,
+                &[peering],
+                &[(x, "x.zpr"), (y, "y.zpr")],
+            )
+            .await,
+        );
+        for (addr, cn, reported) in [(x, "x.zpr", "192.0.2.10:1"), (y, "y.zpr", "192.0.2.11:2")] {
+            asm.actor_mgr
+                .add_node(
+                    &make_node_actor_defexp(&addr.to_string(), cn, reported),
+                    false,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let x_links = relay_links(&asm, &x).await;
+        let y_links = relay_links(&asm, &y).await;
+        assert_eq!(sock(&x_links[0]), "192.0.2.11:2".parse().unwrap());
+        assert_eq!(sock(&y_links[0]), "192.0.2.10:1".parse().unwrap());
     }
 }
