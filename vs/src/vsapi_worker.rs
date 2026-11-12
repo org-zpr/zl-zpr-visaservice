@@ -3926,6 +3926,15 @@ mod tests {
                         }
                         req.send().promise
                     };
+                    // B reports its end up, so A's snapshots alone decide the link
+                    // (R14: both ends must report up).
+                    asm.topo_mgr.record_link_states(
+                        &asm.topo_mgr.ops().await,
+                        &NODE_B.parse().unwrap(),
+                        None,
+                        vec![entry("node-a", LinkState::Up)],
+                        &|| asm.policy_mgr.get_current_snapshot(),
+                    );
                     // Down, then up: the up snapshot is the node's latest word.
                     let held = asm.topo_mgr.ops().await;
                     let down = send(vec![]);

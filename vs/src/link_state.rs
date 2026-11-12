@@ -1,5 +1,5 @@
 //! Link-state reports from nodes, and the rule that turns them into usable edges
-//! (zl-zipline#224).
+//! (zl-zipline#224; R14 of zl-zpr-dev-context `docs/ZODE_LINKS.md`).
 //!
 //! A node (Zode) tells the visa service which of its links are up with
 //! `VSHandle.reportLinkStates`. Each call is a **snapshot**: it lists every link the
@@ -7,18 +7,20 @@
 //! reported before. A link the node leaves out is not up.
 //!
 //! The router uses a link only while **both** of its ends report it up, so one node
-//! cannot claim a link its peer denies. This module holds the latest snapshot of every
-//! reporting node and answers that question for one edge; `TopologyMgr` applies the
-//! answer to the router (`Router::set_link_up`).
+//! cannot claim a link its peer denies. A link with no report counts as **down**
+//! (R14): a node that has not reported, or whose reports were forgotten, agrees to
+//! none of its links. This module holds the latest snapshot of every reporting node
+//! and answers that question for one edge; `TopologyMgr` applies the answer to the
+//! router (`Router::set_link_up`).
 //!
 //! Reports are stored by CN, exactly as sent, and resolved to addresses only when an
 //! edge is evaluated. A Zode reports its link to the relay before the endpoint at the
 //! other end has authenticated; resolving at receipt would drop that entry, and the
 //! snapshot is not re-sent while nothing changes.
 //!
-//! The table lives in memory only. After a visa-service restart every node counts as a
-//! non-reporter (see [LinkStateTable::end_agrees]) until it re-sends its snapshot, which
-//! nodes do after every (re)connect.
+//! The table lives in memory only. After a visa-service restart, or once a node's
+//! reports are forgotten ([LinkStateTable::remove_node]), that node's links are down
+//! until it reports again, which nodes do after every (re)connect.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -59,7 +61,7 @@ impl LinkStateTable {
     }
 
     /// Forget a node's reports (it disconnected or was reset). Afterwards it counts as a
-    /// non-reporter again.
+    /// non-reporter again, so its links are down until it reports again (R14).
     pub fn remove_node(&mut self, node: &IpAddr) {
         self.snapshots.remove(node);
         self.latest_session.remove(node);
@@ -80,26 +82,22 @@ impl LinkStateTable {
     }
 
     /// Does the `reporter` end of a link agree that the link to the peer whose CN is
-    /// `peer_cn` is up?
+    /// `peer_cn` is up? Only if its latest snapshot lists `peer_cn` as `up`.
     ///
-    /// - A node that has reported: only if its snapshot lists `peer_cn` as `up`. A peer
-    ///   whose CN is unknown (`None`) can never match, so the link is not up.
-    /// - A node that has never reported agrees (the legacy rule below).
+    /// A node that has never reported (or whose reports were forgotten) agrees to
+    /// nothing: a link with no report counts as down (R14). A peer whose CN is unknown
+    /// (`None`) can never match, so the link is not up.
     fn end_agrees(&self, reporter: &IpAddr, peer_cn: Option<&str>) -> bool {
-        match self.snapshots.get(reporter) {
-            Some(snapshot) => peer_cn.is_some_and(|cn| snapshot.get(cn) == Some(&LinkState::Up)),
-            // LEGACY RULE -- remove with zl-zipline#242 once every node reports (#223).
-            // A node that has never sent reportLinkStates (today's `ph`) keeps the old
-            // behaviour: a policy-declared link between two connected nodes counts as up.
-            // Its peer can still veto the link by reporting it down. Operator decision on
-            // pd gate g43 (q2 = legacy).
-            None => true,
-        }
+        let Some(snapshot) = self.snapshots.get(reporter) else {
+            return false;
+        };
+        peer_cn.is_some_and(|cn| snapshot.get(cn) == Some(&LinkState::Up))
     }
 
-    /// True if the link between `a` and `b` may carry routes: each end agrees that the
-    /// link to the other is up. `a_cn` and `b_cn` are the nodes' CNs as policy declares
-    /// them (`None` if policy names no CN for the address).
+    /// True if the link between `a` and `b` may carry routes: each end has reported the
+    /// link to the other as up (R14). A link either end has not reported is not
+    /// usable. `a_cn` and `b_cn` are the nodes' CNs as policy declares them (`None` if
+    /// policy names no CN for the address).
     pub fn edge_usable(
         &self,
         a: &IpAddr,
@@ -197,20 +195,20 @@ mod tests {
     }
 
     #[test]
-    fn non_reporter_agrees_legacy_rule() {
-        // Neither end has reported: today's behaviour, the edge is usable.
+    fn neither_end_reported_is_not_usable() {
+        // R14 (ZODE_LINKS.md): a link with no report counts as down.
         let t = LinkStateTable::new();
-        assert!(usable(&t));
+        assert!(!usable(&t));
+    }
 
-        // Only A reports, and says up: B is legacy, so the edge is usable.
+    #[test]
+    fn one_end_up_and_the_other_never_reported_is_not_usable() {
+        // R14: both ends must report up. B never reported, so B does not agree, in
+        // either argument order.
         let mut t = LinkStateTable::new();
         t.set_snapshot(ip(A), vec![entry("b.zpr", LinkState::Up)]);
-        assert!(usable(&t));
-
-        // Only A reports, and says down: A vetoes the link.
-        let mut t = LinkStateTable::new();
-        t.set_snapshot(ip(A), vec![entry("b.zpr", LinkState::Down)]);
         assert!(!usable(&t));
+        assert!(!t.edge_usable(&ip(B), Some("b.zpr"), &ip(A), Some("a.zpr")));
     }
 
     #[test]
@@ -234,13 +232,17 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_node_makes_it_a_non_reporter() {
+    fn removing_a_node_makes_its_links_down() {
+        // R14: once B's reports are forgotten (disconnect or reset), B is a
+        // non-reporter, and a non-reporter's links are down until it reports again.
         let mut t = LinkStateTable::new();
         t.set_snapshot(ip(A), vec![entry("b.zpr", LinkState::Up)]);
-        t.set_snapshot(ip(B), vec![entry("a.zpr", LinkState::Down)]);
-        assert!(!usable(&t));
+        t.set_snapshot(ip(B), vec![entry("a.zpr", LinkState::Up)]);
+        assert!(usable(&t));
         t.remove_node(&ip(B));
-        assert!(usable(&t), "B's veto goes with its reports");
+        assert!(!usable(&t), "B's reports went with it; the link is down");
+        t.set_snapshot(ip(B), vec![entry("a.zpr", LinkState::Up)]);
+        assert!(usable(&t), "B reported up again");
     }
 
     #[test]
