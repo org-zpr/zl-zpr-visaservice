@@ -88,8 +88,8 @@ pub(crate) async fn refresh_and_persist_actor(
     let outcome =
         refresh_expired_attributes(&asm.ts_mgr, &policy.lookup_identity_keys(), actor).await;
     if outcome.changed {
-        // The attributes moved, so the services they grant may have too.
-        restamp_services(&policy, actor);
+        // The attributes moved, so the services they grant may have too: the commit
+        // recomputes them under the policy current then.
         if !commit_refresh(asm, &read_before, actor).await? {
             // The actor left while the refresh was in flight: nothing to write back,
             // and no revision to record against a departed actor.
@@ -122,9 +122,15 @@ pub(crate) async fn refresh_and_persist_actor(
 /// ([crate::topology_mgr::TopoOps]): re-read the actor as stored now and apply to it
 /// only the attributes the refresh changed (`refreshed` against `read_before`), so a
 /// session, substrate claim or anything else written meanwhile -- by a reconnect, say
-/// -- is not rolled back to the copy the refresh started from. `actor` (`refreshed`)
-/// becomes the merged result. Returns false, writing nothing, if the actor is no
-/// longer stored (it left while the refresh was in flight).
+/// -- is not rolled back to the copy the refresh started from. The services the
+/// merged actor provides are then recomputed under the policy current at commit
+/// (stable while the guard is held), not carried over from the policy the refresh
+/// started under. `actor` (`refreshed`) becomes the merged result.
+///
+/// Returns false, writing nothing, if no actor is stored at the address any more or
+/// a different one is (the address was recycled while the refresh was in flight: its
+/// attributes were queried with the old actor's identities). A reconnect of the same
+/// actor (same identity, CN and role; a new session) is merged into.
 async fn commit_refresh(
     asm: &Assembly,
     read_before: &Actor,
@@ -137,13 +143,24 @@ async fn commit_refresh(
     let Some(mut stored) = asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await? else {
         return Ok(false);
     };
+    if !same_actor(read_before, &stored) {
+        debug!(target: VREQ, "not committing attribute refresh for {zpr_addr}: the address now holds a different actor");
+        return Ok(false);
+    }
     apply_changed_attributes(read_before, refreshed, &mut stored)?;
+    restamp_services(&asm.policy_mgr.get_current(), &mut stored);
     asm.actor_mgr
         .update_actor(&stored, &asm.policy_service_names())
         .await?;
     drop(ops);
     *refreshed = stored;
     Ok(true)
+}
+
+/// Whether `a` and `b` are the same actor: same identity values, CN and role. A
+/// reconnect keeps all three; an address recycled to another actor does not.
+fn same_actor(a: &Actor, b: &Actor) -> bool {
+    a.get_identity() == b.get_identity() && a.get_cn() == b.get_cn() && a.is_node() == b.is_node()
 }
 
 /// Apply to `target` every attribute that differs between `before` and `after`:
@@ -1281,6 +1298,102 @@ mod refresh_commit {
         assert_eq!(
             stored_attr(&asm, ACTOR, TS_KEY).await,
             Some("engineering".to_string())
+        );
+    }
+
+    /// Round 16 (Codex P1): if the address was recycled to a different actor while
+    /// the refresh was in flight, the commit applies nothing to the newcomer: the
+    /// attributes were queried with the old actor's identities.
+    #[tokio::test]
+    async fn test_refresh_commit_skips_a_recycled_address() {
+        let (asm, _node) = build_sweep_asm(false).await;
+        let addr: IpAddr = ACTOR.parse().unwrap();
+        let read_before = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut refreshed = read_before.clone();
+        refreshed
+            .add_attribute(Attribute::builder(TS_KEY).value("engineering"))
+            .unwrap();
+        // The old actor left and a different one now holds the address.
+        let newcomer = crate::test_helpers::make_adapter_actor_defexp(ACTOR, "someone-else");
+        asm.actor_mgr
+            .update_actor(&newcomer, &asm.policy_service_names())
+            .await
+            .unwrap();
+
+        assert!(
+            !commit_refresh(&asm, &read_before, &mut refreshed)
+                .await
+                .unwrap()
+        );
+        assert_eq!(stored_attr(&asm, ACTOR, TS_KEY).await, None);
+    }
+
+    /// Round 16 (Codex P1): services are recomputed at commit under the current
+    /// policy, not carried from the policy the refresh started under. Here the
+    /// refresh computed "web" under a policy that hosts it on `device.tags:server`;
+    /// a newer policy that hosts it elsewhere landed before the commit.
+    #[tokio::test]
+    async fn test_refresh_commit_restamps_services_under_the_current_policy() {
+        use crate::test_helpers::make_attr_hosted_service_policy;
+        use zpr::policy_types::PFlags;
+        let (asm, _node) = build_sweep_asm(false).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_attr_hosted_service_policy(
+                "web",
+                80,
+                "device.tags",
+                "server",
+                PFlags::default(),
+            ))
+            .await
+            .unwrap();
+        let addr: IpAddr = ACTOR.parse().unwrap();
+        let read_before = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut refreshed = read_before.clone();
+        refreshed
+            .add_attribute(Attribute::builder("device.tags").value("server"))
+            .unwrap();
+        restamp_services(&asm.policy_mgr.get_current(), &mut refreshed);
+        assert!(
+            refreshed.provides("web"),
+            "precondition: granted under the old policy"
+        );
+
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_attr_hosted_service_policy(
+                "web",
+                80,
+                "device.tags",
+                "other",
+                PFlags::default(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            commit_refresh(&asm, &read_before, &mut refreshed)
+                .await
+                .unwrap()
+        );
+
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored.provides("web"),
+            "the current policy does not grant it"
         );
     }
 
