@@ -136,52 +136,80 @@ impl OidcSessionRecord {
     }
 }
 
-/// Refuse a node's login when the live policy generation is no longer the one
-/// `psnap` -- the snapshot the login was validated and authorized under --
-/// names (#63 review): an install in between may have removed or changed the
-/// provider, and its reconciliation has already looked at the pre-login actor.
-/// `temporarilyUnavailable`: the node fetches a new nonce and logs in again
-/// under the new policy. A window between this check and the write remains;
-/// it is bounded by the install's re-authentication obligation, because the
-/// persisted actor still carries the old `zpr.vinst` (zipline#123).
-fn ensure_policy_unchanged(asm: &Assembly, psnap: &PolicySnapshot) -> Result<(), ServiceError> {
-    if asm.policy_mgr.get_current_snapshot().vinst() != psnap.vinst() {
-        info!(target: CC, "login refused: policy changed while it was being authorized");
-        return Err(ApiResponseError::new(
-            ErrorCode::TemporarilyUnavailable,
-            "policy changed during login; retry",
-            config::LOGIN_POLICY_CHANGED_RETRY_SECS,
-        )
-        .into());
-    }
-    Ok(())
+/// What [recheck_before_commit] found about the policy generation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CommitRecheck {
+    /// The live generation is the one the write was prepared under.
+    Current,
+    /// A policy install landed since the write was prepared; the caller
+    /// refuses, or (a logout) commits a reduced actor instead.
+    PolicyMoved,
 }
 
-/// Refuse a node's self-renewal when the stored actor's VS-API session
-/// generation (`zpr.session`) is no longer `expected` (#63 review): the node
-/// re-authenticated while the renewal was in flight, and persisting the
-/// renewal would write the old session back over the new one, reviving the old
-/// handle and cutting off the new. Same generic `AuthError` as every other
-/// credential failure; the node simply retries on its new session.
-pub(crate) async fn ensure_session_unchanged(
+/// The one commit-time recheck for every write to a node's own actor that was
+/// prepared from an earlier read (#63 review audit): reauthorize (login,
+/// renewal, logout and its fallbacks), the node authenticate persist, the
+/// login-nonce mint and the attribute-refresh write. The caller holds
+/// [ConnectionControl::self_reauth_lock] -- which every writer of a node's own
+/// actor takes -- and calls this right before it commits:
+///
+/// - `expected_session`: when `Some`, the stored actor must still exist and
+///   carry exactly that `zpr.session`; otherwise the node re-authenticated (or
+///   was disconnected) since the write was prepared, and committing would
+///   write an old session or a removed actor back. Generic `AuthError`.
+/// - `prepared_vinst`: when `Some`, the policy generation the write was
+///   prepared (validated, authorized, enriched) under. A different live
+///   generation is [CommitRecheck::PolicyMoved]: that install's reconciliation
+///   may already have looked at the pre-write actor.
+pub(crate) async fn recheck_before_commit(
     asm: &Assembly,
     zpr_addr: &IpAddr,
-    expected: Option<&str>,
-) -> Result<(), ServiceError> {
-    let stored = asm.actor_mgr.get_actor_by_zpr_addr(zpr_addr).await?;
-    let stored_session = stored
-        .as_ref()
-        .and_then(|a| a.get_attribute(key::SESSION))
-        .and_then(|a| a.get_single_value().ok());
-    if stored.is_none() || stored_session.as_deref() != expected {
-        info!(target: CC, "self-renewal of {zpr_addr} refused: the node re-authenticated while it was in flight");
-        return Err(ApiResponseError::new_code_msg(
-            ErrorCode::AuthError,
-            "authentication rejected",
-        )
-        .into());
+    expected_session: Option<&str>,
+    prepared_vinst: Option<u64>,
+) -> Result<CommitRecheck, ServiceError> {
+    if let Some(expected) = expected_session {
+        let stored = asm.actor_mgr.get_actor_by_zpr_addr(zpr_addr).await?;
+        let stored_session = stored
+            .as_ref()
+            .and_then(|a| a.get_attribute(key::SESSION))
+            .and_then(|a| a.get_single_value().ok());
+        if stored_session.as_deref() != Some(expected) {
+            info!(target: CC, "write to {zpr_addr} refused: the node re-authenticated or left while it was prepared");
+            return Err(ApiResponseError::new_code_msg(
+                ErrorCode::AuthError,
+                "authentication rejected",
+            )
+            .into());
+        }
     }
-    Ok(())
+    if let Some(vinst) = prepared_vinst
+        && asm.policy_mgr.get_current_snapshot().vinst() != vinst
+    {
+        info!(target: CC, "write to {zpr_addr}: policy changed while it was prepared");
+        return Ok(CommitRecheck::PolicyMoved);
+    }
+    Ok(CommitRecheck::Current)
+}
+
+/// The refusal for a write whose policy generation moved before it committed:
+/// `temporarilyUnavailable` with a short retry, so the node repeats the
+/// operation under the new policy (#63 review). A login also needs a fresh
+/// nonce, since the old one is spent.
+pub(crate) fn policy_moved_error() -> ServiceError {
+    ApiResponseError::new(
+        ErrorCode::TemporarilyUnavailable,
+        "policy changed; retry",
+        config::LOGIN_POLICY_CHANGED_RETRY_SECS,
+    )
+    .into()
+}
+
+/// The `zpr.vinst` an actor was last authorized under, if stamped.
+pub(crate) fn actor_prepared_vinst(actor: &Actor) -> Option<u64> {
+    actor
+        .get_attribute(key::VINST)
+        .and_then(|a| a.get_single_value().ok())
+        .and_then(|v| v.parse().ok())
 }
 
 /// Whether a `reauthorize` targets the calling node's OWN actor: the target
@@ -263,30 +291,6 @@ fn logout_without_reauthorization(actor: &Actor, policy: &Policy) -> Actor {
         .collect();
     reduced.set_services(policy.join_services_for_role(&claims, true));
     reduced
-}
-
-/// The actor a logout persists (#63 review): `renewed` -- re-authorized and
-/// re-enriched under `psnap` -- while `psnap` is still the live policy
-/// generation; otherwise [logout_without_reauthorization] of the loaded
-/// `actor` under the current policy, so no attribute re-enriched under a
-/// superseded snapshot is written after that install's reconciliation already
-/// ran. Refusing the logout instead would leave the login in place. The
-/// second value is true when the reduced actor was chosen.
-fn logout_actor_for_current_policy(
-    asm: &Assembly,
-    psnap: &PolicySnapshot,
-    actor: &Actor,
-    renewed: Actor,
-) -> (Actor, bool) {
-    let current = asm.policy_mgr.get_current_snapshot();
-    if current.vinst() == psnap.vinst() {
-        return (renewed, false);
-    }
-    info!(target: CC, "logout: policy changed while it was being re-authorized; persisting it without re-enrichment");
-    (
-        logout_without_reauthorization(actor, current.policy()),
-        true,
-    )
 }
 
 /// Whether an attribute is carried over a logout (zl-zipline#232): only
@@ -1584,20 +1588,33 @@ impl ConnectionControl {
             ));
         }
 
+        // The commit-time recheck (#63 review audit), under the self-renewal
+        // lock: the node's session must be the one loaded, and the policy
+        // generation the one this renewal was authorized under. A login or
+        // renewal under a moved generation is refused (retry under the new
+        // policy); a logout is never refused -- that would leave the login in
+        // place -- so it commits the reduced actor under the current policy,
+        // with no attribute enriched under the superseded snapshot.
         if self_renewal {
             let loaded_session = actor
                 .get_attribute(key::SESSION)
                 .and_then(|a| a.get_single_value().ok());
-            ensure_session_unchanged(&asm, &zpr_addr, loaded_session.as_deref()).await?;
-        }
-        if user_change == UserNamespaceChange::Gain {
-            ensure_policy_unchanged(&asm, &psnap)?;
-        }
-        if dropping_user {
-            let (persisted, reduced) =
-                logout_actor_for_current_policy(&asm, &psnap, &actor, renewed);
-            renewed = persisted;
-            logout_without_enrichment |= reduced;
+            let recheck = recheck_before_commit(
+                &asm,
+                &zpr_addr,
+                Some(loaded_session.as_deref().unwrap_or_default()),
+                Some(psnap.vinst()),
+            )
+            .await?;
+            if recheck == CommitRecheck::PolicyMoved {
+                if !dropping_user {
+                    return Err(policy_moved_error());
+                }
+                info!(target: CC, "logout of {zpr_addr}: policy changed; persisting it without re-enrichment");
+                let current = asm.policy_mgr.get_current_snapshot();
+                renewed = logout_without_reauthorization(&actor, current.policy());
+                logout_without_enrichment = true;
+            }
         }
         asm.actor_mgr
             .update_actor(&renewed, &asm.policy_service_names())
@@ -8740,10 +8757,11 @@ mod tests {
     async fn test_self_renewal_refused_when_session_changed() {
         let cn = "zode-u.zpr";
         let (asm, _cc, addr, _privkey) = zode_fixture(cn).await;
-        assert!(
-            ensure_session_unchanged(&asm, &addr, Some(ZODE_SESSION))
+        assert_eq!(
+            recheck_before_commit(&asm, &addr, Some(ZODE_SESSION), None)
                 .await
-                .is_ok()
+                .unwrap(),
+            CommitRecheck::Current
         );
         let mut stored = asm
             .actor_mgr
@@ -8759,7 +8777,7 @@ mod tests {
             .await
             .unwrap();
         assert_auth_rejected(api_err(
-            ensure_session_unchanged(&asm, &addr, Some(ZODE_SESSION)).await,
+            recheck_before_commit(&asm, &addr, Some(ZODE_SESSION), None).await,
         ));
     }
 
@@ -8846,7 +8864,12 @@ mod tests {
         assert!(has_user_attrs(&stale));
         zode_logout(&asm, &cc, addr, &privkey, cn).await;
 
-        let result = crate::actor_attributes::persist_refreshed_actor(&asm, &stale).await;
+        let result = crate::actor_attributes::persist_refreshed_actor(
+            &asm,
+            &stale,
+            asm.policy_mgr.get_current_snapshot().vinst(),
+        )
+        .await;
         assert!(
             matches!(result, Err(ServiceError::AttributesIndeterminate(_))),
             "a stale refresh must be refused, got {result:?}"
@@ -8869,9 +8892,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        crate::actor_attributes::persist_refreshed_actor(&asm, &current)
-            .await
-            .expect("a refresh of the current copy persists");
+        crate::actor_attributes::persist_refreshed_actor(
+            &asm,
+            &current,
+            asm.policy_mgr.get_current_snapshot().vinst(),
+        )
+        .await
+        .expect("a refresh of the current copy persists");
     }
 
     /// Review fix (#63 round 5, Codex P1): when the logout's visa sweep
@@ -8945,26 +8972,33 @@ mod tests {
         );
     }
 
-    /// Review fix (#63 round 7, Codex P1): a login validated under a policy
-    /// snapshot that an install has since replaced is not persisted.
+    /// The commit-time recheck reports a moved policy generation (#63 audit),
+    /// and the refusal it maps to for a login or renewal is
+    /// `temporarilyUnavailable`.
     #[tokio::test]
-    async fn test_login_refused_when_policy_snapshot_is_stale() {
+    async fn test_recheck_before_commit_reports_moved_generation() {
         let cn = "zode-aa.zpr";
-        let (asm, _cc, _addr, privkey) = zode_fixture(cn).await;
+        let (asm, _cc, addr, privkey) = zode_fixture(cn).await;
         let psnap = asm.policy_mgr.get_current_snapshot();
-        assert!(ensure_policy_unchanged(&asm, &psnap).is_ok());
-
+        assert_eq!(
+            recheck_before_commit(&asm, &addr, Some(ZODE_SESSION), Some(psnap.vinst()))
+                .await
+                .unwrap(),
+            CommitRecheck::Current
+        );
         let pubkey_der = privkey.public_key_to_der().unwrap();
         asm.policy_mgr
             .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
             .await
             .expect("a new policy installs");
-        let api = api_err::<()>(ensure_policy_unchanged(&asm, &psnap));
-        assert!(
-            matches!(api.code, ErrorCode::TemporarilyUnavailable),
-            "got {:?}",
-            api.code
+        assert_eq!(
+            recheck_before_commit(&asm, &addr, Some(ZODE_SESSION), Some(psnap.vinst()))
+                .await
+                .unwrap(),
+            CommitRecheck::PolicyMoved
         );
+        let api = api_err::<()>(Err(policy_moved_error()));
+        assert!(matches!(api.code, ErrorCode::TemporarilyUnavailable));
     }
 
     /// Review fix (#63 round 8, Codex P1): a logout persists even when the
@@ -9045,41 +9079,151 @@ mod tests {
         );
     }
 
-    /// Review fix (#63 round 10, Codex P1): a logout whose policy snapshot
-    /// went stale does not persist attributes re-enriched under the old
-    /// snapshot; it persists the reduced actor instead.
-    #[tokio::test]
-    async fn test_logout_under_stale_policy_persists_reduced_actor() {
-        let cn = "zode-ad.zpr";
-        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
-        let loaded = zode_login(&asm, &cc, addr, &privkey, cn).await;
-        let psnap = asm.policy_mgr.get_current_snapshot();
-        let mut reenriched = loaded.clone();
-        reenriched
-            .add_attribute(
-                AttributeSource::new("hr")
+    /// A trusted service that installs `next_policy` the first time it is
+    /// queried and vends `device.clearance` from its own source: it makes a
+    /// policy install land in the middle of a reauthorize's enrichment, so the
+    /// commit-time recheck can be tested deterministically (#63 audit).
+    struct PolicyInstallingTs {
+        asm: std::sync::Mutex<Option<Arc<Assembly>>>,
+        next_policy: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::trusted_services::TrustedServiceInterface for PolicyInstallingTs {
+        async fn get_attributes_for_actor(
+            &self,
+            _identities: &[(String, String)],
+        ) -> Result<Vec<Attribute>, ServiceError> {
+            let asm = self.asm.lock().unwrap().take();
+            if let Some(asm) = asm {
+                asm.policy_mgr
+                    .update_policy_from_container_bytes(self.next_policy.clone())
+                    .await
+                    .expect("the mid-flight policy installs");
+            }
+            Ok(vec![
+                AttributeSource::new("installer")
                     .builder("device.clearance")
                     .expires_in(Duration::from_secs(600))
                     .value("secret"),
-            )
-            .unwrap();
+            ])
+        }
 
-        // Same generation: the re-enriched actor is persisted as is.
-        let (kept, _) = logout_actor_for_current_policy(&asm, &psnap, &loaded, reenriched.clone());
-        assert!(kept.get_attribute("device.clearance").is_some());
+        async fn flush(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
 
-        // An install lands: the reduced actor is persisted instead.
+        fn current_revision(&self) -> u64 {
+            1
+        }
+
+        fn get_source_id(&self) -> &str {
+            "installer"
+        }
+    }
+
+    /// Arm a policy install (same Zode policy, so the node stays admitted and
+    /// the provider stays declared) for the next enrichment on `asm`.
+    fn arm_mid_flight_install(asm: &Arc<Assembly>, cn: &str, privkey: &PKey<Private>) {
         let pubkey_der = privkey.public_key_to_der().unwrap();
+        // Every install advances the generation, so re-installing the same
+        // Zode policy is enough to move it.
+        let next_policy = make_zode_oidc_policy(cn, &pubkey_der);
         asm.policy_mgr
-            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .add_trusted_service_for_tests(Arc::new(PolicyInstallingTs {
+                asm: std::sync::Mutex::new(Some(asm.clone())),
+                next_policy,
+            }));
+    }
+
+    /// #63 audit: a node's device-only renewal (Keep) whose policy generation
+    /// moved during enrichment is refused, not persisted.
+    #[tokio::test]
+    async fn test_self_renewal_refused_when_policy_moves_mid_flight() {
+        let cn = "zode-ad.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        let before = asm.policy_mgr.get_current_snapshot().vinst();
+        arm_mid_flight_install(&asm, cn, &privkey);
+        let api = api_err(
+            cc.reauthorize_actor(
+                asm.clone(),
+                addr,
+                vec![make_fresh_ss_blob(&privkey, cn)],
+                &addr,
+                Some(ZODE_SESSION),
+            )
+            .await,
+        );
+        assert!(
+            matches!(api.code, ErrorCode::TemporarilyUnavailable),
+            "got {:?}",
+            api.code
+        );
+        assert_ne!(asm.policy_mgr.get_current_snapshot().vinst(), before);
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
             .await
-            .expect("a new policy installs");
-        let (reduced, chose_reduced) =
-            logout_actor_for_current_policy(&asm, &psnap, &loaded, reenriched);
-        assert!(chose_reduced);
-        assert!(reduced.get_attribute("device.clearance").is_none());
-        assert!(!has_user_attrs(&reduced));
-        assert!(reduced.is_node());
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.get_attribute("device.clearance").is_none(),
+            "nothing was persisted"
+        );
+    }
+
+    /// #63 audit: a login whose policy generation moved during enrichment is
+    /// refused, not persisted.
+    #[tokio::test]
+    async fn test_login_refused_when_policy_moves_mid_flight() {
+        let cn = "zode-af.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        arm_mid_flight_install(&asm, cn, &privkey);
+        let nonce = mint_zode_nonce(&cc, addr);
+        let api = api_err(
+            cc.reauthorize_actor(
+                asm.clone(),
+                addr,
+                zode_login_blobs(&privkey, cn, &nonce, oidc_base_claims()),
+                &addr,
+                Some(ZODE_SESSION),
+            )
+            .await,
+        );
+        assert!(
+            matches!(api.code, ErrorCode::TemporarilyUnavailable),
+            "got {:?}",
+            api.code
+        );
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!has_user_attrs(&stored), "the login was not persisted");
+    }
+
+    /// #63 audit: a logout whose policy generation moved during enrichment
+    /// persists the reduced actor (never refused), without the attribute
+    /// enriched under the superseded snapshot.
+    #[tokio::test]
+    async fn test_logout_reduced_when_policy_moves_mid_flight() {
+        let cn = "zode-ag.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        arm_mid_flight_install(&asm, cn, &privkey);
+        let renewed = zode_logout(&asm, &cc, addr, &privkey, cn).await;
+        assert!(!has_user_attrs(&renewed));
+        assert!(renewed.get_attribute("device.clearance").is_none());
+        assert!(renewed.is_node());
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!has_user_attrs(&stored));
     }
 
     /// Review fix (#63 round 10, Copilot): a fallback logout (enrichment
@@ -9127,6 +9271,58 @@ mod tests {
             matches!(result, Err(ServiceError::AttributesIndeterminate(_))),
             "with the source still down the next request must be indeterminate, got {result:?}"
         );
+    }
+
+    /// #63 audit: a node's attribute refresh is not written back when the
+    /// node's session changed, or the policy moved, since the refresh began.
+    #[tokio::test]
+    async fn test_refresh_write_rechecks_session_and_generation() {
+        let cn = "zode-ah.zpr";
+        let (asm, _cc, addr, privkey) = zode_fixture(cn).await;
+        let copy = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+
+        // Session changed (the node re-authenticated) since the copy was taken.
+        let mut stored = copy.clone();
+        stored
+            .add_attribute(Attribute::builder(key::SESSION).value("a-newer-session"))
+            .unwrap();
+        asm.actor_mgr
+            .update_actor(&stored, &Default::default())
+            .await
+            .unwrap();
+        let result = crate::actor_attributes::persist_refreshed_actor(&asm, &copy, vinst).await;
+        assert!(
+            matches!(result, Err(ServiceError::AttributesIndeterminate(_))),
+            "got {result:?}"
+        );
+
+        // Session current again, but the policy moved since the refresh began.
+        asm.actor_mgr
+            .update_actor(&copy, &Default::default())
+            .await
+            .unwrap();
+        let pubkey_der = privkey.public_key_to_der().unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_zode_oidc_policy(cn, &pubkey_der))
+            .await
+            .expect("a new policy installs");
+        let result = crate::actor_attributes::persist_refreshed_actor(&asm, &copy, vinst).await;
+        assert!(
+            matches!(result, Err(ServiceError::AttributesIndeterminate(_))),
+            "got {result:?}"
+        );
+
+        // Both current: the write goes through.
+        let current = asm.policy_mgr.get_current_snapshot().vinst();
+        crate::actor_attributes::persist_refreshed_actor(&asm, &copy, current)
+            .await
+            .expect("a current refresh persists");
     }
 
     /// The namespace-change decision table (vs.capnp "Re-Authorization").

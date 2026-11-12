@@ -22,7 +22,9 @@ use zpr::write_to::WriteTo;
 
 use crate::assembly::Assembly;
 use crate::config;
-use crate::connection_control::ensure_session_unchanged;
+use crate::connection_control::{
+    CommitRecheck, actor_prepared_vinst, policy_moved_error, recheck_before_commit,
+};
 use crate::counters::CounterType;
 use crate::error::ServiceError;
 use crate::event_mgr::VsEvent;
@@ -345,6 +347,87 @@ impl VSHandleImpl {
     }
 }
 
+/// The state half of `open` (a node resuming its VS-API session over an existing
+/// link): load the node's own actor, keep its substrate address current, stamp
+/// a NEW session generation and persist it -- all under the self-renewal lock
+/// (`ConnectionControl::self_reauth_lock`, #63 review audit), the lock every
+/// writer of a node's own actor takes, so a concurrent login, logout or
+/// re-authentication cannot land between this load and these writes and be
+/// overwritten with the stale copy. Errors carry the `open` reply code and
+/// message.
+async fn resume_node_actor_for_open(
+    asm: &Assembly,
+    node_zpr_addr: IpAddr,
+    reported_substrate: SocketAddr,
+    cn: &str,
+) -> Result<Actor, (vsapi::ErrorCode, String)> {
+    let internal = || {
+        (
+            vsapi::ErrorCode::Internal,
+            "internal error during open".to_string(),
+        )
+    };
+    let _guard = asm.cc.self_reauth_lock.lock().await;
+    let mut existing_actor = match asm.actor_mgr.get_actor_by_zpr_addr(&node_zpr_addr).await {
+        Ok(Some(actor)) => actor,
+        Ok(None) => return Err((vsapi::ErrorCode::OutOfSync, "no state".to_string())),
+        Err(e) => {
+            error!(target: API, "error checking existing state for node calling open {}: {}", node_zpr_addr, e);
+            return Err(internal());
+        }
+    };
+    if !existing_actor.is_node() {
+        warn!(target: API, "reconnect attempt denied for {}: found {:?}", node_zpr_addr, existing_actor.get_cn());
+        return Err((
+            vsapi::ErrorCode::InvalidOperation,
+            "address in use".to_string(),
+        ));
+    }
+
+    // If policy topology declares a substrate for this node it must agree with the
+    // reported one; with no topology entry the reported value stands.
+    if let Some(sa) = crate::connection_control::substrate_addr_from_topology(asm, &node_zpr_addr)
+        && sa != reported_substrate
+    {
+        return Err((
+            vsapi::ErrorCode::ParamError,
+            format!(
+                "substrate address mismatch: policy declares {sa}, node reported {reported_substrate}"
+            ),
+        ));
+    }
+
+    // A soft reconnect may carry a changed dock address; keep the stored claim current.
+    let stored = existing_actor
+        .get_attribute(key::SUBSTRATE_ADDR)
+        .and_then(|a| a.get_value().first().cloned());
+    if stored.as_deref() != Some(reported_substrate.to_string().as_str()) {
+        info!(target: API, "node {} substrate address {} -> {} on open", cn, stored.unwrap_or_default(), reported_substrate);
+        if let Err(e) = existing_actor.add_attribute(
+            Attribute::builder(key::SUBSTRATE_ADDR).value(reported_substrate.to_string()),
+        ) {
+            error!(target: API, "failed to update substrate addr claim for {}: {}", cn, e);
+            return Err(internal());
+        }
+    }
+
+    // A reconnect mints a NEW session generation (zipline#123, PR #41
+    // review): stamp and persist it before building the handle, so every
+    // handle from before this open fails the liveness gate — an old
+    // revoked capability cannot ride the reconnect back to life. One write
+    // carries both the substrate update and the new session.
+    VSHandleImpl::stamp_new_session(&mut existing_actor);
+    if let Err(e) = asm
+        .actor_mgr
+        .update_actor(&existing_actor, &asm.policy_service_names())
+        .await
+    {
+        error!(target: API, "failed to persist session for {}: {}", cn, e);
+        return Err(internal());
+    }
+    Ok(existing_actor)
+}
+
 /// Mint a login nonce for the node at `node_addr` whose handle was minted under
 /// VS-API session `session`. Under the self-renewal lock -- which a node's
 /// authenticate holds while it persists a new session -- the stored session is
@@ -357,7 +440,7 @@ async fn mint_login_nonce_for_handle(
     session: &str,
 ) -> Result<(String, SystemTime), MintError> {
     let _guard = asm.cc.self_reauth_lock.lock().await;
-    if ensure_session_unchanged(asm, &node_addr, Some(session))
+    if recheck_before_commit(asm, &node_addr, Some(session), None)
         .await
         .is_err()
     {
@@ -374,12 +457,25 @@ async fn mint_login_nonce_for_handle(
 /// actor to persisting it, so this write can never land between that renewal's
 /// session check and its write and be overwritten with the old session (#63
 /// review). The lock is held only for the write, not for authentication.
+///
+/// Before the write, the shared commit-time recheck (#63 review audit): the
+/// actor was authorized under the policy generation stamped in its
+/// `zpr.vinst`; if an install landed since, the authentication is refused
+/// (`temporarilyUnavailable`) and the node authenticates again under the new
+/// policy, rather than persisting an admission that install's reconciliation
+/// never saw.
 async fn add_node_serialized(
     asm: &Assembly,
     node_actor: &Actor,
     reconnect: bool,
 ) -> Result<(), ServiceError> {
     let _guard = asm.cc.self_reauth_lock.lock().await;
+    if let Some(addr) = node_actor.get_zpr_addr()
+        && recheck_before_commit(asm, addr, None, actor_prepared_vinst(node_actor)).await?
+            == CommitRecheck::PolicyMoved
+    {
+        return Err(policy_moved_error());
+    }
     asm.actor_mgr
         .add_node(node_actor, reconnect, &asm.policy_service_names())
         .await
@@ -835,103 +931,22 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         let node_zpr_addr = self.remote.ip();
         info!(target: API, "node {} requests open from addr {} (CONNECT_TYPE={:?})", vs_connect_request.cn, node_zpr_addr, vs_connect_request.ctype);
 
-        let existing_actor = match self
-            .asm
-            .actor_mgr
-            .get_actor_by_zpr_addr(&node_zpr_addr)
-            .await
+        // Load, update and re-stamp the node's own actor under the self-renewal
+        // lock (#63 review audit): a concurrent login/logout or re-authentication
+        // of this node cannot land between this load and these writes.
+        let existing_actor = match resume_node_actor_for_open(
+            &self.asm,
+            node_zpr_addr,
+            reported_substrate,
+            &vs_connect_request.cn,
+        )
+        .await
         {
-            Ok(Some(actor)) => actor,
-            Ok(None) => {
-                return self.ok_with_open_error(results, vsapi::ErrorCode::OutOfSync, "no state");
-            }
-            Err(e) => {
-                error!(target: API, "error checking existing state for node calling open {}: {}", node_zpr_addr, e);
-                return self.ok_with_open_error(
-                    results,
-                    vsapi::ErrorCode::Internal,
-                    "internal error during open",
-                );
-            }
+            Ok(actor) => actor,
+            Err((code, message)) => return self.ok_with_open_error(results, code, &message),
         };
-        if !existing_actor.is_node() {
-            warn!(target: API, "reconnect attempt denied for {}: found {:?}", node_zpr_addr, existing_actor.get_cn());
-            return self.ok_with_open_error(
-                results,
-                vsapi::ErrorCode::InvalidOperation,
-                "address in use",
-            );
-        }
-        let mut existing_actor = existing_actor;
-
-        // If policy topology declares a substrate for this node it must agree with the
-        // reported one; with no topology entry the reported value stands.
-        if let Some(sa) =
-            crate::connection_control::substrate_addr_from_topology(&self.asm, &node_zpr_addr)
-            && sa != reported_substrate
-        {
-            return self.ok_with_open_error(
-                results,
-                vsapi::ErrorCode::ParamError,
-                &format!(
-                    "substrate address mismatch: policy declares {sa}, node reported {reported_substrate}"
-                ),
-            );
-        }
-
-        // A soft reconnect may carry a changed dock address; keep the stored claim current.
-        let stored = existing_actor
-            .get_attribute(key::SUBSTRATE_ADDR)
-            .and_then(|a| a.get_value().first().cloned());
-        if stored.as_deref() != Some(reported_substrate.to_string().as_str()) {
-            info!(target: API, "node {} substrate address {} -> {} on open", vs_connect_request.cn, stored.unwrap_or_default(), reported_substrate);
-            if let Err(e) = existing_actor.add_attribute(
-                Attribute::builder(key::SUBSTRATE_ADDR).value(reported_substrate.to_string()),
-            ) {
-                error!(target: API, "failed to update substrate addr claim for {}: {}", vs_connect_request.cn, e);
-                return self.ok_with_open_error(
-                    results,
-                    vsapi::ErrorCode::Internal,
-                    "internal error during open",
-                );
-            }
-            if let Err(e) = self
-                .asm
-                .actor_mgr
-                .update_actor(&existing_actor, &self.asm.policy_service_names())
-                .await
-            {
-                error!(target: API, "failed to persist substrate addr claim for {}: {}", vs_connect_request.cn, e);
-                return self.ok_with_open_error(
-                    results,
-                    vsapi::ErrorCode::Internal,
-                    "internal error during open",
-                );
-            }
-        }
-
-        // Not yet sure if we support a RESET over this channel...but might make sense.
         if matches!(vs_connect_request.ctype, ConnectType::Reset) {
             warn!(target: API, "{} requests RESET: not yet implemented", vs_connect_request.cn);
-        }
-
-        // A reconnect mints a NEW session generation (zipline#123, PR #41
-        // review): stamp and persist it before building the handle, so every
-        // handle from before this open fails the liveness gate — an old
-        // revoked capability cannot ride the reconnect back to life.
-        VSHandleImpl::stamp_new_session(&mut existing_actor);
-        if let Err(e) = self
-            .asm
-            .actor_mgr
-            .update_actor(&existing_actor, &self.asm.policy_service_names())
-            .await
-        {
-            error!(target: API, "failed to persist session for {}: {}", vs_connect_request.cn, e);
-            return self.ok_with_open_error(
-                results,
-                vsapi::ErrorCode::Internal,
-                "internal error during open",
-            );
         }
 
         // Skip ahead to the handle:
@@ -1171,8 +1186,12 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
 
         // The add_node call will clean up after ifself if it fails.
         if let Err(e) = add_node_serialized(&self.asm, &node_actor, self.reconnect).await {
-            error!(target: API, "failed to add authenticated node {:?} to actor db: {}", &node_cn, e);
             undo.undo(&self.asm).await;
+            if let ServiceError::ApiResponse(api) = e {
+                info!(target: API, "authentication of node {:?} refused at commit: {}", &node_cn, api.message);
+                return self.ok_with_authenticate_error(results, api.code.into(), &api.message);
+            }
+            error!(target: API, "failed to add authenticated node {:?} to actor db: {}", &node_cn, e);
             return self.ok_with_authenticate_error(
                 results,
                 vsapi::ErrorCode::Internal,
@@ -3409,6 +3428,77 @@ mod tests {
                     .consume(&fresh, addr, &current, SystemTime::now()),
                 "the current session's nonce must survive the stale mint"
             );
+        }
+
+        /// #63 audit: a node authenticated under a policy generation that an
+        /// install has since replaced is not persisted (the node authenticates
+        /// again under the new policy).
+        #[tokio::test]
+        async fn test_node_persist_refused_when_policy_moved() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let mut node = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
+            VSHandleImpl::stamp_new_session(&mut node);
+            let stale = asm.policy_mgr.get_current_snapshot().vinst() + 1;
+            node.add_attribute(Attribute::builder(key::VINST).value(stale.to_string()))
+                .unwrap();
+            let err = add_node_serialized(&asm, &node, false)
+                .await
+                .expect_err("a stale admission must not persist");
+            assert!(
+                matches!(&err, ServiceError::ApiResponse(api) if matches!(api.code, zpr::vsapi_types::ErrorCode::TemporarilyUnavailable)),
+                "got {err:?}"
+            );
+            assert!(
+                asm.actor_mgr
+                    .get_actor_by_zpr_addr(&NODE.parse().unwrap())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            // The current generation persists.
+            let current = asm.policy_mgr.get_current_snapshot().vinst();
+            node.add_attribute(Attribute::builder(key::VINST).value(current.to_string()))
+                .unwrap();
+            add_node_serialized(&asm, &node, false)
+                .await
+                .expect("a current admission persists");
+        }
+
+        /// #63 audit: `open`'s load -> write of the node's own actor runs under
+        /// the self-renewal lock.
+        #[tokio::test]
+        async fn test_open_state_update_waits_for_self_renewal_lock() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let node = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
+            asm.actor_mgr
+                .add_node(&node, false, &Default::default())
+                .await
+                .unwrap();
+            let guard = asm.cc.self_reauth_lock.lock().await;
+            let task = tokio::spawn({
+                let asm = asm.clone();
+                async move {
+                    resume_node_actor_for_open(
+                        &asm,
+                        NODE.parse().unwrap(),
+                        "[fd5a:5052:3000::101]:1234".parse().unwrap(),
+                        "zode",
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|(code, msg)| format!("{code:?}: {msg}"))
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !task.is_finished(),
+                "open's state update must wait for the lock"
+            );
+            drop(guard);
+            task.await
+                .unwrap()
+                .expect("open's state update completes once the lock is free");
         }
 
         /// Test 19: a dead handle (node disconnected) gets `authRequired`.

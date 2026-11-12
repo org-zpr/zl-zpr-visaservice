@@ -18,7 +18,7 @@ use libeval::policy::Policy;
 use tracing::{debug, warn};
 
 use crate::assembly::Assembly;
-use crate::connection_control::ATTR_KEY_VS_IDENT;
+use crate::connection_control::{ATTR_KEY_VS_IDENT, CommitRecheck, recheck_before_commit};
 use crate::error::ServiceError;
 use crate::logging::targets::VREQ;
 use crate::trusted_services::{
@@ -82,13 +82,14 @@ pub(crate) async fn refresh_and_persist_actor(
     asm: &Assembly,
     actor: &mut Actor,
 ) -> Result<bool, ServiceError> {
-    let policy = asm.policy_mgr.get_current();
+    let psnap = asm.policy_mgr.get_current_snapshot();
+    let policy = psnap.policy_arc();
     let outcome =
         refresh_expired_attributes(&asm.ts_mgr, &policy.lookup_identity_keys(), actor).await;
     if outcome.changed {
         // The attributes moved, so the services they grant may have too.
         restamp_services(&policy, actor);
-        persist_refreshed_actor(asm, actor).await?;
+        persist_refreshed_actor(asm, actor, psnap.vinst()).await?;
     }
 
     // No ZPR address means refresh_expired_attributes did nothing at all (an actor
@@ -118,15 +119,19 @@ pub(crate) async fn refresh_and_persist_actor(
 /// the write takes the self-renewal lock (`ConnectionControl::self_reauth_lock`,
 /// held by those paths from load to persist) and is refused when the stored
 /// actor's VS identity token (`zpr.vs.bootstrap.ident`, re-minted by every
-/// reauthorize and authenticate) differs from the copy's. The refusal is
-/// `AttributesIndeterminate`, which callers treat as a denial; the next request
-/// reloads the actor.
+/// reauthorize and authenticate) differs from the copy's, or when the shared
+/// commit-time recheck (`connection_control::recheck_before_commit`, #63
+/// review audit) finds the node's session changed or the policy generation
+/// moved since `prepared_vinst`, the generation the services were restamped
+/// under. The refusal is `AttributesIndeterminate`, which callers treat as a
+/// denial; the next request reloads the actor.
 ///
 /// ponytail: nodes only, one global lock; adapters are not renewed by
 /// themselves, so their refresh race with reauthorize is unchanged.
 pub(crate) async fn persist_refreshed_actor(
     asm: &Assembly,
     actor: &Actor,
+    prepared_vinst: u64,
 ) -> Result<(), ServiceError> {
     let _guard = if actor.is_node() {
         Some(asm.cc.self_reauth_lock.lock().await)
@@ -144,6 +149,17 @@ pub(crate) async fn persist_refreshed_actor(
             warn!(target: VREQ, "refresh of node {addr} discarded: it was re-authorized since the copy was loaded");
             return Err(ServiceError::AttributesIndeterminate(format!(
                 "node {addr} was re-authorized during an attribute refresh"
+            )));
+        }
+        let copy_session = actor
+            .get_attribute(key::SESSION)
+            .and_then(|s| s.get_single_value().ok());
+        let recheck =
+            recheck_before_commit(asm, addr, copy_session.as_deref(), Some(prepared_vinst)).await;
+        if !matches!(recheck, Ok(CommitRecheck::Current)) {
+            warn!(target: VREQ, "refresh of node {addr} discarded: its session changed or the policy moved since the copy was refreshed");
+            return Err(ServiceError::AttributesIndeterminate(format!(
+                "node {addr} changed during an attribute refresh"
             )));
         }
     }

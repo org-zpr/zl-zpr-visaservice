@@ -680,6 +680,25 @@ impl PolicyMgr {
         PolicySnapshot(self.state.load_full())
     }
 
+    /// A copy of the current snapshot with one more trusted service appended,
+    /// installed as current -- same policy, generation and OIDC stores.
+    /// Test-only: lets a test hook into enrichment on a live path.
+    #[cfg(test)]
+    pub(crate) fn add_trusted_service_for_tests(&self, svc: Arc<dyn TrustedServiceInterface>) {
+        let cur = self.state.load_full();
+        let mut trusted_services = cur.trusted_services.clone();
+        trusted_services.push(svc);
+        self.state.store(Arc::new(PolicyState {
+            policy: cur.policy.clone(),
+            container: cur.container.clone(),
+            resolved_peers_by_node: cur.resolved_peers_by_node.clone(),
+            trusted_services,
+            oidc_services: cur.oidc_services.clone(),
+            ts_definitions: cur.ts_definitions.clone(),
+            oidc_refreshers: std::sync::Mutex::new(HashMap::new()),
+        }));
+    }
+
     /// Make `snapshot` the current one, bypassing a policy install. Test-only:
     /// lets a test run a live path against a snapshot with chosen trusted
     /// services (e.g. one that fails).
