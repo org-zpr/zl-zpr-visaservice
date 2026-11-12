@@ -227,6 +227,14 @@ impl VssHandle {
             .map_err(|_| VssSyncError::ConnClosed)
     }
 
+    /// Tell the worker its node's topology changed ([VssCmd::TopologyChanged]) without
+    /// waiting: safe to call from anywhere. Returns false if the mark could not be
+    /// queued (channel full or worker gone); the node's next policy pass or reconnect
+    /// re-sends its topology anyway.
+    pub fn topology_changed(&self) -> bool {
+        self.cmd_tx.try_send(VssCmd::TopologyChanged).is_ok()
+    }
+
     /// Stop the worker.
     pub async fn stop(&self) -> Result<(), VssSyncError> {
         let cmd = VssCmd::Stop();

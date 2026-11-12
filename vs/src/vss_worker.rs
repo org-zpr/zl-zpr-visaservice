@@ -78,6 +78,12 @@ impl VssState {
         self.topology_state.last_update = Instant::now();
     }
 
+    /// A [VssCmd::TopologyChanged] arrived: the node's topology must be sent again.
+    /// Only marks it; housekeeping sends it, so a burst of changes costs one send.
+    fn handle_topology_changed(&mut self) {
+        self.mark_topology_updated();
+    }
+
     /// Indicates we have sent the topology information across.
     fn mark_topology_synced(&mut self) {
         self.topology_state.mark_synced();
@@ -185,6 +191,10 @@ pub async fn vss_worker_loop(
                                 error!(target: VSS, "failed to send response for configure command: {:?}", e);
                                 asm.counters.incr(CounterType::VssErrors);
                             }
+                        }
+                        VssCmd::TopologyChanged => {
+                            debug!(target: VSS, "topology of {} changed; re-sending it at the next heartbeat", node_addr);
+                            state.handle_topology_changed();
                         }
                         VssCmd::SetTopology(links, policy, resp_tx) => {
                             state.mark_topology_updated();
@@ -931,6 +941,23 @@ pub(crate) async fn topology_links(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Address changes are coalesced (zl-zipline#227): any number of "topology
+    /// changed" marks before the next heartbeat make one `setTopology`, and none after
+    /// it is sent until a new mark arrives.
+    #[test]
+    fn topology_changes_coalesce_into_one_send() {
+        let mut state = VssState::default();
+        state.mark_topology_synced();
+        assert!(!state.needs_set_topology());
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            state.handle_topology_changed();
+        }
+        assert!(state.needs_set_topology(), "one send is due");
+        state.mark_topology_synced();
+        assert!(!state.needs_set_topology(), "and only one");
+    }
     use std::cell::RefCell;
     use std::rc::Rc;
 

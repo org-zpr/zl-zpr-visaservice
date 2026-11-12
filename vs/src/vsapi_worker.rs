@@ -396,7 +396,8 @@ impl VSHandleImpl {
 }
 
 /// The state half of `open` (a node resuming its VS-API session over an existing
-/// link): load the node's own actor, keep its substrate address current, stamp
+/// link): load the node's own actor, keep its substrate address current (returning
+/// whether it changed, so the caller can tell the node's peers), stamp
 /// a NEW session generation and persist it -- all under the self-renewal lock
 /// (`PolicyMgr::node_commit_lock`, #63 review audit), the lock every
 /// writer of a node's own actor takes, so a concurrent login, logout or
@@ -408,7 +409,7 @@ async fn resume_node_actor_for_open(
     node_zpr_addr: IpAddr,
     reported_substrate: SocketAddr,
     cn: &str,
-) -> Result<Actor, (vsapi::ErrorCode, String)> {
+) -> Result<(Actor, bool), (vsapi::ErrorCode, String)> {
     let internal = || {
         (
             vsapi::ErrorCode::Internal,
@@ -445,7 +446,8 @@ async fn resume_node_actor_for_open(
     let stored = existing_actor
         .get_attribute(key::SUBSTRATE_ADDR)
         .and_then(|a| a.get_value().first().cloned());
-    if stored.as_deref() != Some(reported_substrate.to_string().as_str()) {
+    let changed = stored.as_deref() != Some(reported_substrate.to_string().as_str());
+    if changed {
         info!(target: API, "node {} substrate address {} -> {} on open", cn, stored.unwrap_or_default(), reported_substrate);
         if let Err(e) = existing_actor.add_attribute(
             Attribute::builder(key::SUBSTRATE_ADDR).value(reported_substrate.to_string()),
@@ -469,7 +471,92 @@ async fn resume_node_actor_for_open(
         error!(target: API, "failed to persist session for {}: {}", cn, e);
         return Err(internal());
     }
-    Ok(existing_actor)
+    Ok((existing_actor, changed))
+}
+
+/// Tell every connected peer policy declares for `node_addr` that `node_addr`'s
+/// substrate address changed (zl-zipline#227), so their topology `Link.peer` for it is
+/// re-sent (`VssCmd::TopologyChanged`, coalesced per heartbeat by each peer's VSS
+/// worker; pd g72 q5). Call it after the change is persisted -- the worker reads the
+/// address when it sends -- and after dropping the topology guard: it only queues
+/// marks and never waits, but keeps queue work out of the guarded span all the same.
+fn notify_peers_of_address_change(asm: &Assembly, node_addr: &IpAddr) {
+    let psnap = asm.policy_mgr.get_current_snapshot();
+    let Some(peers) = psnap.policy().get_peers_for_node(node_addr) else {
+        return;
+    };
+    for peer in peers {
+        if let Some(handle) = asm.vss_mgr.get_handle(&peer.remote_zpr_addr)
+            && !handle.topology_changed()
+        {
+            warn!(target: API, "could not tell peer {} that node {node_addr} moved; its next policy pass or reconnect re-sends its topology", peer.remote_zpr_addr);
+        }
+    }
+}
+
+/// Record the substrate address the node at `node_addr` reported with
+/// `updateSubstrateAddr` (zl-zipline#227). Returns whether it changed.
+///
+/// Under the caller's topology guard ([TopoOps]) and the node commit lock (the lock
+/// every writer of a node's own actor takes; order: topology lock, then node commit
+/// lock). The stored session must still be `session` -- the handle's -- or the node
+/// re-authenticated meanwhile (`authRequired`). The address follows
+/// [crate::connection_control::accept_reported_substrate]: a node whose address policy
+/// declares cannot report another one (`paramError`).
+async fn record_reported_substrate(
+    asm: &Assembly,
+    _ops: &TopoOps<'_>,
+    node_addr: IpAddr,
+    session: Option<&str>,
+    reported: SocketAddr,
+) -> Result<bool, (vsapi::ErrorCode, String)> {
+    let _guard = asm.policy_mgr.node_commit_lock.lock().await;
+    if recheck_before_commit(asm, &node_addr, session, None)
+        .await
+        .is_err()
+    {
+        return Err((
+            vsapi::ErrorCode::AuthRequired,
+            "node is no longer connected; re-authenticate".to_string(),
+        ));
+    }
+    let reported = crate::connection_control::accept_reported_substrate(asm, &node_addr, reported)
+        .map_err(|e| (vsapi::ErrorCode::ParamError, e.to_string()))?;
+    let internal = |what: &str| (vsapi::ErrorCode::Internal, what.to_string());
+    let mut actor = match asm.actor_mgr.get_actor_by_zpr_addr(&node_addr).await {
+        Ok(Some(actor)) if actor.is_node() => actor,
+        Ok(_) => {
+            return Err((
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate".to_string(),
+            ));
+        }
+        Err(e) => {
+            error!(target: API, "cannot load node {node_addr} to update its substrate address: {e}");
+            return Err(internal("internal error"));
+        }
+    };
+    let stored = actor
+        .get_attribute(key::SUBSTRATE_ADDR)
+        .and_then(|a| a.get_value().first().cloned());
+    if stored.as_deref() == Some(reported.to_string().as_str()) {
+        return Ok(false);
+    }
+    info!(target: API, "node {node_addr} substrate address {} -> {reported}", stored.unwrap_or_default());
+    actor
+        .add_attribute(Attribute::builder(key::SUBSTRATE_ADDR).value(reported.to_string()))
+        .map_err(|e| {
+            error!(target: API, "failed to set substrate address of {node_addr}: {e}");
+            internal("internal error")
+        })?;
+    asm.actor_mgr
+        .update_actor(&actor, &asm.policy_service_names())
+        .await
+        .map_err(|e| {
+            error!(target: API, "failed to persist substrate address of {node_addr}: {e}");
+            internal("internal error")
+        })?;
+    Ok(true)
 }
 
 /// Mint a login nonce for the node at `node_addr` whose handle was minted under
@@ -1011,7 +1098,7 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         // commit lock (#63 review audit): a concurrent login/logout of this node
         // cannot land between them. Order: topology lock, then node commit lock.
         let ops = self.asm.topo_mgr.ops().await;
-        let existing_actor = match resume_node_actor_for_open(
+        let (existing_actor, substrate_changed) = match resume_node_actor_for_open(
             &self.asm,
             node_zpr_addr,
             reported_substrate,
@@ -1027,6 +1114,11 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         }
 
         drop(ops);
+
+        // The node came back at a new substrate address: its peers' topology must say so.
+        if substrate_changed {
+            notify_peers_of_address_change(&self.asm, &node_zpr_addr);
+        }
 
         // Skip ahead to the handle:
         let vs_handle: vsapi::v_s_handle::Client =
@@ -1334,6 +1426,10 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         // before ActorJoins: that event drives the topology fan-out, which reads the router.
         install_policy_links_for_node(&self.asm, &ops, &node_actor, &node_zpr_addr).await;
         drop(ops);
+
+        // The node's peers may have been told an older address, or none (`[::]:0`, a
+        // peer that had not connected): re-send their topology (zl-zipline#227).
+        notify_peers_of_address_change(&self.asm, &node_zpr_addr);
 
         let evt = VsEvent::ActorJoins(node_zpr_addr);
         if let Err(e) = self.asm.event_mgr.record_event(evt).await {
@@ -2090,6 +2186,91 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         }
         drop(ops);
 
+        results.get().init_res().set_ok(());
+        Ok(())
+    }
+
+    /// The node's substrate address changed (zl-zipline#227): record it over the
+    /// existing session, with no re-authentication, and re-send `setTopology` to the
+    /// node's peers (coalesced per heartbeat; pd g72 q5).
+    ///
+    /// Under the topology operation lock (see TopoOps), taken first as in
+    /// `report_link_states`: the liveness check and the write cannot interleave with a
+    /// disconnect, reconnect or policy pass. The peers are told after it is dropped.
+    async fn update_substrate_addr(
+        self: Rc<Self>,
+        params: vsapi::v_s_handle::UpdateSubstrateAddrParams,
+        mut results: vsapi::v_s_handle::UpdateSubstrateAddrResults,
+    ) -> Result<(), capnp::Error> {
+        /// Answer with an error.
+        fn refuse(
+            results: &mut vsapi::v_s_handle::UpdateSubstrateAddrResults,
+            code: vsapi::ErrorCode,
+            msg: &str,
+        ) {
+            let mut err_builder = results.get().init_res().init_error();
+            write_error(&mut err_builder, code, msg);
+        }
+
+        let ops = self.asm.topo_mgr.ops().await;
+        if !self.node_is_live().await {
+            warn!(target: API, "update_substrate_addr from disconnected node {:?}: refused", self.node.get_cn());
+            refuse(
+                &mut results,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
+        let Some(node_addr) = self.node.get_zpr_addr().cloned() else {
+            refuse(
+                &mut results,
+                vsapi::ErrorCode::InvalidOperation,
+                "node has no ZPR address assigned",
+            );
+            return Ok(());
+        };
+
+        // Decode and validate at the trust boundary: the same rules as the
+        // `substrate_addr` connect parameter (a specific address, a non-zero port).
+        let reported = match zpr::vsapi_types::SockAddr::try_from(params.get()?.get_addr()?) {
+            Ok(sa) => SocketAddr::from(sa),
+            Err(e) => {
+                warn!(target: API, "update_substrate_addr from {node_addr}: undecodable address: {e}");
+                refuse(
+                    &mut results,
+                    vsapi::ErrorCode::ParamError,
+                    "undecodable address",
+                );
+                return Ok(());
+            }
+        };
+        if let Err(e) = parse_substrate_addr_str(&reported.to_string()) {
+            refuse(&mut results, vsapi::ErrorCode::ParamError, &e.to_string());
+            return Ok(());
+        }
+
+        let changed = match record_reported_substrate(
+            &self.asm,
+            &ops,
+            node_addr,
+            self.session.as_deref(),
+            reported,
+        )
+        .await
+        {
+            Ok(changed) => changed,
+            Err((code, msg)) => {
+                warn!(target: API, "update_substrate_addr from {node_addr} to {reported}: {msg}");
+                refuse(&mut results, code, &msg);
+                return Ok(());
+            }
+        };
+        drop(ops);
+
+        if changed {
+            notify_peers_of_address_change(&self.asm, &node_addr);
+        }
         results.get().init_res().set_ok(());
         Ok(())
     }
@@ -4286,7 +4467,7 @@ mod tests {
                 .await
                 .unwrap();
             let moved: std::net::SocketAddr = "192.0.2.10:7000".parse().unwrap();
-            let actor = resume_node_actor_for_open(&asm, node, moved, "zode")
+            let (actor, _changed) = resume_node_actor_for_open(&asm, node, moved, "zode")
                 .await
                 .map_err(|(code, msg)| format!("{code:?}: {msg}"))
                 .expect("a reported address stands when policy declares none");
@@ -4391,6 +4572,275 @@ mod tests {
                     );
                 })
                 .await;
+        }
+    }
+
+    /// `VSHandle.updateSubstrateAddr` and telling a node's peers that its address
+    /// changed (zl-zipline#227).
+    mod substrate_updates {
+        use super::*;
+        use crate::assembly::tests::new_assembly_for_tests;
+        use crate::db::PolicyRepo;
+        use crate::policy_mgr::PolicyMgr;
+        use crate::test_helpers::{
+            FakeResolver, make_node_actor_defexp, make_peering, policy_with_peerings_and_node_cns,
+        };
+        use crate::trusted_services::TrustedServicesMgr;
+        use crate::vss::VssCmd;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+        use zpr::vsapi_types::SockAddr;
+        use zpr::write_to::WriteTo;
+
+        /// A laptop: policy declares its links but no address for it.
+        const LAPTOP: &str = "fd5a:5052:3000::1";
+        const LAPTOP_AT: &str = "192.0.2.1:5000";
+        /// The relay: policy declares its address, `[RELAY]:0`.
+        const RELAY: &str = "fd5a:5052:3000::2";
+        /// Not a peer of the laptop.
+        const OTHER: &str = "fd5a:5052:3000::3";
+
+        struct Fixture {
+            asm: Arc<Assembly>,
+            laptop: vsapi::v_s_handle::Client,
+            relay: vsapi::v_s_handle::Client,
+            /// Commands sent to the relay's and the other node's VSS workers.
+            relay_cmds: mpsc::Receiver<VssCmd>,
+            other_cmds: mpsc::Receiver<VssCmd>,
+        }
+
+        /// Policy: laptop -- relay (laptop end has no address), relay -- other. All
+        /// three connected, each with a (test) VSS worker handle.
+        async fn build() -> Fixture {
+            let (laptop, relay, other): (IpAddr, IpAddr, IpAddr) = (
+                LAPTOP.parse().unwrap(),
+                RELAY.parse().unwrap(),
+                OTHER.parse().unwrap(),
+            );
+            let mut lr = make_peering(laptop, relay, "link-lr", vec![]);
+            lr.substrate_a = None;
+            let mut asm = new_assembly_for_tests(None).await;
+            asm.policy_mgr = PolicyMgr::new_with_initial_policy(
+                policy_with_peerings_and_node_cns(
+                    &[lr, make_peering(relay, other, "link-ro", vec![])],
+                    &[],
+                ),
+                PolicyRepo::new(asm.state_db.clone()),
+                Arc::new(FakeResolver::ip_only()),
+                Arc::new(TrustedServicesMgr::new()),
+                PathBuf::from("."),
+                PathBuf::from("."),
+                Arc::new(crate::db::ActorRepo::new(asm.state_db.clone())),
+                None,
+                crate::config::VSConfig::default().get_vs_addr(),
+            )
+            .await
+            .unwrap();
+            let mut laptop_actor = make_node_actor_defexp(LAPTOP, "laptop", LAPTOP_AT);
+            VSHandleImpl::stamp_new_session(&mut laptop_actor);
+            let mut relay_actor =
+                make_node_actor_defexp(RELAY, "relay", &SocketAddr::new(relay, 0).to_string());
+            VSHandleImpl::stamp_new_session(&mut relay_actor);
+            let other_actor = make_node_actor_defexp(OTHER, "other", "192.0.2.3:5000");
+            for actor in [&laptop_actor, &relay_actor, &other_actor] {
+                asm.actor_mgr
+                    .add_node(actor, false, &Default::default())
+                    .await
+                    .unwrap();
+            }
+            let (relay_tx, relay_cmds) = mpsc::channel(8);
+            let (other_tx, other_cmds) = mpsc::channel(8);
+            asm.vss_mgr.insert_test_handle(relay, relay_tx);
+            asm.vss_mgr.insert_test_handle(other, other_tx);
+            let asm = Arc::new(asm);
+            Fixture {
+                laptop: capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), laptop_actor)),
+                relay: capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), relay_actor)),
+                asm,
+                relay_cmds,
+                other_cmds,
+            }
+        }
+
+        /// Call `updateSubstrateAddr`; Ok(()) or the error code the VS answered with.
+        async fn send_update(
+            handle: &vsapi::v_s_handle::Client,
+            addr: &str,
+        ) -> Result<(), vsapi::ErrorCode> {
+            let sa: SocketAddr = addr.parse().unwrap();
+            let mut req = handle.update_substrate_addr_request();
+            SockAddr {
+                addr: sa.ip(),
+                port: sa.port(),
+            }
+            .write_to(&mut req.get().init_addr());
+            let resp = req.send().promise.await.unwrap();
+            let res = resp.get().unwrap().get_res().unwrap();
+            match res.which().unwrap() {
+                vsapi::ok_or_error::Which::Ok(_) => Ok(()),
+                vsapi::ok_or_error::Which::Error(err) => Err(err.unwrap().get_code().unwrap()),
+            }
+        }
+
+        async fn stored_addr(asm: &Assembly, node: &str) -> String {
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&node.parse().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .get_attribute(key::SUBSTRATE_ADDR)
+                .unwrap()
+                .get_value()[0]
+                .clone()
+        }
+
+        /// How many `TopologyChanged` marks are queued on a worker's channel.
+        fn topology_marks(rx: &mut mpsc::Receiver<VssCmd>) -> usize {
+            let mut n = 0;
+            while let Ok(cmd) = rx.try_recv() {
+                if matches!(cmd, VssCmd::TopologyChanged) {
+                    n += 1;
+                }
+            }
+            n
+        }
+
+        /// A new address is stored and the laptop's peers (only them) are told.
+        #[tokio::test]
+        async fn update_stores_the_address_and_notifies_peers() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let mut f = build().await;
+                    assert_eq!(send_update(&f.laptop, "198.51.100.9:6000").await, Ok(()));
+                    assert_eq!(stored_addr(&f.asm, LAPTOP).await, "198.51.100.9:6000");
+                    assert_eq!(topology_marks(&mut f.relay_cmds), 1, "the relay is a peer");
+                    assert_eq!(topology_marks(&mut f.other_cmds), 0, "not a peer");
+                })
+                .await;
+        }
+
+        /// The same address again is a no-op: nobody is told.
+        #[tokio::test]
+        async fn update_to_the_same_address_notifies_nobody() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let mut f = build().await;
+                    assert_eq!(send_update(&f.laptop, LAPTOP_AT).await, Ok(()));
+                    assert_eq!(topology_marks(&mut f.relay_cmds), 0);
+                })
+                .await;
+        }
+
+        /// An unspecified address or port 0 is a `paramError`; nothing changes.
+        #[tokio::test]
+        async fn update_rejects_an_unspecified_address_or_port_zero() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let mut f = build().await;
+                    for bad in ["[::]:5000", "0.0.0.0:5000", "198.51.100.9:0"] {
+                        assert_eq!(
+                            send_update(&f.laptop, bad).await,
+                            Err(vsapi::ErrorCode::ParamError),
+                            "{bad}"
+                        );
+                    }
+                    assert_eq!(stored_addr(&f.asm, LAPTOP).await, LAPTOP_AT);
+                    assert_eq!(topology_marks(&mut f.relay_cmds), 0);
+                })
+                .await;
+        }
+
+        /// A node whose address policy declares cannot report another one.
+        #[tokio::test]
+        async fn update_contradicting_policy_is_a_param_error() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let mut f = build().await;
+                    assert_eq!(
+                        send_update(&f.relay, "198.51.100.9:6000").await,
+                        Err(vsapi::ErrorCode::ParamError)
+                    );
+                    assert_eq!(topology_marks(&mut f.other_cmds), 0);
+                })
+                .await;
+        }
+
+        /// A handle from a superseded session is refused with `authRequired`.
+        #[tokio::test]
+        async fn update_from_a_dead_handle_is_refused() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let mut f = build().await;
+                    // The laptop reconnects: a new session generation is persisted.
+                    let mut actor = f
+                        .asm
+                        .actor_mgr
+                        .get_actor_by_zpr_addr(&LAPTOP.parse().unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    VSHandleImpl::stamp_new_session(&mut actor);
+                    f.asm
+                        .actor_mgr
+                        .update_actor(&actor, &f.asm.policy_service_names())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        send_update(&f.laptop, "198.51.100.9:6000").await,
+                        Err(vsapi::ErrorCode::AuthRequired)
+                    );
+                    assert_eq!(stored_addr(&f.asm, LAPTOP).await, LAPTOP_AT);
+                    assert_eq!(topology_marks(&mut f.relay_cmds), 0);
+                })
+                .await;
+        }
+
+        /// The update runs under the topology operation lock (TopoOps).
+        #[tokio::test]
+        async fn update_waits_for_the_topology_operation_lock() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let f = build().await;
+                    let held = f.asm.topo_mgr.ops().await;
+                    let update = tokio::task::spawn_local({
+                        let handle = f.laptop.clone();
+                        async move { send_update(&handle, "198.51.100.9:6000").await }
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    assert!(!update.is_finished(), "the update must wait for the lock");
+                    assert_eq!(stored_addr(&f.asm, LAPTOP).await, LAPTOP_AT);
+                    drop(held);
+                    assert_eq!(update.await.unwrap(), Ok(()));
+                })
+                .await;
+        }
+
+        /// `open` with a changed address notifies the peers; with the same one it does not.
+        #[tokio::test]
+        async fn open_with_a_changed_address_notifies_peers() {
+            let mut f = build().await;
+            let laptop: IpAddr = LAPTOP.parse().unwrap();
+            let (_actor, changed) =
+                resume_node_actor_for_open(&f.asm, laptop, LAPTOP_AT.parse().unwrap(), "laptop")
+                    .await
+                    .map_err(|(code, msg)| format!("{code:?}: {msg}"))
+                    .unwrap();
+            assert!(!changed, "same address: open does not notify");
+
+            let (_actor, changed) = resume_node_actor_for_open(
+                &f.asm,
+                laptop,
+                "198.51.100.9:6000".parse().unwrap(),
+                "laptop",
+            )
+            .await
+            .map_err(|(code, msg)| format!("{code:?}: {msg}"))
+            .unwrap();
+            assert!(changed);
+            // `open` notifies after it drops the topology guard; this is that step.
+            notify_peers_of_address_change(&f.asm, &laptop);
+            assert_eq!(topology_marks(&mut f.relay_cmds), 1);
         }
     }
 }
