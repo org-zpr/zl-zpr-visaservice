@@ -26,7 +26,7 @@ use libeval::attribute::{AttrMatch, attributes_equivalent};
 use libeval::eval_route::{RouteHint, TopologyQueryApi};
 use libeval::policy::LinkDescription;
 use libeval::route::{LinkId, NodeId, Route};
-use zpr::vsapi_types::LinkStateReport;
+use zpr::vsapi_types::{LinkState, LinkStateReport};
 
 /// Proof that the caller holds the topology operation lock ([TopologyMgr::ops]).
 ///
@@ -203,6 +203,10 @@ impl TopologyMgr {
     /// session generation than the node's latest is dropped
     /// (`LinkStateTable::accept_session`): a soft reconnect keeps the router node, so a
     /// late report from the replaced session must not overwrite the new one's.
+    ///
+    /// A `failed` entry also marks the pair {reporter, that peer} failed (R13a). The
+    /// peer is the policy-declared peer of `reporter` whose CN (from the same policy
+    /// snapshot) is the entry's `peerCn`. Recording a report never sends topology.
     pub fn record_link_states(
         &self,
         _ops: &TopoOps<'_>,
@@ -213,17 +217,26 @@ impl TopologyMgr {
     ) -> Vec<(IpAddr, IpAddr)> {
         let mut table = self.link_state.lock().unwrap();
         let snapshot = current_policy();
+        let declared_peers: Vec<IpAddr> = snapshot
+            .policy()
+            .get_peers_for_node(reporter)
+            .unwrap_or(&[])
+            .iter()
+            .map(|p| p.remote_zpr_addr)
+            .collect();
         self.record_locked(
             &mut table,
             reporter,
             session,
             entries,
             &Self::policy_cn_lookup(&snapshot),
+            &declared_peers,
         )
     }
 
     /// As [Self::record_link_states], with a fixed node-address -> CN lookup instead of a
-    /// policy. For tests, which have no compiled policy naming CNs.
+    /// policy. For tests, which have no compiled policy naming CNs; the reporter's router
+    /// peers stand in for its policy-declared peers.
     #[cfg(test)]
     pub fn record_link_states_with_cns(
         &self,
@@ -234,13 +247,24 @@ impl TopologyMgr {
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
     ) -> Vec<(IpAddr, IpAddr)> {
         let mut table = self.link_state.lock().unwrap();
-        self.record_locked(&mut table, reporter, session, entries, cn_of)
+        let declared_peers = self.router.get_peers(reporter);
+        self.record_locked(
+            &mut table,
+            reporter,
+            session,
+            entries,
+            cn_of,
+            &declared_peers,
+        )
     }
 
     /// Body of [Self::record_link_states], with the table locked by the caller: one
     /// critical section from storing the snapshot through the last router update, so
     /// two overlapping reports cannot interleave and leave an older evaluation's flag
     /// on the router (table, then router: the same order as installs).
+    ///
+    /// `declared_peers` are the reporter's peers; a `failed` entry marks the pair with
+    /// the one whose CN it names (R13a).
     fn record_locked(
         &self,
         table: &mut LinkStateTable,
@@ -248,6 +272,7 @@ impl TopologyMgr {
         session: Option<&str>,
         entries: Vec<LinkStateReport>,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
+        declared_peers: &[IpAddr],
     ) -> Vec<(IpAddr, IpAddr)> {
         if !table.accept_session(*reporter, session) {
             debug!(target: TOPO, "link-state report from {reporter}: from a superseded session; dropped");
@@ -260,6 +285,22 @@ impl TopologyMgr {
         if !self.router.has_node(reporter) {
             debug!(target: TOPO, "link-state report from {reporter}: node is no longer connected; dropped");
             return Vec::new();
+        }
+        // R13a: remember each pair whose link the owner reports `failed`. A CN that
+        // names none of the reporter's peers marks nothing (it may race a policy change).
+        for entry in entries.iter().filter(|e| e.state == LinkState::Failed) {
+            match declared_peers
+                .iter()
+                .find(|p| cn_of(p).as_deref() == Some(entry.peer_cn.as_str()))
+            {
+                Some(peer) => {
+                    info!(target: TOPO, "link {reporter} <-> {peer} reported failed; left out of topology until either end reconnects");
+                    table.mark_failed(*reporter, *peer);
+                }
+                None => {
+                    debug!(target: TOPO, "failed report from {reporter} for peerCn '{}': no such peer; nothing marked", entry.peer_cn);
+                }
+            }
         }
         table.set_snapshot(*reporter, entries);
         self.refresh_links_locked(table, reporter, cn_of)
@@ -314,6 +355,25 @@ impl TopologyMgr {
     ) -> bool {
         let (a_cn, b_cn) = (cn_of(a), cn_of(b));
         table.edge_usable(a, a_cn.as_deref(), b, b_cn.as_deref())
+    }
+
+    /// True if the owner of the link between `a` and `b` reported it `failed` and the
+    /// pair has not been cleared since (R13a): the link is left out of both ends'
+    /// topology. A read, like visa issuance, so it takes no [TopoOps].
+    pub fn is_failed_pair(&self, a: &IpAddr, b: &IpAddr) -> bool {
+        self.link_state.lock().unwrap().is_failed(a, b)
+    }
+
+    /// Clear every failed pair `node` is part of (R13a): something about those pairs
+    /// changed, so the visa service proposes their links again. Returns the other end
+    /// of each cleared pair; the caller sends those nodes `setTopology` once it has
+    /// dropped the guard (see `vsapi_worker::repropose_failed_pairs`).
+    ///
+    /// This is the one entry point for "the pair changed". In #250 the only such event
+    /// is a (re)connect of the node's VS-API session; #227's `updateSubstrateAddr` and
+    /// v2's ZBOLT/rendezvous step are meant to call it too.
+    pub fn clear_failed_pairs_for(&self, _ops: &TopoOps<'_>, node: &IpAddr) -> Vec<IpAddr> {
+        self.link_state.lock().unwrap().clear_failed_for(node)
     }
 
     /// Is `addr` a node in the router?
@@ -1916,6 +1976,159 @@ mod tests {
             "no reports after a restart: the link is down"
         );
         report_both_up_and_check(&topo, a, b);
+    }
+
+    // --- R13a: failed pairs (ZODE_LINKS.md) ---
+
+    /// Two router nodes a, b with a link, and their CN table.
+    fn two_linked_nodes() -> (TopologyMgr, IpAddr, IpAddr) {
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let topo = TopologyMgr::new(LinkRepo::new(Arc::new(FakeDb::new())));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        (topo, a, b)
+    }
+
+    #[test]
+    fn test_failed_report_marks_the_pair() {
+        let (topo, a, b) = two_linked_nodes();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("b.zpr", LinkState::Failed)],
+            &cn_of,
+        );
+        assert!(topo.is_failed_pair(&a, &b));
+        assert!(topo.is_failed_pair(&b, &a), "the pair is unordered");
+    }
+
+    #[test]
+    fn test_up_and_down_reports_neither_set_nor_clear_the_mark() {
+        let (topo, a, b) = two_linked_nodes();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        for state in [LinkState::Down, LinkState::Up] {
+            topo.record_link_states_with_cns(
+                &topo.ops_now(),
+                &a,
+                None,
+                vec![report("b.zpr", state)],
+                &cn_of,
+            );
+            assert!(!topo.is_failed_pair(&a, &b), "{state:?} sets no mark");
+        }
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("b.zpr", LinkState::Failed)],
+            &cn_of,
+        );
+        for state in [LinkState::Down, LinkState::Up] {
+            topo.record_link_states_with_cns(
+                &topo.ops_now(),
+                &b,
+                None,
+                vec![report("a.zpr", state)],
+                &cn_of,
+            );
+            topo.record_link_states_with_cns(
+                &topo.ops_now(),
+                &a,
+                None,
+                vec![report("b.zpr", state)],
+                &cn_of,
+            );
+            assert!(topo.is_failed_pair(&a, &b), "{state:?} clears no mark");
+        }
+    }
+
+    #[test]
+    fn test_failed_report_from_a_superseded_session_marks_nothing() {
+        let (topo, a, b) = two_linked_nodes();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        topo.record_link_states_with_cns(&topo.ops_now(), &a, Some("7-new"), vec![], &cn_of);
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            Some("6-old"),
+            vec![report("b.zpr", LinkState::Failed)],
+            &cn_of,
+        );
+        assert!(!topo.is_failed_pair(&a, &b));
+    }
+
+    #[test]
+    fn test_failed_report_for_an_unknown_cn_marks_nothing() {
+        let (topo, a, b) = two_linked_nodes();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("stranger.zpr", LinkState::Failed)],
+            &cn_of,
+        );
+        assert!(!topo.is_failed_pair(&a, &b));
+    }
+
+    #[test]
+    fn test_clear_failed_pairs_for_returns_the_other_ends() {
+        let (topo, a, b) = two_linked_nodes();
+        let c = ip("fd5a:5052::3");
+        topo.add_node(c).unwrap();
+        topo.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr"), (c, "c.zpr")]);
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![
+                report("b.zpr", LinkState::Failed),
+                report("c.zpr", LinkState::Failed),
+            ],
+            &cn_of,
+        );
+        // C reconnects: only the A-C pair is cleared, and A is the end to tell.
+        assert_eq!(topo.clear_failed_pairs_for(&topo.ops_now(), &c), vec![a]);
+        assert!(!topo.is_failed_pair(&a, &c));
+        assert!(topo.is_failed_pair(&a, &b));
+    }
+
+    #[tokio::test]
+    async fn test_policy_pass_keeps_failed_marks() {
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr = make_policy_mgr_with_cns(db.clone(), a, b).await;
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.restore_from_state(&topo.ops_now(), &policy_mgr.get_current_snapshot(), &[a, b])
+            .await
+            .unwrap();
+        topo.record_link_states(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("b.zpr", LinkState::Failed)],
+            &|| policy_mgr.get_current_snapshot(),
+        );
+        assert!(
+            topo.is_failed_pair(&a, &b),
+            "marked from the policy's peers"
+        );
+        topo.revalidate_against_policy(
+            &topo.ops_now(),
+            &policy_mgr.get_current_snapshot(),
+            &[a, b],
+            &|| policy_mgr.get_current_snapshot(),
+        )
+        .await
+        .unwrap();
+        assert!(topo.is_failed_pair(&a, &b), "a policy pass clears no mark");
     }
 
     #[test]

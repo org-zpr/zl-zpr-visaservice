@@ -21,6 +21,13 @@
 //! The table lives in memory only. After a visa-service restart, or once a node's
 //! reports are forgotten ([LinkStateTable::remove_node]), that node's links are down
 //! until it reports again, which nodes do after every (re)connect.
+//!
+//! The table also remembers **failed pairs** (R13a): node pairs whose link the owner
+//! reported `failed`. The visa service leaves such a link out of both ends' topology
+//! until something about the pair changes ([LinkStateTable::clear_failed_for]), so a
+//! link that cannot come up is not proposed, and retried, over and over. Like the
+//! reports, the marks are in memory only: a visa-service restart forgets them, and
+//! every link is proposed again.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -36,6 +43,14 @@ pub struct LinkStateTable {
     /// has carried (see [session_generation]). A report from a lower generation is from
     /// a session the node has since replaced, and is dropped.
     latest_session: HashMap<IpAddr, u64>,
+    /// Unordered node pairs whose link the owner reported `failed` (R13a), each stored
+    /// as (lower address, higher address); see [failed_pair_key].
+    failed_pairs: HashSet<(IpAddr, IpAddr)>,
+}
+
+/// The key of the unordered pair {a, b} in [LinkStateTable::failed_pairs].
+fn failed_pair_key(a: IpAddr, b: IpAddr) -> (IpAddr, IpAddr) {
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 /// The generation of a VS-API session id: the decimal number before the first `-`
@@ -60,8 +75,39 @@ impl LinkStateTable {
         self.snapshots.insert(reporter, snapshot);
     }
 
+    /// Remember that the link between `a` and `b` failed: its owner reported `failed`
+    /// after the link-up window (R13a). The mark stays until [Self::clear_failed_for]
+    /// clears it; `up` and `down` reports never touch it.
+    pub fn mark_failed(&mut self, a: IpAddr, b: IpAddr) {
+        self.failed_pairs.insert(failed_pair_key(a, b));
+    }
+
+    /// True if the link between `a` and `b` is marked failed (in either order).
+    pub fn is_failed(&self, a: &IpAddr, b: &IpAddr) -> bool {
+        self.failed_pairs.contains(&failed_pair_key(*a, *b))
+    }
+
+    /// Clear every failed pair `node` is part of, because something about those pairs
+    /// changed (R13a). Returns the other end of each cleared pair.
+    pub fn clear_failed_for(&mut self, node: &IpAddr) -> Vec<IpAddr> {
+        let mut others = Vec::new();
+        self.failed_pairs.retain(|&(x, y)| {
+            let other = if x == *node {
+                y
+            } else if y == *node {
+                x
+            } else {
+                return true;
+            };
+            others.push(other);
+            false
+        });
+        others
+    }
+
     /// Forget a node's reports (it disconnected or was reset). Afterwards it counts as a
-    /// non-reporter again, so its links are down until it reports again (R14).
+    /// non-reporter again, so its links are down until it reports again (R14). Its
+    /// failed pairs are kept: only a (re)connect clears them (R13a).
     pub fn remove_node(&mut self, node: &IpAddr) {
         self.snapshots.remove(node);
         self.latest_session.remove(node);
@@ -243,6 +289,48 @@ mod tests {
         assert!(!usable(&t), "B's reports went with it; the link is down");
         t.set_snapshot(ip(B), vec![entry("a.zpr", LinkState::Up)]);
         assert!(usable(&t), "B reported up again");
+    }
+
+    // --- R13a: failed pairs ---
+
+    const C: &str = "fd5a:5052::3";
+
+    #[test]
+    fn a_failed_pair_is_unordered() {
+        let mut t = LinkStateTable::new();
+        assert!(!t.is_failed(&ip(A), &ip(B)));
+        t.mark_failed(ip(B), ip(A));
+        assert!(t.is_failed(&ip(A), &ip(B)));
+        assert!(t.is_failed(&ip(B), &ip(A)));
+        assert!(!t.is_failed(&ip(A), &ip(C)));
+    }
+
+    #[test]
+    fn clearing_a_node_clears_only_its_pairs_and_returns_the_other_ends() {
+        let mut t = LinkStateTable::new();
+        t.mark_failed(ip(A), ip(B));
+        t.mark_failed(ip(C), ip(A));
+        t.mark_failed(ip(B), ip(C));
+        let mut others = t.clear_failed_for(&ip(A));
+        others.sort();
+        assert_eq!(others, vec![ip(B), ip(C)]);
+        assert!(!t.is_failed(&ip(A), &ip(B)));
+        assert!(!t.is_failed(&ip(A), &ip(C)));
+        assert!(t.is_failed(&ip(B), &ip(C)), "a pair without A stays marked");
+        assert!(
+            t.clear_failed_for(&ip(A)).is_empty(),
+            "nothing left to clear"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_nodes_reports_keeps_its_failed_pairs() {
+        // Only a (re)connect clears a mark (R13a); a disconnect forgets the reports
+        // but the visa service still must not propose the link again.
+        let mut t = LinkStateTable::new();
+        t.mark_failed(ip(A), ip(B));
+        t.remove_node(&ip(A));
+        assert!(t.is_failed(&ip(A), &ip(B)));
     }
 
     #[test]

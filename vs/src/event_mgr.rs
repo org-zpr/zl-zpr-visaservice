@@ -115,6 +115,24 @@ async fn handle_actor_leaves(
     Ok(())
 }
 
+/// Send `setTopology` from `psnap` to every node in `nodes` that has a VSS worker, in
+/// parallel. A node without one is skipped (it gets topology when its worker starts).
+/// Failures are logged. Never call this under a [TopoOps]: it waits on node RPCs.
+pub(crate) async fn send_topology_to(asm: &Assembly, psnap: &PolicySnapshot, nodes: &[IpAddr]) {
+    let futs = nodes.iter().filter_map(|naddr| {
+        let peers = psnap.resolved_peers_for_node(naddr);
+        // Same snapshot the peers came from: the worker builds the wire Links and
+        // mints bootstrap visas off it.
+        let policy = psnap.policy_arc();
+        asm.vss_mgr.get_handle(naddr).map(|vss_handle| async move {
+            if let Err(e) = vss_handle.set_topology(peers, policy).await {
+                error!(target: EVENT, "failed to set topology for node {}: {}", naddr, e);
+            }
+        })
+    });
+    join_all(futs).await;
+}
+
 /// Re-push the current auth-services list to all connected nodes. The list is the
 /// policy's OIDC identity providers (see `ActorMgr::get_auth_services_list`), so it
 /// can only change when policy does.
@@ -255,19 +273,7 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     reconciled?;
 
     if !valid_node_addrs.is_empty() {
-        // Queue up setTopology messages in parallel.
-        let futs = valid_node_addrs.iter().filter_map(|naddr| {
-            let peers = psnap.resolved_peers_for_node(naddr);
-            // Same snapshot the peers came from: the worker builds the wire Links and
-            // mints bootstrap visas off it.
-            let policy = psnap.policy_arc();
-            asm.vss_mgr.get_handle(naddr).map(|vss_handle| async move {
-                if let Err(e) = vss_handle.set_topology(peers, policy).await {
-                    error!(target: EVENT, "failed to set topology for node {}: {}", naddr, e);
-                }
-            })
-        });
-        join_all(futs).await;
+        send_topology_to(asm, &psnap, &valid_node_addrs).await;
 
         // A policy update can change the auth-services list (OIDC providers are
         // declared in policy). Re-push the current list so surviving nodes stay in
