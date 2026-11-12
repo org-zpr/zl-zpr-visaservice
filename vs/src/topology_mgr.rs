@@ -188,9 +188,15 @@ impl TopologyMgr {
         self.router.link_between(a, b).is_some_and(|l| l.up)
     }
 
-    /// True if every link of a route still exists and is up. See [Router::links_up].
-    pub fn route_links_up(&self, links: &[LinkId]) -> bool {
-        self.router.links_up(links)
+    /// True if a stored visa's route is still valid: with its recorded node `path`,
+    /// every link exists, is up and joins the matching hop ([Router::route_matches]);
+    /// without one (a route that stays on one node, or no recorded path), every link
+    /// exists and is up ([Router::links_up]).
+    pub fn route_still_valid(&self, links: &[LinkId], path: Option<&[IpAddr]>) -> bool {
+        match path {
+            Some(p) => self.router.route_matches(links, p),
+            None => self.router.links_up(links),
+        }
     }
 
     /// The one place that decides a router link's up/down flag: usable only while both

@@ -445,6 +445,34 @@ impl Router {
             .all(|id| inner.topology.edges.get(id).is_some_and(|l| l.up))
     }
 
+    /// True if a stored visa's route is still exactly what it was chosen as: every link
+    /// in `ids` exists, is up, and joins two adjacent nodes of `path` (the visa's
+    /// recorded node path), one link per hop, in either direction. Checking ids alone
+    /// is not enough: policy reconciliation can move a link id to another edge.
+    pub fn route_matches(&self, ids: &[LinkId], path: &[IpAddr]) -> bool {
+        let hops: HashSet<(IpAddr, IpAddr)> = path
+            .windows(2)
+            .map(|w| {
+                if w[0] <= w[1] {
+                    (w[0], w[1])
+                } else {
+                    (w[1], w[0])
+                }
+            })
+            .collect();
+        if hops.len() != ids.len() {
+            return false;
+        }
+        let inner = self.inner.read().unwrap();
+        ids.iter().all(|id| {
+            inner.topology.edges.get(id).is_some_and(|l| {
+                let (a, b) = (l.a.0, l.b.0);
+                let pair = if a <= b { (a, b) } else { (b, a) };
+                l.up && hops.contains(&pair)
+            })
+        })
+    }
+
     /// Current link between two node addrs, in either order (edges are undirected).
     /// Returns `None` if no link connects them.
     pub fn link_between(&self, a: &IpAddr, b: &IpAddr) -> Option<RouterLink> {
@@ -2188,5 +2216,42 @@ mod tests {
         assert_eq!(ab.id, LinkId("ab".into()));
         assert!(!ab.up, "restored with its flag");
         assert_eq!(r.link_snapshot().len(), 3);
+    }
+
+    #[test]
+    fn test_route_matches_requires_each_link_to_join_path_hops() {
+        // A link id moved to another edge (policy reconciliation can do that) must not
+        // pass for the edge the path recorded.
+        let (r, a, b, c) = make_triangle();
+        let ab = LinkId("ab".into());
+        let bc = LinkId("bc".into());
+        let path = [a, b, c];
+        assert!(r.route_matches(&[ab.clone(), bc.clone()], &path));
+        assert!(
+            r.route_matches(&[bc.clone(), ab.clone()], &[c, b, a]),
+            "either direction"
+        );
+
+        // Move id "bc" from b-c to a-c: ids still exist and are up, the route does not.
+        r.apply_link_batch(
+            &[bc.clone(), LinkId("ac".into())],
+            vec![LinkSpec {
+                a,
+                b: c,
+                id: bc.clone(),
+                attributes: vec![],
+                cost: 1,
+                up: true,
+            }],
+        )
+        .unwrap();
+        assert!(r.links_up(&[ab.clone(), bc.clone()]));
+        assert!(!r.route_matches(&[ab.clone(), bc.clone()], &path));
+
+        // A down link fails too, and so does a hop count mismatch.
+        let (r, a, b, c) = make_triangle();
+        r.set_link_up(&LinkId("bc".into()), false);
+        assert!(!r.route_matches(&[ab.clone(), LinkId("bc".into())], &[a, b, c]));
+        assert!(!r.route_matches(&[ab], &[a, b, c]));
     }
 }

@@ -525,7 +525,7 @@ mod tests {
         db.set_set_ex_fault(FaultMode::Reject);
         assert!(
             asm.visa_mgr
-                .revoke_if_route_down(&asm, id, &route.links)
+                .revoke_if_route_down(&asm, id, &route.links, None)
                 .await
                 .is_err(),
             "a stale visa that could not be revoked must not be issued"
@@ -561,7 +561,7 @@ mod tests {
         // A route that is still up is left alone.
         assert!(
             asm.visa_mgr
-                .revoke_if_route_down(&asm, id, &[])
+                .revoke_if_route_down(&asm, id, &[], None)
                 .await
                 .is_ok()
         );

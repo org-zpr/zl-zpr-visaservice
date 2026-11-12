@@ -537,13 +537,20 @@ impl VisaMgr {
             )
             .await?;
 
-        self.revoke_if_route_down(asm, vwmd.visa.issuer_id, &route.links)
-            .await?;
+        self.revoke_if_route_down(
+            asm,
+            vwmd.visa.issuer_id,
+            &route.links,
+            vwmd.metadata.path.as_deref(),
+        )
+        .await?;
         Ok(vwmd)
     }
 
     /// Commit-time check for a just-stored visa (zl-zipline#224). A link on its route
-    /// may have gone down after the route was chosen and before the visa was stored;
+    /// may have gone down, or its id moved to another edge, after the route was chosen
+    /// and before the visa was stored; `path` is the visa's recorded node path, against
+    /// which each route link's endpoints are checked;
     /// the link-down revocation pass lists the visas stored when it ran, so it can miss
     /// this one. Called once the visa is committed: if the link went down before this
     /// check, the check catches it; if it goes down after, the pass finds the visa.
@@ -558,8 +565,9 @@ impl VisaMgr {
         asm: &Assembly,
         visa_id: u64,
         links: &[LinkId],
+        path: Option<&[IpAddr]>,
     ) -> Result<(), ServiceError> {
-        if asm.topo_mgr.route_links_up(links) {
+        if asm.topo_mgr.route_still_valid(links, path) {
             return Ok(());
         }
         warn!(target: VISA, "visa {visa_id}: a link on its route went down while it was issued; revoking it");
