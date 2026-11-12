@@ -136,6 +136,27 @@ impl OidcSessionRecord {
     }
 }
 
+/// Refuse a node's login when the live policy generation is no longer the one
+/// `psnap` -- the snapshot the login was validated and authorized under --
+/// names (#63 review): an install in between may have removed or changed the
+/// provider, and its reconciliation has already looked at the pre-login actor.
+/// `temporarilyUnavailable`: the node fetches a new nonce and logs in again
+/// under the new policy. A window between this check and the write remains;
+/// it is bounded by the install's re-authentication obligation, because the
+/// persisted actor still carries the old `zpr.vinst` (zipline#123).
+fn ensure_policy_unchanged(asm: &Assembly, psnap: &PolicySnapshot) -> Result<(), ServiceError> {
+    if asm.policy_mgr.get_current_snapshot().vinst() != psnap.vinst() {
+        info!(target: CC, "login refused: policy changed while it was being authorized");
+        return Err(ApiResponseError::new(
+            ErrorCode::TemporarilyUnavailable,
+            "policy changed during login; retry",
+            config::LOGIN_POLICY_CHANGED_RETRY_SECS,
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Refuse a node's self-renewal when the stored actor's VS-API session
 /// generation (`zpr.session`) is no longer `expected` (#63 review): the node
 /// re-authenticated while the renewal was in flight, and persisting the
@@ -1497,6 +1518,9 @@ impl ConnectionControl {
                 .get_attribute(key::SESSION)
                 .and_then(|a| a.get_single_value().ok());
             ensure_session_unchanged(&asm, &zpr_addr, loaded_session.as_deref()).await?;
+        }
+        if user_change == UserNamespaceChange::Gain {
+            ensure_policy_unchanged(&asm, &psnap)?;
         }
         asm.actor_mgr
             .update_actor(&renewed, &asm.policy_service_names())
@@ -8831,6 +8855,28 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Review fix (#63 round 7, Codex P1): a login validated under a policy
+    /// snapshot that an install has since replaced is not persisted.
+    #[tokio::test]
+    async fn test_login_refused_when_policy_snapshot_is_stale() {
+        let cn = "zode-aa.zpr";
+        let (asm, _cc, _addr, privkey) = zode_fixture(cn).await;
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        assert!(ensure_policy_unchanged(&asm, &psnap).is_ok());
+
+        let pubkey_der = privkey.public_key_to_der().unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .await
+            .expect("a new policy installs");
+        let api = api_err::<()>(ensure_policy_unchanged(&asm, &psnap));
+        assert!(
+            matches!(api.code, ErrorCode::TemporarilyUnavailable),
+            "got {:?}",
+            api.code
         );
     }
 

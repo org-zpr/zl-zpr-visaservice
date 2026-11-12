@@ -92,6 +92,10 @@ pub const NAMESPACE_SWEEP_ATTEMPTS: usize = 3;
 /// record every verdict runs again (zl-zipline#232 review).
 pub const RECONCILE_RETRY: Duration = Duration::from_secs(30);
 
+/// Retry hint (seconds) sent with `temporarilyUnavailable` when a node's login
+/// is refused because policy changed while it was authorized (zl-zipline#232).
+pub const LOGIN_POLICY_CHANGED_RETRY_SECS: u32 = 1;
+
 pub const MAX_VISA_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
 /// A visa must be valid for at least this long to be worth issuing. Below this the node
