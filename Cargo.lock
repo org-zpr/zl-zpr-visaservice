@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "admin-api-types"
-version = "0.21.1"
+version = "0.22.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "build-info"
-version = "0.21.1"
+version = "0.22.0"
 
 [[package]]
 name = "bumpalo"
@@ -1816,7 +1816,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libeval"
-version = "0.21.1"
+version = "0.22.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3702,7 +3702,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vs"
-version = "0.21.1"
+version = "0.22.0"
 dependencies = [
  "admin-api-types",
  "arc-swap",
@@ -3760,7 +3760,7 @@ dependencies = [
 
 [[package]]
 name = "vs-admin"
-version = "0.21.1"
+version = "0.22.0"
 dependencies = [
  "admin-api-types",
  "base64 0.22.1",
@@ -4363,7 +4363,7 @@ dependencies = [
 
 [[package]]
 name = "zpr-attr-server"
-version = "0.21.1"
+version = "0.22.0"
 dependencies = [
  "axum",
  "chrono",
@@ -4389,7 +4389,7 @@ dependencies = [
 
 [[package]]
 name = "zpt"
-version = "0.21.1"
+version = "0.22.0"
 dependencies = [
  "build-info",
  "bytes",
