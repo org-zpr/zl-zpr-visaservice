@@ -30,10 +30,20 @@ use zpr::vsapi_types::{LinkState, LinkStateReport};
 pub struct LinkStateTable {
     /// Reporting node's ZPR address -> (peer CN -> reported state).
     snapshots: HashMap<IpAddr, HashMap<String, LinkState>>,
-    /// Node's ZPR address -> the VS-API session its reports must come from. Set when
-    /// the node (re)connects ([LinkStateTable::begin_session]); a report from any other
-    /// session is stale. A node with no entry accepts any report.
-    sessions: HashMap<IpAddr, Option<String>>,
+    /// Node's ZPR address -> the highest VS-API session generation a report from it
+    /// has carried (see [session_generation]). A report from a lower generation is from
+    /// a session the node has since replaced, and is dropped.
+    latest_session: HashMap<IpAddr, u64>,
+}
+
+/// The generation of a VS-API session id: the decimal number before the first `-`
+/// (`stamp_new_session` in vsapi_worker mints `"<generation>-<uuid>"` from a counter
+/// that only goes up). An id without one, or no session, counts as generation 0.
+pub fn session_generation(session: Option<&str>) -> u64 {
+    session
+        .and_then(|s| s.split_once('-'))
+        .and_then(|(generation, _)| generation.parse().ok())
+        .unwrap_or(0)
 }
 
 impl LinkStateTable {
@@ -52,23 +62,21 @@ impl LinkStateTable {
     /// non-reporter again.
     pub fn remove_node(&mut self, node: &IpAddr) {
         self.snapshots.remove(node);
-        self.sessions.remove(node);
+        self.latest_session.remove(node);
     }
 
-    /// The node (re)connected with VS-API session `session`: drop its reports from any
-    /// earlier session (it re-sends a snapshot after every (re)connect) and accept
-    /// reports only from this session from now on.
-    pub fn begin_session(&mut self, node: IpAddr, session: Option<String>) {
-        self.snapshots.remove(&node);
-        self.sessions.insert(node, session);
-    }
-
-    /// True if a report from `session` may be stored for `node`: no session is
-    /// recorded, or it is the recorded one.
-    pub fn session_current(&self, node: &IpAddr, session: Option<&str>) -> bool {
-        self.sessions
-            .get(node)
-            .is_none_or(|current| current.as_deref() == session)
+    /// True if a report from `session` may be stored for `node`: its generation is at
+    /// least the highest seen from the node, which it then becomes. A late report from
+    /// a session the node has replaced (lower generation) is refused, whichever handle
+    /// happened to be minted last.
+    pub fn accept_session(&mut self, node: IpAddr, session: Option<&str>) -> bool {
+        let generation = session_generation(session);
+        let latest = self.latest_session.entry(node).or_insert(0);
+        if generation < *latest {
+            return false;
+        }
+        *latest = generation;
+        true
     }
 
     /// Does the `reporter` end of a link agree that the link to the peer whose CN is
@@ -233,6 +241,14 @@ mod tests {
         assert!(!usable(&t));
         t.remove_node(&ip(B));
         assert!(usable(&t), "B's veto goes with its reports");
+    }
+
+    #[test]
+    fn session_generation_parses_the_prefix() {
+        assert_eq!(session_generation(Some("42-6f1c")), 42);
+        assert_eq!(session_generation(Some("6f1c-no-number")), 0);
+        assert_eq!(session_generation(Some("plain")), 0);
+        assert_eq!(session_generation(None), 0);
     }
 
     #[test]

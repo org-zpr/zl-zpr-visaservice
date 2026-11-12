@@ -209,16 +209,10 @@ impl VSGateImpl {
 }
 
 impl VSHandleImpl {
-    /// Build the handle for a node's freshly (re)authenticated session. Minting a handle
-    /// is where a new session begins, so this also starts the node's link-state session
-    /// (zl-zipline#224): reports from earlier handles are no longer accepted.
     fn new(asm: Arc<Assembly>, node: Actor) -> Self {
         let session = node
             .get_attribute(key::SESSION)
             .and_then(|a| a.get_single_value().ok().map(str::to_string));
-        if let Some(addr) = node.get_zpr_addr() {
-            asm.topo_mgr.begin_link_session(addr, session.clone());
-        }
         VSHandleImpl { asm, node, session }
     }
 
@@ -227,9 +221,20 @@ impl VSHandleImpl {
     /// persisting the actor and before building its handle: the persisted
     /// session is the current generation, the handle captures it, and every
     /// handle bound to an earlier generation fails [Self::node_is_live].
+    ///
+    /// The id is `"<generation>-<uuid>"`. The generation comes from a process-wide
+    /// counter that only goes up, so link-state reports can tell a newer session from
+    /// an older one (zl-zipline#224, `link_state::session_generation`); the uuid keeps
+    /// ids unpredictable. Session checks elsewhere compare the whole string.
     fn stamp_new_session(actor: &mut Actor) {
+        static SESSION_GENERATION: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let generation = SESSION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         actor
-            .add_attribute(Attribute::builder(key::SESSION).value(uuid::Uuid::new_v4().to_string()))
+            .add_attribute(
+                Attribute::builder(key::SESSION)
+                    .value(format!("{generation}-{}", uuid::Uuid::new_v4())),
+            )
             .expect("session attribute is unvalidated and cannot fail");
     }
 

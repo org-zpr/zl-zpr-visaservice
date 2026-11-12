@@ -118,9 +118,10 @@ impl TopologyMgr {
     /// can revoke the visas that use them. A link coming up is not returned: it affects
     /// new visas only (Zodes plan §5.8).
     ///
-    /// `session` is the VS-API session the report came from. It must be the node's
-    /// current link session ([Self::begin_link_session]); a late report from a session
-    /// the node has since replaced (a soft reconnect keeps the router node) is dropped.
+    /// `session` is the VS-API session the report came from. A report from an older
+    /// session generation than the node's latest is dropped
+    /// (`LinkStateTable::accept_session`): a soft reconnect keeps the router node, so a
+    /// late report from the replaced session must not overwrite the new one's.
     pub fn record_link_states(
         &self,
         reporter: &IpAddr,
@@ -137,18 +138,6 @@ impl TopologyMgr {
             entries,
             &Self::policy_cn_lookup(&snapshot),
         )
-    }
-
-    /// The node at `node` (re)connected with VS-API session `session` (called when its
-    /// handle is minted): its reports from earlier sessions are dropped, and only this
-    /// session's reports are accepted from now on. Under the table lock, so a report is
-    /// checked against the session atomically with being stored.
-    pub fn begin_link_session(&self, node: &IpAddr, session: Option<String>) {
-        let mut table = self.link_state.lock().unwrap();
-        table.begin_session(*node, session);
-        // Its old snapshot no longer counts; re-evaluate its links. The node is now a
-        // non-reporter, so its end agrees whatever the CNs (legacy rule until it reports).
-        self.refresh_links_locked(&table, node, &|_: &IpAddr| None);
     }
 
     /// As [Self::record_link_states], with a fixed node-address -> CN lookup instead of a
@@ -177,7 +166,7 @@ impl TopologyMgr {
         entries: Vec<LinkStateReport>,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
     ) -> Vec<(IpAddr, IpAddr)> {
-        if !table.session_current(reporter, session) {
+        if !table.accept_session(*reporter, session) {
             debug!(target: TOPO, "link-state report from {reporter}: from a superseded session; dropped");
             return Vec::new();
         }
@@ -588,8 +577,6 @@ impl TopologyMgr {
             b: IpAddr,
             persisted: bool,
             old_id: Option<LinkId>,
-            /// Whether the router link was up before this reconciliation.
-            was_up: bool,
         }
 
         let cn_of = Self::policy_cn_lookup(snapshot);
@@ -603,7 +590,6 @@ impl TopologyMgr {
                     a,
                     b,
                     persisted,
-                    was_up: router_link.as_ref().is_some_and(|rl| rl.up),
                     old_id: router_link.map(|rl| rl.id),
                 }),
                 EdgeDecision::Install(desc) => {
@@ -674,11 +660,6 @@ impl TopologyMgr {
         // every changed edge) are listed first so each reassigned id is free before reuse.
         let mut removal_ids: Vec<LinkId> =
             removals.iter().filter_map(|r| r.old_id.clone()).collect();
-        report.links_down = removals
-            .iter()
-            .filter(|r| r.was_up)
-            .map(|r| (r.a, r.b))
-            .collect();
         let mut additions: Vec<LinkSpec> = Vec::new();
         // Link state comes from link-state reports, not policy: every installed or
         // rebuilt link gets the flag its reports call for, inside the atomic batch.
@@ -697,6 +678,13 @@ impl TopologyMgr {
             return Ok(report);
         }
         let flag_cn_of = Self::policy_cn_lookup(&current);
+        // A removed link that is up now (read under the lock: a report may have brought
+        // it up since the decision) carries visas that must be revoked.
+        report.links_down = removals
+            .iter()
+            .filter(|r| self.router.link_between(&r.a, &r.b).is_some_and(|l| l.up))
+            .map(|r| (r.a, r.b))
+            .collect();
         for e in surviving {
             let spec = LinkSpec {
                 a: e.a,
@@ -1933,9 +1921,10 @@ mod tests {
     }
 
     #[test]
-    fn test_report_from_a_superseded_session_is_dropped() {
-        // A soft reconnect keeps the router node; a late report from the old session
-        // must not overwrite the new session's state.
+    fn test_reports_are_ordered_by_session_generation() {
+        // A soft reconnect keeps the router node; a late report from an older session
+        // must not overwrite a newer session's state. Sessions are ordered by their
+        // generation prefix, not by which handle was minted last.
         let a = ip("fd5a:5052::1");
         let b = ip("fd5a:5052::2");
         let topo = TopologyMgr::new(LinkRepo::new(Arc::new(FakeDb::new())));
@@ -1944,31 +1933,44 @@ mod tests {
         topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
         let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
 
-        topo.begin_link_session(&a, Some("s2".into()));
+        // B reports A up. A reconnecting changes nothing by itself: B's report stands.
+        topo.record_link_states_with_cns(
+            &b,
+            Some("1-b"),
+            vec![report("a.zpr", LinkState::Up)],
+            &cn_of,
+        );
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+
+        // A's newer session (generation 7) reports the link down.
         topo.record_link_states_with_cns(
             &a,
-            Some("s1"),
+            Some("7-new"),
             vec![report("b.zpr", LinkState::Down)],
             &cn_of,
         );
-        assert!(
-            topo.router.link_between(&a, &b).unwrap().up,
-            "the old session's report is dropped"
-        );
-        topo.record_link_states_with_cns(
+        assert!(!topo.router.link_between(&a, &b).unwrap().up);
+
+        // A late report from A's older session (generation 6) is dropped.
+        let down = topo.record_link_states_with_cns(
             &a,
-            Some("s2"),
-            vec![report("b.zpr", LinkState::Down)],
+            Some("6-old"),
+            vec![report("b.zpr", LinkState::Up)],
             &cn_of,
         );
+        assert!(down.is_empty());
         assert!(
             !topo.router.link_between(&a, &b).unwrap().up,
-            "the current session's applies"
+            "the older session's report does not overwrite the newer one"
         );
 
-        // A new session starts clean: the node is a non-reporter until it reports.
-        topo.begin_link_session(&a, Some("s3".into()));
-        topo.refresh_links_for_node(&a, &cn_of);
+        // The newer session can still update its state.
+        topo.record_link_states_with_cns(
+            &a,
+            Some("7-new"),
+            vec![report("b.zpr", LinkState::Up)],
+            &cn_of,
+        );
         assert!(topo.router.link_between(&a, &b).unwrap().up);
     }
 
