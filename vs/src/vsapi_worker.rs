@@ -1858,6 +1858,17 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
                 .node_cn_for_addr(addr)
                 .map(str::to_string)
         };
+        // The session may have ended while this report was validated. Re-check it right
+        // before applying; record_link_states additionally drops a report for a node
+        // that has left the router.
+        if !self.node_is_live().await {
+            refuse(
+                &mut results,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
         let went_down = self
             .asm
             .topo_mgr

@@ -121,6 +121,14 @@ impl TopologyMgr {
         // so two overlapping reports cannot interleave and leave an older evaluation's
         // flag on the router (table, then router: the same order as installs).
         let mut table = self.link_state.lock().unwrap();
+        // A report from a node that is no longer in the router -- a stale handle whose
+        // node was disconnected meanwhile -- is dropped: storing it would let a
+        // pre-disconnect snapshot govern the link after the node reconnects.
+        // `remove_node` clears the snapshot and the router node under this same lock.
+        if !self.router.has_node(reporter) {
+            debug!(target: TOPO, "link-state report from {reporter}: node is no longer connected; dropped");
+            return Vec::new();
+        }
         table.set_snapshot(*reporter, entries);
         self.refresh_links_locked(&table, reporter, cn_of)
     }
@@ -719,7 +727,10 @@ impl TopologyMgr {
                 warn!(target: TOPO, "failed to remove persisted edge {} <-> {} on node removal: {}", addr, peer, e);
             }
         }
-        self.link_state.lock().unwrap().remove_node(addr);
+        // Under the table lock, so a concurrent report either lands before (and is
+        // cleared here) or after (and finds the node gone; see record_link_states).
+        let mut table = self.link_state.lock().unwrap();
+        table.remove_node(addr);
         self.router.remove_node(addr)
     }
 
@@ -1644,5 +1655,25 @@ mod tests {
         );
         let (x, y) = report.links_down[0];
         assert!((x, y) == (a, b) || (x, y) == (b, a));
+    }
+
+    #[test]
+    fn test_report_from_a_node_no_longer_in_the_router_is_not_stored() {
+        // A stale handle whose node was disconnected (removed from the router) must
+        // not leave a snapshot behind that would govern the link after a reconnect.
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let topo = TopologyMgr::new(LinkRepo::new(Arc::new(FakeDb::new())));
+        topo.add_node(b).unwrap();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+
+        // A is not a router node: its (down) report is dropped.
+        topo.record_link_states(&a, vec![report("b.zpr", LinkState::Down)], &cn_of);
+
+        // A reconnects and its link is installed: A is a non-reporter, so legacy-up.
+        topo.add_node(a).unwrap();
+        topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        topo.refresh_links_for_node(&a, &cn_of);
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
     }
 }
