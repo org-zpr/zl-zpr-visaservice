@@ -182,6 +182,24 @@ pub(crate) async fn revoke_visas_through_node(
     .await
 }
 
+/// Revoke every live visa whose recorded path has an interior node the router does not
+/// hold transit-capable ([crate::topology_mgr::TopologyMgr::interior_is_transit]).
+///
+/// Startup runs this right after the topology restore (review on visaservice#65). The
+/// visas come back from the store, but the revocations a policy pass owed them do not:
+/// if the service stopped after installing a policy that took a node's transit flag
+/// away and before that pass revoked the visas through it, the restored router already
+/// has the new transit set and reports no change, so nothing else would revoke them.
+/// The caller holds [crate::topology_mgr::TopoOps], so the transit set cannot change
+/// while the paths are checked. See [revoke_visas_on_paths] for how each visa is
+/// revoked and what is returned.
+pub(crate) async fn revoke_visas_through_non_transit(asm: &Arc<Assembly>) -> Result<usize, usize> {
+    revoke_visas_on_paths(asm, "restored route through a non-transit node", |path| {
+        !asm.topo_mgr.interior_is_transit(path)
+    })
+    .await
+}
+
 /// Revoke every live visa whose recorded node path (`VisaMetadata.path`) satisfies
 /// `affected`. `why` names the cause in the logs.
 ///

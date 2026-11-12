@@ -612,26 +612,36 @@ fn tls_connect() -> TlsConnector {
 ///
 /// Only a node actor's claim counts. Trusting the report steers only where peers dial:
 /// the link still needs the peer's CA-signed certificate with the expected CN.
+///
+/// A failed actor read is an error, not case 3: sending `[::]:0` would tell the node to
+/// stop dialling a peer that may well have reported an address, and `send_topology`
+/// would mark the topology synced and never retry. The error keeps it unsynced, so the
+/// next heartbeat tries again.
 async fn peer_substrate_addr(
     asm: &Assembly,
     policy_addr: Option<SocketAddr>,
     peer_zpr_addr: &IpAddr,
-) -> SocketAddr {
+) -> Result<SocketAddr, VssSyncError> {
     if let Some(addr) = policy_addr {
-        return addr;
+        return Ok(addr);
     }
-    let reported = match asm.actor_mgr.get_actor_by_zpr_addr(peer_zpr_addr).await {
-        Ok(Some(actor)) if actor.is_node() => actor
-            .get_attribute(key::SUBSTRATE_ADDR)
-            .and_then(|a| a.get_single_value().ok().map(str::to_string))
-            .and_then(|v| v.parse::<SocketAddr>().ok()),
-        Ok(_) => None,
-        Err(e) => {
-            warn!(target: VSS, "cannot read the reported substrate address of peer {peer_zpr_addr}: {e}");
-            None
-        }
-    };
-    reported.unwrap_or(UNKNOWN_PEER_ADDR)
+    let actor = asm
+        .actor_mgr
+        .get_actor_by_zpr_addr(peer_zpr_addr)
+        .await
+        .map_err(|e| {
+            VssSyncError::Internal(format!(
+                "cannot read the reported substrate address of peer {peer_zpr_addr}: {e}"
+            ))
+        })?;
+    let reported = actor
+        .filter(|a| a.is_node())
+        .and_then(|a| {
+            a.get_attribute(key::SUBSTRATE_ADDR)
+                .and_then(|attr| attr.get_single_value().ok().map(str::to_string))
+        })
+        .and_then(|v| v.parse::<SocketAddr>().ok());
+    Ok(reported.unwrap_or(UNKNOWN_PEER_ADDR))
 }
 
 /// `Link.peer` for a peer whose address is not known yet: don't dial, accept its
@@ -902,7 +912,6 @@ pub(crate) async fn topology_links(
             .iter()
             .find(|(id, _)| *id == link_id)
             .map(|(_, sock_addr)| *sock_addr);
-        let sock_addr = peer_substrate_addr(asm, policy_addr, &peer.remote_zpr_addr).await;
         // The CN the peer's link certificate must carry (zl-zipline#221). A peer policy does
         // not name is left out (operator, pd g44 q2): its node would refuse an unnamed peer
         // (zl-zipline#220), and its bootstrap visas would have no CN to be bound to.
@@ -910,6 +919,7 @@ pub(crate) async fn topology_links(
             warn!(target: VSS, "no CN in policy for peer {} of node {node_addr} (link {link_id}); skipping the link", peer.remote_zpr_addr);
             continue;
         };
+        let sock_addr = peer_substrate_addr(asm, policy_addr, &peer.remote_zpr_addr).await?;
         let mut link = Link {
             link_id,
             role: LinkRole::Active, // only "active" support at the moment.

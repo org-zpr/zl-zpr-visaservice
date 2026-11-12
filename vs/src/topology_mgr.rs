@@ -348,6 +348,12 @@ impl TopologyMgr {
         self.router.link_between(a, b).is_some_and(|l| l.up)
     }
 
+    /// True if every interior node of a visa's recorded node `path` is transit-capable
+    /// ([Router::interior_is_transit]).
+    pub fn interior_is_transit(&self, path: &[IpAddr]) -> bool {
+        self.router.interior_is_transit(path)
+    }
+
     /// True if a stored visa's route is still valid: with its recorded node `path`,
     /// every link exists, is up and joins the matching hop ([Router::route_matches]);
     /// without one (a route that stays on one node, or no recorded path), every link
@@ -553,7 +559,9 @@ impl TopologyMgr {
         node_addrs: &[IpAddr],
     ) -> Result<(), ServiceError> {
         // Which nodes may pass traffic through comes from policy (zl-zipline#227). The
-        // router is empty at startup, so no visa can be using a node that lost transit.
+        // router is empty here, so this reports no loss even when the policy took a
+        // node's flag away before a restart: the caller revokes the restored visas that pass
+        // through a node that is not transit-capable (`revoke_visas_through_non_transit`).
         self.apply_transit_nodes(_ops, snapshot);
 
         // In this code path there should be no cases for errors from add_node.

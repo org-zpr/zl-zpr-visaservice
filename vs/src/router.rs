@@ -492,11 +492,7 @@ impl Router {
         let inner = self.inner.read().unwrap();
         // Every interior node must still be transit-capable (zl-zipline#227): policy can
         // take a node's transit flag away after the route was chosen.
-        let interior = path.get(1..path.len().saturating_sub(1)).unwrap_or(&[]);
-        if !interior
-            .iter()
-            .all(|n| inner.topology.is_transit(&NodeId::from(n)))
-        {
+        if !inner.topology.interior_is_transit(path) {
             return false;
         }
         ids.iter().all(|id| {
@@ -506,6 +502,17 @@ impl Router {
                 l.up && hops.contains(&pair)
             })
         })
+    }
+
+    /// True if every interior node of `path` (a visa's recorded node path) is
+    /// transit-capable: the transit half of [Self::route_matches], for a visa restored
+    /// from the store, which records no link ids.
+    pub fn interior_is_transit(&self, path: &[IpAddr]) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .topology
+            .interior_is_transit(path)
     }
 
     /// Current link between two node addrs, in either order (edges are undirected).
@@ -964,6 +971,13 @@ impl Graph {
     /// another). Any node may be a route's first or last node.
     fn is_transit(&self, node_id: &NodeId) -> bool {
         self.transit.contains(node_id)
+    }
+
+    /// True if every interior node of `path` -- all but its first and last -- is
+    /// transit-capable. A path of one or two nodes has no interior.
+    fn interior_is_transit(&self, path: &[IpAddr]) -> bool {
+        let interior = path.get(1..path.len().saturating_sub(1)).unwrap_or(&[]);
+        interior.iter().all(|n| self.is_transit(&NodeId::from(n)))
     }
 
     /// Replace the transit set and recompute best routes if it changed. Returns the

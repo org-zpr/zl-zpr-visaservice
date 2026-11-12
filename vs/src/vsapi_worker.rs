@@ -492,6 +492,24 @@ fn notify_peers_of_address_change(asm: &Assembly, node_addr: &IpAddr) {
     }
 }
 
+/// Whether a write of a node's reported substrate address (`changed`: the outcome of
+/// [record_reported_substrate] or [resume_node_actor_for_open]) may have changed the
+/// stored claim, so its peers must be told ([notify_peers_of_address_change]).
+///
+/// True on a reported change, and on an internal error too (review r2 on
+/// visaservice#65): the actor write is not atomic, so it can fail after the new address
+/// was stored. The node's retry would then find the address unchanged, and nobody would
+/// tell the peers. A notice when nothing changed only re-sends the current topology.
+fn substrate_may_have_changed<T>(
+    changed: &Result<T, (vsapi::ErrorCode, String)>,
+    flag: impl Fn(&T) -> bool,
+) -> bool {
+    match changed {
+        Ok(v) => flag(v),
+        Err((code, _)) => *code == vsapi::ErrorCode::Internal,
+    }
+}
+
 /// Record the substrate address the node at `node_addr` reported with
 /// `updateSubstrateAddr` (zl-zipline#227). Returns whether it changed.
 ///
@@ -1096,26 +1114,25 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         // commit lock (#63 review audit): a concurrent login/logout of this node
         // cannot land between them. Order: topology lock, then node commit lock.
         let ops = self.asm.topo_mgr.ops().await;
-        let (existing_actor, substrate_changed) = match resume_node_actor_for_open(
+        let resumed = resume_node_actor_for_open(
             &self.asm,
             node_zpr_addr,
             reported_substrate,
             &vs_connect_request.cn,
         )
-        .await
-        {
-            Ok(actor) => actor,
+        .await;
+        drop(ops);
+
+        // The node came back at a new substrate address: its peers' topology must say so.
+        if substrate_may_have_changed(&resumed, |(_, changed)| *changed) {
+            notify_peers_of_address_change(&self.asm, &node_zpr_addr);
+        }
+        let existing_actor = match resumed {
+            Ok((actor, _)) => actor,
             Err((code, message)) => return self.ok_with_open_error(results, code, &message),
         };
         if matches!(vs_connect_request.ctype, ConnectType::Reset) {
             warn!(target: API, "{} requests RESET: not yet implemented", vs_connect_request.cn);
-        }
-
-        drop(ops);
-
-        // The node came back at a new substrate address: its peers' topology must say so.
-        if substrate_changed {
-            notify_peers_of_address_change(&self.asm, &node_zpr_addr);
         }
 
         // Skip ahead to the handle:
@@ -2248,26 +2265,23 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             return Ok(());
         }
 
-        let changed = match record_reported_substrate(
+        let recorded = record_reported_substrate(
             &self.asm,
             &ops,
             node_addr,
             self.session.as_deref(),
             reported,
         )
-        .await
-        {
-            Ok(changed) => changed,
-            Err((code, msg)) => {
-                warn!(target: API, "update_substrate_addr from {node_addr} to {reported}: {msg}");
-                refuse(&mut results, code, &msg);
-                return Ok(());
-            }
-        };
+        .await;
         drop(ops);
 
-        if changed {
+        if substrate_may_have_changed(&recorded, |changed| *changed) {
             notify_peers_of_address_change(&self.asm, &node_addr);
+        }
+        if let Err((code, msg)) = recorded {
+            warn!(target: API, "update_substrate_addr from {node_addr} to {reported}: {msg}");
+            refuse(&mut results, code, &msg);
+            return Ok(());
         }
         results.get().init_res().set_ok(());
         Ok(())
@@ -4577,8 +4591,8 @@ mod tests {
     /// changed (zl-zipline#227).
     mod substrate_updates {
         use super::*;
-        use crate::assembly::tests::new_assembly_for_tests;
-        use crate::db::PolicyRepo;
+        use crate::assembly::tests::new_assembly_with_event_rx_and_db;
+        use crate::db::{FakeDb, FaultMode, PolicyRepo};
         use crate::policy_mgr::PolicyMgr;
         use crate::test_helpers::{
             FakeResolver, make_node_actor_defexp, make_peering, policy_with_peerings_and_node_cns,
@@ -4603,6 +4617,8 @@ mod tests {
             asm: Arc<Assembly>,
             laptop: vsapi::v_s_handle::Client,
             relay: vsapi::v_s_handle::Client,
+            /// The state DB, to inject faults.
+            db: Arc<FakeDb>,
             /// Command receivers of the relay's and the other node's test VSS
             /// workers, kept open so their handles look live.
             _relay_cmds: mpsc::Receiver<VssCmd>,
@@ -4619,7 +4635,8 @@ mod tests {
             );
             let mut lr = make_peering(laptop, relay, "link-lr", vec![]);
             lr.substrate_a = None;
-            let mut asm = new_assembly_for_tests(None).await;
+            let (mut asm, events, db) = new_assembly_with_event_rx_and_db(None).await;
+            std::mem::forget(events);
             asm.policy_mgr = PolicyMgr::new_with_initial_policy(
                 policy_with_peerings_and_node_cns(
                     &[lr, make_peering(relay, other, "link-ro", vec![])],
@@ -4657,6 +4674,7 @@ mod tests {
                 laptop: capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), laptop_actor)),
                 relay: capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), relay_actor)),
                 asm,
+                db,
                 _relay_cmds: relay_cmds,
                 _other_cmds: other_cmds,
             }
@@ -4728,6 +4746,27 @@ mod tests {
                     f.asm.vss_mgr.insert_test_handle(relay, full_tx);
                     assert_eq!(send_update(&f.laptop, "198.51.100.9:6000").await, Ok(()));
                     assert_eq!(topology_marks(&f.asm, RELAY), 1);
+                })
+                .await;
+        }
+
+        /// Review r2: a write that fails after it applied (the attribute pipeline
+        /// commits, a later write errors) still notifies the peers. Otherwise the
+        /// node's retry would find the address unchanged and nobody would ever tell
+        /// them.
+        #[tokio::test]
+        async fn update_that_fails_after_its_write_still_notifies_peers() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let f = build().await;
+                    f.db.set_hset_fault(FaultMode::Reject);
+                    assert_eq!(
+                        send_update(&f.laptop, "198.51.100.9:6000").await,
+                        Err(vsapi::ErrorCode::Internal)
+                    );
+                    f.db.set_hset_fault(FaultMode::None);
+                    assert_eq!(stored_addr(&f.asm, LAPTOP).await, "198.51.100.9:6000");
+                    assert_eq!(topology_marks(&f.asm, RELAY), 1, "the relay is told");
                 })
                 .await;
         }

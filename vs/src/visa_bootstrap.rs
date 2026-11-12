@@ -368,13 +368,29 @@ mod tests {
         peerings: &[zpr::policy_types::Peering],
         node_cns: &[(IpAddr, &str)],
     ) -> Assembly {
+        build_bootstrap_test_asm_on(
+            new_assembly_for_tests(None).await,
+            via_node,
+            peerings,
+            node_cns,
+        )
+        .await
+    }
+
+    /// As [build_bootstrap_test_asm_from_peerings], on a caller-built assembly (e.g. one
+    /// whose fake DB the test holds to inject faults).
+    async fn build_bootstrap_test_asm_on(
+        mut asm: Assembly,
+        via_node: IpAddr,
+        peerings: &[zpr::policy_types::Peering],
+        node_cns: &[(IpAddr, &str)],
+    ) -> Assembly {
         use crate::db::PolicyRepo;
         use crate::policy_mgr::PolicyMgr;
         use crate::test_helpers::{FakeResolver, policy_with_peerings_and_node_cns};
         use crate::trusted_services::TrustedServicesMgr;
         use std::path::PathBuf;
 
-        let mut asm = new_assembly_for_tests(None).await;
         asm.policy_mgr = PolicyMgr::new_with_initial_policy(
             policy_with_peerings_and_node_cns(peerings, node_cns),
             PolicyRepo::new(asm.state_db.clone()),
@@ -966,5 +982,47 @@ mod tests {
         let y_links = relay_links(&asm, &y).await;
         assert_eq!(sock(&x_links[0]), "192.0.2.11:2".parse().unwrap());
         assert_eq!(sock(&y_links[0]), "192.0.2.10:1".parse().unwrap());
+    }
+
+    /// A failed read of a peer's reported address fails the whole call (codex review on
+    /// visaservice#65). Sending the link as `[::]:0` instead would let `send_topology` mark
+    /// the topology synced, replacing the peer's dial address with "don't dial" and never
+    /// retrying. On a non-relay node no bootstrap-visa lookup follows to catch the error.
+    #[tokio::test]
+    async fn topology_links_fail_when_a_reported_address_cannot_be_read() {
+        use crate::test_helpers::make_peering;
+        let relay: IpAddr = RELAY.parse().unwrap();
+        let x: IpAddr = "fd5a:5052:3000::a".parse().unwrap();
+        let y: IpAddr = "fd5a:5052:3000::b".parse().unwrap();
+        let mut peering = make_peering(x, y, "link-xy", vec![]);
+        peering.substrate_b = None; // y's address comes from its report
+        let (asm, _rx, db) = crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let asm = Arc::new(
+            build_bootstrap_test_asm_on(asm, relay, &[peering], &[(x, "x.zpr"), (y, "y.zpr")])
+                .await,
+        );
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp(&y.to_string(), "y.zpr", "192.0.2.11:2"),
+                false,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        db.set_exists_fault(crate::db::FaultMode::Reject);
+        let result = crate::vss_worker::topology_links(
+            &asm,
+            &asm.policy_mgr.get_current(),
+            &x,
+            resolved_peers(&asm, &x),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a lookup failure must not be sent as [::]:0: {result:?}"
+        );
+        db.set_exists_fault(crate::db::FaultMode::None);
+        let links = relay_links(&asm, &x).await;
+        assert_eq!(sock(&links[0]), "192.0.2.11:2".parse().unwrap());
     }
 }
