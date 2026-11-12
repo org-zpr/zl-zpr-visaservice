@@ -150,7 +150,7 @@ pub(crate) enum CommitRecheck {
 /// prepared from an earlier read (#63 review audit): reauthorize (login,
 /// renewal, logout and its fallbacks), the node authenticate persist, the
 /// login-nonce mint and the attribute-refresh write. The caller holds
-/// [ConnectionControl::self_reauth_lock] -- which every writer of a node's own
+/// [crate::policy_mgr::PolicyMgr::node_commit_lock] -- which every writer of a node's own
 /// actor takes -- and calls this right before it commits:
 ///
 /// - `expected_session`: when `Some`, the stored actor must still exist and
@@ -347,15 +347,6 @@ pub struct ConnectionControl {
     /// Outstanding visa-service-minted OIDC login nonces (`getLoginNonce`):
     /// a node's own login on `reauthorize` must spend one (zl-zipline#232).
     pub(crate) login_nonces: LoginNonceStore,
-    /// Serializes a node's reauthorizations of its OWN actor across load ->
-    /// classify -> persist -> record anchors, so two concurrent logins cannot
-    /// both classify as a gain and silently switch users (#63 review). A
-    /// node's authenticate persists its new `zpr.session` under the same lock
-    /// (`vsapi_worker::add_node_serialized`), so a reconnect cannot write
-    /// between a self-renewal's session check and its write.
-    /// ponytail: one global lock; a per-address lock if self-renewals become
-    /// frequent (today only a Zode's login and logout use them).
-    pub(crate) self_reauth_lock: tokio::sync::Mutex<()>,
 }
 
 /// What one `reauthorize` request does to the actor's `user` namespace
@@ -390,7 +381,6 @@ impl ConnectionControl {
             authority: format!("vs.zpr/{}", &vs_ident),
             jwt_key,
             login_nonces: LoginNonceStore::default(),
-            self_reauth_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1317,7 +1307,7 @@ impl ConnectionControl {
         // anchors (#63 review): the namespace classification below must still
         // describe the actor that gets persisted.
         let self_reauth_guard = if zpr_addr == *connect_via {
-            Some(self.self_reauth_lock.lock().await)
+            Some(asm.policy_mgr.node_commit_lock.lock().await)
         } else {
             None
         };
@@ -1831,7 +1821,7 @@ impl ConnectionControl {
         &self,
         asm: &Arc<Assembly>,
         actor: &Actor,
-        self_reauth_lock_held: bool,
+        node_commit_lock_held: bool,
     ) -> Result<(), ServiceError> {
         // Same gating as sweep_denylisted_actors: only a bootstrap-admitted
         // device authority is subject to the bootstrap-key denylist, and the
@@ -1862,7 +1852,7 @@ impl ConnectionControl {
                     asm.clone(),
                     *addr,
                     vsapi::DisconnectReason::Admin,
-                    self_reauth_lock_held,
+                    node_commit_lock_held,
                 )
                 .await
             {
@@ -2359,11 +2349,11 @@ impl ConnectionControl {
     }
 
     /// [Self::disconnect], for a caller that may already hold the self-renewal
-    /// lock. The actor record is removed under `self_reauth_lock` (#63
+    /// lock. The actor record is removed under `node_commit_lock` (#63
     /// review): a node's reauthorization of its own actor holds that lock from
     /// its session check to its write, so a removal landing in between would
     /// be undone by that write, reviving the disconnected node. The rest of the
-    /// teardown runs without the lock. `self_reauth_lock_held` is true only on
+    /// teardown runs without the lock. `node_commit_lock_held` is true only on
     /// the reauthorize path's post-persist denylist re-check, which runs under
     /// the lock already (tokio's mutex is not re-entrant).
     async fn disconnect_impl(
@@ -2371,13 +2361,13 @@ impl ConnectionControl {
         asm: Arc<Assembly>,
         zpr_addr: IpAddr,
         reason: vsapi::DisconnectReason,
-        self_reauth_lock_held: bool,
+        node_commit_lock_held: bool,
     ) -> Result<(), ServiceError> {
         info!(target: CC, "disconnect actor at {} for reason {:?}", zpr_addr, reason);
-        let removal_guard = if self_reauth_lock_held {
+        let removal_guard = if node_commit_lock_held {
             None
         } else {
-            Some(self.self_reauth_lock.lock().await)
+            Some(asm.policy_mgr.node_commit_lock.lock().await)
         };
 
         let maybe_actor = asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await?;
@@ -8715,7 +8705,7 @@ mod tests {
         let cn = "zode-s.zpr";
         let (asm, cc, addr, privkey) = zode_fixture(cn).await;
         let cc = Arc::new(cc);
-        let guard = cc.self_reauth_lock.lock().await;
+        let guard = asm.policy_mgr.node_commit_lock.lock().await;
         let task = tokio::spawn({
             let (asm, cc) = (asm.clone(), cc.clone());
             let blobs = vec![make_fresh_ss_blob(&privkey, cn)];
@@ -8945,7 +8935,7 @@ mod tests {
         let cn = "zode-z.zpr";
         let (asm, cc, addr, _privkey) = zode_fixture(cn).await;
         let cc = Arc::new(cc);
-        let guard = cc.self_reauth_lock.lock().await;
+        let guard = asm.policy_mgr.node_commit_lock.lock().await;
         let task = tokio::spawn({
             let (asm, cc) = (asm.clone(), cc.clone());
             async move {
@@ -9083,13 +9073,16 @@ mod tests {
         );
     }
 
-    /// A trusted service that installs `next_policy` the first time it is
-    /// queried and vends `device.clearance` from its own source: it makes a
-    /// policy install land in the middle of a reauthorize's enrichment, so the
-    /// commit-time recheck can be tested deterministically (#63 audit).
+    /// A trusted service that starts a policy install (re-installing the Zode
+    /// policy, which advances the generation) the first time it is queried --
+    /// i.e. in the middle of a reauthorize's enrichment -- and vends
+    /// `device.clearance` from its own source. The install runs as its own
+    /// task; since policy publication takes the node commit lock, it must wait
+    /// until the in-flight commit has written (#63 review, operator decision).
     struct PolicyInstallingTs {
         asm: std::sync::Mutex<Option<Arc<Assembly>>>,
         next_policy: Vec<u8>,
+        install: std::sync::Mutex<Option<tokio::task::JoinHandle<u64>>>,
     }
 
     #[async_trait::async_trait]
@@ -9100,10 +9093,18 @@ mod tests {
         ) -> Result<Vec<Attribute>, ServiceError> {
             let asm = self.asm.lock().unwrap().take();
             if let Some(asm) = asm {
-                asm.policy_mgr
-                    .update_policy_from_container_bytes(self.next_policy.clone())
-                    .await
-                    .expect("the mid-flight policy installs");
+                let bytes = self.next_policy.clone();
+                let handle = tokio::spawn(async move {
+                    asm.policy_mgr
+                        .update_policy_from_container_bytes(bytes)
+                        .await
+                        .expect("the mid-flight policy installs")
+                });
+                // Give the install every chance to run before the commit.
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+                *self.install.lock().unwrap() = Some(handle);
             }
             Ok(vec![
                 AttributeSource::new("installer")
@@ -9126,115 +9127,123 @@ mod tests {
         }
     }
 
-    /// Arm a policy install (same Zode policy, so the node stays admitted and
-    /// the provider stays declared) for the next enrichment on `asm`.
-    fn arm_mid_flight_install(asm: &Arc<Assembly>, cn: &str, privkey: &PKey<Private>) {
+    /// Arm a policy install for the next enrichment on `asm`; returns the hook
+    /// so the test can await the install afterwards.
+    fn arm_mid_flight_install(
+        asm: &Arc<Assembly>,
+        cn: &str,
+        privkey: &PKey<Private>,
+    ) -> Arc<PolicyInstallingTs> {
         let pubkey_der = privkey.public_key_to_der().unwrap();
-        // Every install advances the generation, so re-installing the same
-        // Zode policy is enough to move it.
-        let next_policy = make_zode_oidc_policy(cn, &pubkey_der);
-        asm.policy_mgr
-            .add_trusted_service_for_tests(Arc::new(PolicyInstallingTs {
-                asm: std::sync::Mutex::new(Some(asm.clone())),
-                next_policy,
-            }));
+        let hook = Arc::new(PolicyInstallingTs {
+            asm: std::sync::Mutex::new(Some(asm.clone())),
+            next_policy: make_zode_oidc_policy(cn, &pubkey_der),
+            install: std::sync::Mutex::new(None),
+        });
+        asm.policy_mgr.add_trusted_service_for_tests(hook.clone());
+        hook
     }
 
-    /// #63 audit: a node's device-only renewal (Keep) whose policy generation
-    /// moved during enrichment is refused, not persisted.
-    #[tokio::test]
-    async fn test_self_renewal_refused_when_policy_moves_mid_flight() {
-        let cn = "zode-ad.zpr";
-        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
-        let before = asm.policy_mgr.get_current_snapshot().vinst();
-        arm_mid_flight_install(&asm, cn, &privkey);
-        let api = api_err(
-            cc.reauthorize_actor(
-                asm.clone(),
-                addr,
-                vec![make_fresh_ss_blob(&privkey, cn)],
-                &addr,
-                Some(ZODE_SESSION),
-            )
-            .await,
-        );
-        assert!(
-            matches!(api.code, ErrorCode::TemporarilyUnavailable),
-            "got {:?}",
-            api.code
-        );
-        assert_ne!(asm.policy_mgr.get_current_snapshot().vinst(), before);
+    /// Await the install the hook started; returns its generation.
+    async fn finish_mid_flight_install(hook: &PolicyInstallingTs) -> u64 {
+        let handle = hook
+            .install
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the hook started an install");
+        handle.await.expect("the install task completes")
+    }
+
+    /// The `zpr.vinst` stored on the actor at `addr`.
+    async fn stored_vinst(asm: &Arc<Assembly>, addr: IpAddr) -> Option<u64> {
         let stored = asm
             .actor_mgr
             .get_actor_by_zpr_addr(&addr)
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            stored.get_attribute("device.clearance").is_none(),
-            "nothing was persisted"
-        );
+        actor_prepared_vinst(&stored)
     }
 
-    /// #63 audit: a login whose policy generation moved during enrichment is
-    /// refused, not persisted.
+    /// #63 review (operator decision): a policy install that starts during a
+    /// node's device-only renewal waits for the renewal's commit, so the
+    /// renewal commits under the generation it was authorized under and the
+    /// install lands afterwards (its re-authentication obligation then covers
+    /// the node).
     #[tokio::test]
-    async fn test_login_refused_when_policy_moves_mid_flight() {
+    async fn test_install_waits_for_in_flight_renewal_commit() {
+        let cn = "zode-ad.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        let before = asm.policy_mgr.get_current_snapshot().vinst();
+        let hook = arm_mid_flight_install(&asm, cn, &privkey);
+        cc.reauthorize_actor(
+            asm.clone(),
+            addr,
+            vec![make_fresh_ss_blob(&privkey, cn)],
+            &addr,
+            Some(ZODE_SESSION),
+        )
+        .await
+        .expect("the renewal commits; the install waits for it");
+        assert_eq!(
+            asm.policy_mgr.get_current_snapshot().vinst(),
+            before,
+            "not yet published"
+        );
+        let after = finish_mid_flight_install(&hook).await;
+        assert!(after > before);
+        assert_eq!(stored_vinst(&asm, addr).await, Some(before));
+    }
+
+    /// #63 review (operator decision): a login whose enrichment overlaps a
+    /// policy install commits first; the install publishes after it.
+    #[tokio::test]
+    async fn test_install_waits_for_in_flight_login_commit() {
         let cn = "zode-af.zpr";
         let (asm, cc, addr, privkey) = zode_fixture(cn).await;
-        arm_mid_flight_install(&asm, cn, &privkey);
+        let before = asm.policy_mgr.get_current_snapshot().vinst();
+        let hook = arm_mid_flight_install(&asm, cn, &privkey);
         let nonce = mint_zode_nonce(&cc, addr);
-        let api = api_err(
-            cc.reauthorize_actor(
+        let renewed = cc
+            .reauthorize_actor(
                 asm.clone(),
                 addr,
                 zode_login_blobs(&privkey, cn, &nonce, oidc_base_claims()),
                 &addr,
                 Some(ZODE_SESSION),
             )
-            .await,
-        );
-        assert!(
-            matches!(api.code, ErrorCode::TemporarilyUnavailable),
-            "got {:?}",
-            api.code
-        );
-        let stored = asm
-            .actor_mgr
-            .get_actor_by_zpr_addr(&addr)
             .await
-            .unwrap()
-            .unwrap();
-        assert!(!has_user_attrs(&stored), "the login was not persisted");
+            .expect("the login commits; the install waits for it");
+        assert!(renewed.get_attribute(key::USER_AUTHORITY).is_some());
+        assert!(finish_mid_flight_install(&hook).await > before);
+        assert_eq!(stored_vinst(&asm, addr).await, Some(before));
     }
 
-    /// #63 audit: a logout whose policy generation moved during enrichment
-    /// persists the reduced actor (never refused), without the attribute
-    /// enriched under the superseded snapshot.
+    /// #63 review (operator decision): a logout whose enrichment overlaps a
+    /// policy install commits its re-authorized actor (no fallback needed),
+    /// with a fresh identity token; the install publishes after it.
     #[tokio::test]
-    async fn test_logout_reduced_when_policy_moves_mid_flight() {
+    async fn test_install_waits_for_in_flight_logout_commit() {
         let cn = "zode-ag.zpr";
         let (asm, cc, addr, privkey) = zode_fixture(cn).await;
         let logged_in = zode_login(&asm, &cc, addr, &privkey, cn).await;
-        arm_mid_flight_install(&asm, cn, &privkey);
+        let before = asm.policy_mgr.get_current_snapshot().vinst();
+        let hook = arm_mid_flight_install(&asm, cn, &privkey);
         let renewed = zode_logout(&asm, &cc, addr, &privkey, cn).await;
         assert!(!has_user_attrs(&renewed));
-        assert!(renewed.get_attribute("device.clearance").is_none());
         assert!(renewed.is_node());
-        // The persisted reduced actor carries a freshly minted identity token
-        // (#63 review): the pre-logout one was capped by the user authority's
-        // expiry, and a refresh holding a pre-logout copy must not match it.
         let ident = |a: &Actor| {
             a.get_attribute(ATTR_KEY_VS_IDENT)
                 .and_then(|i| i.get_single_value().ok())
                 .map(|s| s.to_string())
         };
-        assert!(ident(&renewed).is_some());
         assert_ne!(
             ident(&renewed),
             ident(&logged_in),
-            "the identity token must be re-minted"
+            "the identity token is re-minted"
         );
+        assert!(finish_mid_flight_install(&hook).await > before);
         let stored = asm
             .actor_mgr
             .get_actor_by_zpr_addr(&addr)
@@ -9242,6 +9251,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!has_user_attrs(&stored));
+    }
+
+    /// #63 review (operator decision): a policy install blocks while a node
+    /// commit holds the node commit lock, and publishes once it is released.
+    #[tokio::test]
+    async fn test_policy_install_blocks_until_node_commit_finishes() {
+        let cn = "zode-aj.zpr";
+        let (asm, _cc, _addr, privkey) = zode_fixture(cn).await;
+        let before = asm.policy_mgr.get_current_snapshot().vinst();
+        let pubkey_der = privkey.public_key_to_der().unwrap();
+        let guard = asm.policy_mgr.node_commit_lock.lock().await;
+        let task = tokio::spawn({
+            let asm = asm.clone();
+            let bytes = make_zode_oidc_policy(cn, &pubkey_der);
+            async move {
+                asm.policy_mgr
+                    .update_policy_from_container_bytes(bytes)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !task.is_finished(),
+            "the install must wait for the node commit"
+        );
+        assert_eq!(asm.policy_mgr.get_current_snapshot().vinst(), before);
+        drop(guard);
+        task.await
+            .unwrap()
+            .expect("the install publishes once the lock is free");
+        assert!(asm.policy_mgr.get_current_snapshot().vinst() > before);
     }
 
     /// Review fix (#63 round 10, Copilot): a fallback logout (enrichment

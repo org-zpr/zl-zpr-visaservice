@@ -159,6 +159,21 @@ pub struct PolicyMgr {
     repo: db::PolicyRepo,
     /// Serializes concurrent policy updates; reads remain lock-free via ArcSwap.
     update_lock: tokio::sync::Mutex<()>,
+    /// The node commit lock (zl-zipline#232, #63 review): every writer of a
+    /// node's own actor -- `reauthorize` of its own actor, the node
+    /// `authenticate` persist, `open`, the login-nonce mint, a node's
+    /// attribute-refresh write and a disconnect's actor removal -- holds it
+    /// from the read its write is based on through the write, and calls
+    /// `connection_control::recheck_before_commit` just before committing.
+    /// Policy publication takes it too, so an install is serialized with that
+    /// recheck and write: it lands either before the recheck (which then sees
+    /// the new generation) or after the write (which the install's own
+    /// reconciliation then sees). The cost is that an install waits behind an
+    /// in-flight login or logout, including its attribute fetch
+    /// (org-zpr/zl-zipline#247).
+    /// ponytail: one global lock; per-address locks if node commits become
+    /// frequent (today: Zode logins/logouts, node authentications, refreshes).
+    pub(crate) node_commit_lock: tokio::sync::Mutex<()>,
     resolver: PolicyResolver,
     ts_mgr: Arc<TrustedServicesMgr>,
     /// Directory holding the `<service-id>.json` files for `api=file` trusted services.
@@ -603,6 +618,7 @@ impl PolicyMgr {
             state: ArcSwap::from_pointee(state),
             repo,
             update_lock: tokio::sync::Mutex::new(()),
+            node_commit_lock: tokio::sync::Mutex::new(()),
             resolver,
             ts_mgr,
             file_ts_dir,
@@ -663,6 +679,9 @@ impl PolicyMgr {
         .await?;
         self.repo.set_current_policy(&loaded, false).await?;
 
+        // Publish under the node commit lock: an install never lands between a
+        // node commit's recheck and its write (#63 review, zl-zipline#247).
+        let _commit = self.node_commit_lock.lock().await;
         self.publish(candidate.commit(Some(&previous), self.oidc_refresh));
         Ok(vinst)
     }

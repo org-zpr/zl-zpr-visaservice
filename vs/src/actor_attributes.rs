@@ -116,7 +116,7 @@ pub(crate) async fn refresh_and_persist_actor(
 /// `reauthorize`, or a re-authentication) while a refresh holds a copy loaded
 /// earlier; writing that copy back would undo the re-authorization -- e.g.
 /// restore the `user.*` attributes a logout removed (#63 review). So for a node
-/// the write takes the self-renewal lock (`ConnectionControl::self_reauth_lock`,
+/// the write takes the self-renewal lock (`PolicyMgr::node_commit_lock`,
 /// held by those paths from load to persist) and is refused when the stored
 /// actor's VS identity token (`zpr.vs.bootstrap.ident`, re-minted by every
 /// reauthorize and authenticate) differs from the copy's, or when the shared
@@ -134,7 +134,7 @@ pub(crate) async fn persist_refreshed_actor(
     prepared_vinst: u64,
 ) -> Result<(), ServiceError> {
     let _guard = if actor.is_node() {
-        Some(asm.cc.self_reauth_lock.lock().await)
+        Some(asm.policy_mgr.node_commit_lock.lock().await)
     } else {
         None
     };

@@ -350,7 +350,7 @@ impl VSHandleImpl {
 /// The state half of `open` (a node resuming its VS-API session over an existing
 /// link): load the node's own actor, keep its substrate address current, stamp
 /// a NEW session generation and persist it -- all under the self-renewal lock
-/// (`ConnectionControl::self_reauth_lock`, #63 review audit), the lock every
+/// (`PolicyMgr::node_commit_lock`, #63 review audit), the lock every
 /// writer of a node's own actor takes, so a concurrent login, logout or
 /// re-authentication cannot land between this load and these writes and be
 /// overwritten with the stale copy. Errors carry the `open` reply code and
@@ -367,7 +367,7 @@ async fn resume_node_actor_for_open(
             "internal error during open".to_string(),
         )
     };
-    let _guard = asm.cc.self_reauth_lock.lock().await;
+    let _guard = asm.policy_mgr.node_commit_lock.lock().await;
     let mut existing_actor = match asm.actor_mgr.get_actor_by_zpr_addr(&node_zpr_addr).await {
         Ok(Some(actor)) => actor,
         Ok(None) => return Err((vsapi::ErrorCode::OutOfSync, "no state".to_string())),
@@ -439,7 +439,7 @@ async fn mint_login_nonce_for_handle(
     node_addr: IpAddr,
     session: &str,
 ) -> Result<(String, SystemTime), MintError> {
-    let _guard = asm.cc.self_reauth_lock.lock().await;
+    let _guard = asm.policy_mgr.node_commit_lock.lock().await;
     if recheck_before_commit(asm, &node_addr, Some(session), None)
         .await
         .is_err()
@@ -452,7 +452,7 @@ async fn mint_login_nonce_for_handle(
 }
 
 /// Persist an authenticated node (its fresh `zpr.session` included) while
-/// holding the self-renewal lock (`ConnectionControl::self_reauth_lock`). A
+/// holding the self-renewal lock (`PolicyMgr::node_commit_lock`). A
 /// node's reauthorization of its own actor holds the same lock from loading the
 /// actor to persisting it, so this write can never land between that renewal's
 /// session check and its write and be overwritten with the old session (#63
@@ -469,7 +469,7 @@ async fn add_node_serialized(
     node_actor: &Actor,
     reconnect: bool,
 ) -> Result<(), ServiceError> {
-    let _guard = asm.cc.self_reauth_lock.lock().await;
+    let _guard = asm.policy_mgr.node_commit_lock.lock().await;
     if let Some(addr) = node_actor.get_zpr_addr()
         && recheck_before_commit(asm, addr, None, actor_prepared_vinst(node_actor)).await?
             == CommitRecheck::PolicyMoved
@@ -3378,7 +3378,7 @@ mod tests {
             let asm = Arc::new(new_assembly_for_tests(None).await);
             let mut node = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
             VSHandleImpl::stamp_new_session(&mut node);
-            let guard = asm.cc.self_reauth_lock.lock().await;
+            let guard = asm.policy_mgr.node_commit_lock.lock().await;
             let task = tokio::spawn({
                 let asm = asm.clone();
                 async move { add_node_serialized(&asm, &node, false).await }
@@ -3475,7 +3475,7 @@ mod tests {
                 .add_node(&node, false, &Default::default())
                 .await
                 .unwrap();
-            let guard = asm.cc.self_reauth_lock.lock().await;
+            let guard = asm.policy_mgr.node_commit_lock.lock().await;
             let task = tokio::spawn({
                 let asm = asm.clone();
                 async move {
