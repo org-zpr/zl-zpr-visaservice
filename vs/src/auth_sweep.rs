@@ -534,7 +534,7 @@ pub(crate) async fn sweep_reauth_obligations(asm: &Arc<Assembly>) -> ReauthSweep
 /// `zpr.vinst` attribute, stamped by `approve_connection` on connect and
 /// reauthorize. A missing or unparseable value is 0 — such an actor owes a
 /// re-auth against every obligation (fail closed).
-fn actor_vinst(actor: &Actor) -> u64 {
+pub(crate) fn actor_vinst(actor: &Actor) -> u64 {
     actor
         .get_attribute(key::VINST)
         .and_then(|a| a.get_single_value().ok())

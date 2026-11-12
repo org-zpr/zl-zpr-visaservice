@@ -389,6 +389,13 @@ fn write_error(bldr: &mut vsapi::error::Builder, code: vsapi::ErrorCode, message
 ///
 /// Must run before [crate::actor_mgr::ActorMgr::add_node] replaces the node
 /// record, which drops the node's connected-adapters set.
+/// Whether `actor` was approved (its `zpr.vinst`, stamped by `approve_connection`)
+/// under the policy that is current now. Call under a [TopoOps]: policy installs
+/// commit under it, so the answer holds until the guard is dropped.
+fn approved_under_current_policy(asm: &Assembly, actor: &Actor) -> bool {
+    crate::auth_sweep::actor_vinst(actor) == asm.policy_mgr.get_current_snapshot().vinst()
+}
+
 async fn reset_node_state(
     asm: &Assembly,
     ops: &TopoOps<'_>,
@@ -826,6 +833,12 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         let node_zpr_addr = self.remote.ip();
         info!(target: API, "node {} requests open from addr {} (CONNECT_TYPE={:?})", vs_connect_request.cn, node_zpr_addr, vs_connect_request.ctype);
 
+        // Topology operation lock (see TopoOps): held from the actor lookup through
+        // the session persist, so an overlapping authenticate, open, disconnect or
+        // link-state report sees this node's session either before or after it, and
+        // session generations are persisted in the order they are minted.
+        let ops = self.asm.topo_mgr.ops().await;
+
         let existing_actor = match self
             .asm
             .actor_mgr
@@ -924,6 +937,8 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
                 "internal error during open",
             );
         }
+
+        drop(ops);
 
         // Skip ahead to the handle:
         let vs_handle: vsapi::v_s_handle::Client =
@@ -1134,25 +1149,36 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
             .add_attribute(Attribute::builder(key::AAA_NET).value(node_aaa_net.to_string()))
             .unwrap();
 
+        // Note that the node may have services on it in addition to its node-ness.
+
+        // Topology operation lock (see TopoOps): held from the policy recheck and the
+        // session stamp through the policy link install, so a policy install or
+        // revalidation, a link-state report, an `open` or a disconnect cannot
+        // interleave with this node's state being rebuilt. Undo calls inside this
+        // span pass the guard; the lock is not re-entrant.
+        let ops = self.asm.topo_mgr.ops().await;
+
+        // The node was approved (above, outside the lock: authentication can query
+        // trusted services) under the policy current then. If a newer policy has
+        // been installed since, its pass may already have run without this node, so
+        // refuse; the node retries and is judged under the current policy. Installs
+        // commit under the guard, so the answer holds until it is dropped.
+        if !approved_under_current_policy(&self.asm, &node_actor) {
+            warn!(target: API, "policy changed while authenticating {:?}; refusing, node to retry", &node_cn);
+            undo.undo(&self.asm, Some(&ops)).await;
+            return self.ok_with_authenticate_error(
+                results,
+                vsapi::ErrorCode::TemporarilyUnavailable,
+                "policy changed during authentication; retry",
+            );
+        }
+
         // Bind the handle we are about to mint to THIS authentication
         // (zipline#123, PR #41 review): a fresh session generation is stamped
         // before the actor is persisted, so any handle from a previous
-        // session at this address fails the liveness gate from here on.
+        // session at this address fails the liveness gate from here on. Stamped
+        // under the guard, so generations are persisted in the order minted.
         VSHandleImpl::stamp_new_session(&mut node_actor);
-
-        // TODO: The policy may have changed since started the authentication. Once we add the node
-        // it is part of the ZPRnet.  The add_node should check the visa vinst used to grant access
-        // and we should make sure we do not allow add_node and update_policy to run concurrently.
-        // If add_node runs first, then update policy can catch the issue.  If update_policy runs
-        // first, then add_node will see the new version and should not allow the node to be added.
-
-        // Note that the node may have services on it in addition to its node-ness.
-
-        // Topology operation lock (see TopoOps): held from the node-state reset through
-        // the policy link install, so a policy revalidation, link-state report or
-        // disconnect cannot interleave with this node's router entry being rebuilt.
-        // Undo calls inside this span pass the guard; the lock is not re-entrant.
-        let ops = self.asm.topo_mgr.ops().await;
 
         if !self.reconnect {
             if let Err(e) = reset_node_state(&self.asm, &ops, &node_zpr_addr).await {
@@ -1487,15 +1513,30 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         let actor_addr = actor.get_zpr_addr().unwrap().clone(); // MUST have an addr by now.
 
         if actor.is_node() {
-            // Capture a policy snapshot right before installing the topology link so the
-            // link description is read from one consistent view.
-            //
-            // TODO: Plumb the auth-time policy vinst through this path and detect/retry if
-            // policy changed underneath us while adding a new node. Authentication reads
-            // policy earlier in authorize_connect, so this snapshot does not yet close that
-            // window. ( https://github.com/org-zpr/zpr-visaservice/issues/232 )
-            // Topology operation lock (see TopoOps) spans the policy read and the write.
+            // Topology operation lock (see TopoOps): spans the policy recheck, the
+            // policy read and the link install.
             let ops = self.asm.topo_mgr.ops().await;
+            // The node was approved (above, outside the lock) under the policy current
+            // then. A newer policy's pass may already have run without it: refuse, and
+            // the node retries under the current policy. Same rule as authenticate.
+            if !approved_under_current_policy(&self.asm, &actor) {
+                warn!(target: API, "policy changed while authorizing node {:?}; refusing, node to retry", actor.get_cn());
+                if !self.asm.topo_mgr.has_node(&actor_addr)
+                    && self.asm.net_mgr.is_managed_address(&actor_addr)
+                {
+                    if let Err(e) = self.asm.net_mgr.release_zpr_addr(actor_addr) {
+                        warn!(target: API, "failed to release node address, actor={}: {}", actor_addr, e);
+                    }
+                }
+                let mut err_builder = results.get().init_resp().init_error();
+                write_error(
+                    &mut err_builder,
+                    vsapi::ErrorCode::TemporarilyUnavailable,
+                    "policy changed during authorization; retry",
+                );
+                self.asm.counters.incr(CounterType::AuthorizeConnectFailed);
+                return Ok(());
+            }
             let psnap = self.asm.policy_mgr.get_current_snapshot();
             if let Err(add_err) = self
                 .asm
@@ -2271,6 +2312,33 @@ mod tests {
             (100..=120).contains(&secs_out),
             "expected ~120 s out, got {secs_out} s"
         );
+    }
+
+    /// Authentication's policy recheck under the topology lock (round 13): an
+    /// actor approved under the current policy passes; one approved under an older
+    /// policy, or carrying no `zpr.vinst`, does not.
+    #[tokio::test]
+    async fn test_approved_under_current_policy() {
+        let asm = crate::assembly::tests::new_assembly_for_tests(None).await;
+        let current = asm.policy_mgr.get_current_snapshot().vinst();
+        let with_vinst = |v: u64| {
+            let mut a = Actor::new();
+            a.add_attribute(Attribute::builder(key::VINST).value(v.to_string()))
+                .unwrap();
+            a
+        };
+        assert!(approved_under_current_policy(&asm, &with_vinst(current)));
+        assert!(!approved_under_current_policy(
+            &asm,
+            &with_vinst(current + 1)
+        ));
+        if current > 0 {
+            assert!(!approved_under_current_policy(
+                &asm,
+                &with_vinst(current - 1)
+            ));
+        }
+        assert!(!approved_under_current_policy(&asm, &Actor::new()) || current == 0);
     }
 
     /// A device-only actor (no user authority) gets its device-authority
@@ -3448,6 +3516,42 @@ mod tests {
                     drop(held);
                     assert_eq!(report.await.unwrap(), Ok(()));
                     assert!(!ab_route_exists(&asm));
+                })
+                .await;
+        }
+
+        /// `open` reads the node's actor and persists its new session under the
+        /// topology operation lock (round 13, Copilot): while another operation holds
+        /// it, `open` does not complete, so overlapping opens, authentications and
+        /// report applications cannot persist sessions out of order.
+        #[tokio::test]
+        async fn open_waits_for_the_topology_operation_lock() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, _handle) = build().await;
+                    let vs: vsapi::visa_service::Client = capnp_rpc::new_client(VisaServiceImpl {
+                        asm: asm.clone(),
+                        remote: SocketAddr::new(NODE_A.parse().unwrap(), 1234),
+                    });
+                    let mut req = vs.open_request();
+                    {
+                        let mut r = req.get().init_req();
+                        r.set_cn("node-a");
+                        r.set_ctype(vsapi::VSConnT::Reconnect);
+                        let mut p = r.init_params(1).get(0);
+                        p.set_ptype(vsapi::ParamT::String);
+                        p.set_name(pname::SUBSTRATE_ADDR);
+                        p.set_value_text("[fd5a:5052::101]:1234");
+                    }
+                    let held = asm.topo_mgr.ops().await;
+                    let open =
+                        tokio::task::spawn_local(
+                            async move { req.send().promise.await.map(|_| ()) },
+                        );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    assert!(!open.is_finished(), "open must wait for the lock");
+                    drop(held);
+                    open.await.unwrap().unwrap();
                 })
                 .await;
         }

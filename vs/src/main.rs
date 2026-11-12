@@ -405,6 +405,8 @@ async fn main() -> std::process::ExitCode {
         ts_mgr,
         deny_log: Default::default(),
     });
+    // Policy installs commit under the topology operation lock (TopoOps invariant).
+    asm.policy_mgr.bind_topology_lock(asm.topo_mgr.ops_lock());
 
     // Tear down what the startup cull left for us, now that the Assembly
     // exists: the culled nodes' adapters (records, visas, pool addresses),

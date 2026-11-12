@@ -188,6 +188,7 @@ pub mod tests {
             ts_mgr,
             deny_log: Default::default(),
         };
+        asm.policy_mgr.bind_topology_lock(asm.topo_mgr.ops_lock());
         (asm, event_rx, db_handle_for_tests)
     }
 }

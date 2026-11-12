@@ -8,7 +8,7 @@
 //!
 use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use crate::actor_mgr::ActorMgr;
@@ -31,25 +31,37 @@ use zpr::vsapi_types::LinkStateReport;
 /// Proof that the caller holds the topology operation lock ([TopologyMgr::ops]).
 ///
 /// THE INVARIANT (zl-zpr-visaservice#62, zl-zipline#224): every operation that reads
-/// policy, link or session state to decide a topology or link-state write holds one
-/// `TopoOps` from its first read to its last write, including any visa revocation the
-/// write calls for. Every mutating `TopologyMgr` method takes `&TopoOps`, so an
-/// unlocked mutation does not compile. Operations therefore never interleave: none can
-/// act on state another is about to change, whatever it awaits in between (persistence,
-/// actor updates, revocations). Read the current policy and session only after taking
-/// the guard. Never take a second guard while holding one: the lock is not re-entrant.
-/// Under the guard await only local work (state store writes, actor updates): never an
-/// event-queue send or a node RPC, which can wait on a task that wants the guard. So
-/// `authenticate` drops it before recording `ActorJoins`, and the policy pass before
+/// policy, link, actor or session state to decide a topology, link-state or session
+/// write holds one `TopoOps` from its first read to its last write, including any visa
+/// revocation the write calls for. Every mutating `TopologyMgr` method takes `&TopoOps`,
+/// so an unlocked topology mutation does not compile. Operations therefore never
+/// interleave: none can act on state another is about to change, whatever it awaits in
+/// between (persistence, actor updates, revocations).
+///
+/// Policy installs commit under the same lock ([crate::policy_mgr::PolicyMgr::bind_topology_lock]), so
+/// the current policy cannot change while a guard is held: read it after taking the
+/// guard and it stays current until the guard is dropped. Work that must read policy
+/// before the guard because it waits on the network -- authenticating a node, which
+/// can query trusted services -- rechecks under the guard that the policy it used is
+/// still current (`approved_under_current_policy` in `vsapi_worker`) and refuses
+/// otherwise.
+///
+/// Rules: never take a second guard while holding one: the lock is not re-entrant
+/// (pass the guard down instead, as `disconnect_locked` and `AuthenticateUndo::undo`
+/// take it). Under the guard await only local work (state store writes, actor
+/// updates): never an event-queue send or a node RPC, which can wait on a task that
+/// wants the guard. So `authenticate` drops it before recording `ActorJoins`,
+/// `disconnect` before stopping the node's VSS worker, and the policy pass before
 /// sending `setTopology`.
+///
+/// The one path outside it is visa issuance, which is not a topology write: it reads
+/// routes lock-free and checks its route again once the visa is stored (see
+/// `VisaMgr::revoke_if_route_down`). A link going down sets its flag before its
+/// revocation pass lists visas, so a visa is either listed by the pass or sees the flag.
 ///
 /// ponytail: one global lock. Topology operations are rare (node connects and
 /// disconnects, link-state reports, policy installs); make it per-node only if
 /// profiling shows contention.
-///
-/// The one path outside it is visa issuance, which is not a topology write: it reads
-/// routes lock-free and checks its route again once the visa is stored (see
-/// `VisaMgr::revoke_if_route_down`).
 pub struct TopoOps<'a> {
     _guard: tokio::sync::MutexGuard<'a, ()>,
 }
@@ -62,7 +74,7 @@ pub struct TopologyMgr {
     /// In memory only; a std mutex because no critical section awaits.
     link_state: Mutex<LinkStateTable>,
     /// The topology operation lock; see [TopoOps].
-    ops: tokio::sync::Mutex<()>,
+    ops: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The fate of a persisted/live edge when validated against the current policy.
@@ -126,7 +138,7 @@ impl TopologyMgr {
             router: Router::new(),
             link_repo,
             link_state: Mutex::new(LinkStateTable::new()),
-            ops: tokio::sync::Mutex::new(()),
+            ops: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -136,6 +148,13 @@ impl TopologyMgr {
         TopoOps {
             _guard: self.ops.lock().await,
         }
+    }
+
+    /// The topology operation lock itself, for [crate::policy_mgr::PolicyMgr::bind_topology_lock]: a
+    /// policy install commits under it, so the current policy cannot change while a
+    /// topology operation holds a [TopoOps].
+    pub fn ops_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.ops.clone()
     }
 
     /// Test helper: take the topology operation lock without awaiting, for single
@@ -287,8 +306,7 @@ impl TopologyMgr {
         table.edge_usable(a, a_cn.as_deref(), b, b_cn.as_deref())
     }
 
-    /// Test helper: is `addr` a node in the router?
-    #[cfg(test)]
+    /// Is `addr` a node in the router?
     pub fn has_node(&self, addr: &IpAddr) -> bool {
         self.router.has_node(addr)
     }
@@ -573,16 +591,13 @@ impl TopologyMgr {
     /// membership is governed by the passed in `node_addrs` (the authoritative
     /// known-node set), not by edge count.
     ///
-    /// Validation always runs against the current policy. The pass is
-    /// idempotent, so a policy update racing mid-pass simply produces another
-    /// pass.
-    ///
-    /// `snapshot` decides which links exist and their ids, attributes and cost. Their
-    /// up/down flags are computed with `current_policy()`, called once inside the
-    /// link-state table lock: a stale pass (a newer policy was installed while this one
-    /// awaited persistence) must not overwrite flags a report already evaluated against
-    /// the current policy (zl-zipline#224). Reports take the same lock, so whichever
-    /// applies second sees the current policy.
+    /// `snapshot` decides which links exist and their ids, attributes and cost; their
+    /// up/down flags are computed with `current_policy()` inside the link-state table
+    /// lock. The caller reads `snapshot` under its [TopoOps], and policy installs
+    /// commit under the same lock, so the two are the same policy for the whole pass.
+    /// A `snapshot` that is not current when the pass starts (a caller that read it
+    /// before taking the guard) applies nothing -- not even persistence repairs or
+    /// deletions -- and leaves the work to the pass for the current policy.
     pub async fn revalidate_against_policy(
         &self,
         ops: &TopoOps<'_>,
@@ -591,6 +606,12 @@ impl TopologyMgr {
         current_policy: &dyn Fn() -> PolicySnapshot,
     ) -> Result<RevalidationReport, ServiceError> {
         let mut report = RevalidationReport::default();
+        // Superseded before any write: nothing is decided on an old policy.
+        let current_vinst = current_policy().vinst();
+        if current_vinst != snapshot.vinst() {
+            info!(target: TOPO, "revalidate: policy vinst {} superseded by {}; topology left to the newer pass", snapshot.vinst(), current_vinst);
+            return Ok(report);
+        }
         let known: HashSet<IpAddr> = node_addrs.iter().copied().collect();
 
         // Actor/node state is the authoritative live-node set; make sure each such node
@@ -731,16 +752,6 @@ impl TopologyMgr {
         // in install_router_link: a concurrent report cannot slip in between.
         let table = self.link_state.lock().unwrap();
         let current = current_policy();
-        // A superseded pass (a newer policy was installed while this one awaited
-        // persistence) applies nothing: its link decisions come from an old policy, and
-        // the queued pass for the current policy will make them. Its persistence repairs
-        // above are harmless; the next pass reconciles router and state again.
-        if current.vinst() != snapshot.vinst() {
-            info!(target: TOPO, "revalidate: policy vinst {} superseded by {}; topology left to the newer pass", snapshot.vinst(), current.vinst());
-            // Nothing was removed or taken down here, so nothing to revoke.
-            report.links_down.clear();
-            return Ok(report);
-        }
         let flag_cn_of = Self::policy_cn_lookup(&current);
         // A removed link that is up now (read under the lock: a report may have brought
         // it up since the decision) carries visas that must be revoked.
@@ -2168,6 +2179,42 @@ mod tests {
             "the stale pass removed nothing"
         );
         assert!(report.links_down.is_empty(), "and asks for no revocation");
+    }
+
+    #[tokio::test]
+    async fn test_superseded_policy_pass_keeps_persisted_edges() {
+        // Round 13 (Copilot): the stale-pass check runs before any write. An edge that
+        // exists only in persistence, which the old policy would GC but the current
+        // policy declares, must survive: the next pass can only find it there.
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr =
+            make_policy_mgr_from_bytes(db.clone(), policy_bytes_from_peerings(&[])).await;
+        let old = policy_mgr.get_current_snapshot();
+        policy_mgr
+            .update_policy_from_container_bytes(make_container_bytes(
+                config::POLICY_MIN_COMPILER_MAJOR,
+                config::POLICY_MIN_COMPILER_MINOR,
+                config::POLICY_MIN_COMPILER_PATCH,
+                &policy_with_link(a, b, "link-ab"),
+            ))
+            .await
+            .unwrap();
+
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+
+        topo.revalidate_against_policy(&topo.ops_now(), &old, &[a, b], &|| {
+            policy_mgr.get_current_snapshot()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            LinkRepo::new(db.clone()).list_edges().await.unwrap().len(),
+            1,
+            "the stale pass deleted no persisted edge"
+        );
     }
 
     #[tokio::test]
