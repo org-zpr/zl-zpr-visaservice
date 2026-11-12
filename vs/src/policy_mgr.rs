@@ -680,6 +680,14 @@ impl PolicyMgr {
         PolicySnapshot(self.state.load_full())
     }
 
+    /// Make `snapshot` the current one, bypassing a policy install. Test-only:
+    /// lets a test run a live path against a snapshot with chosen trusted
+    /// services (e.g. one that fails).
+    #[cfg(test)]
+    pub(crate) fn set_current_snapshot_for_tests(&self, snapshot: &PolicySnapshot) {
+        self.state.store(snapshot.0.clone());
+    }
+
     /// Callers should drop the policy as quickly as possible to avoid missing a policy update.
     pub fn get_current(&self) -> Arc<Policy> {
         self.get_current_snapshot().policy_arc()

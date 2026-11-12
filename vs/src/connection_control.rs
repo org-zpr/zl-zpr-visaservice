@@ -234,6 +234,34 @@ fn classify_user_namespace_change(
     }
 }
 
+/// The actor a logout persists when its policy re-run failed (#63 review): the
+/// loaded actor with every `user.*` attribute removed, still a node (its role is
+/// fixed at connect), granting only the services a node gets from the claims
+/// that remain. Everything else -- address, session, device authority, VS
+/// identity token -- is unchanged.
+fn logout_without_reauthorization(actor: &Actor, policy: &Policy) -> Actor {
+    let mut reduced = Actor::new();
+    for attr in actor
+        .attrs_iter()
+        .filter(|a| !a.get_key().starts_with("user."))
+    {
+        let _ = reduced.add_attribute(attr.clone());
+    }
+    for identity_key in actor
+        .identity_keys_iter()
+        .filter(|k| !k.starts_with("user."))
+    {
+        let _ = reduced.add_identity_key(usize::MAX, identity_key);
+    }
+    let claims: Vec<Attribute> = reduced
+        .attrs_iter()
+        .filter(|a| !key::POLICY_STAMPED.contains(&a.get_key()))
+        .cloned()
+        .collect();
+    reduced.set_services(policy.join_services_for_role(&claims, true));
+    reduced
+}
+
 /// Whether an attribute is carried over a logout (zl-zipline#232): only
 /// attributes the visa service itself stamped (internal source), and never
 /// one in the `user.` namespace.
@@ -1442,7 +1470,7 @@ impl ConnectionControl {
         // above, which is what authorizes re-accepting an occupied address
         // (PR #33 review, P1).
         let endpoint_cn = actor.get_cn().unwrap_or_default().to_string();
-        let mut renewed = self
+        let reauthorized = self
             .authorize_connection_impl(
                 asm.clone(),
                 &psnap,
@@ -1452,8 +1480,20 @@ impl ConnectionControl {
                 0,
                 Some(zpr_addr),
             )
-            .await
-            .map_err(Self::classify_reauth_policy_error)?;
+            .await;
+        let mut renewed = match reauthorized {
+            Ok(renewed) => renewed,
+            // A logout must not depend on the policy re-run (#63 review): if
+            // it fails -- a trusted service is down, say -- persist the
+            // loaded actor with its user namespace removed instead of leaving
+            // the login in place for the outage. This only removes privilege,
+            // and the device proof has already been checked.
+            Err(e) if dropping_user => {
+                warn!(target: CC, "logout of {zpr_addr}: policy re-run failed ({e}); persisting the logout without re-enrichment");
+                logout_without_reauthorization(&actor, psnap.policy())
+            }
+            Err(e) => return Err(Self::classify_reauth_policy_error(e)),
+        };
 
         // A node's role is fixed at connect, as on the attribute-refresh path
         // (`actor_attributes::restamp_services`). If the policy re-run no
@@ -8877,6 +8917,39 @@ mod tests {
             matches!(api.code, ErrorCode::TemporarilyUnavailable),
             "got {:?}",
             api.code
+        );
+    }
+
+    /// Review fix (#63 round 8, Codex P1): a logout persists even when the
+    /// policy re-run fails (a trusted service is down): the stored actor loses
+    /// every `user.*` attribute and keeps its node role.
+    #[tokio::test]
+    async fn test_logout_persists_when_enrichment_fails() {
+        let cn = "zode-ab.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+
+        let current = asm.policy_mgr.get_current_snapshot();
+        let mut services = current.trusted_services().to_vec();
+        services.push(Arc::new(FailingTrustedService));
+        asm.policy_mgr
+            .set_current_snapshot_for_tests(&PolicySnapshot::for_tests(
+                current.policy_arc(),
+                services,
+            ));
+
+        let renewed = zode_logout(&asm, &cc, addr, &privkey, cn).await;
+        assert!(!has_user_attrs(&renewed));
+        assert!(renewed.is_node());
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !has_user_attrs(&stored),
+            "the logout must persist despite the failure"
         );
     }
 
