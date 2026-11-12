@@ -674,7 +674,12 @@ pub fn make_container_bytes(maj: u32, min: u32, patch: u32, policy: &[u8]) -> Ve
 /// The default (empty) policy denies everything (NoMatch), so with a route
 /// present the eval still denies — either way the sweep sees a deny.
 pub async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
-    let asm = new_assembly_for_tests(None).await;
+    build_sweep_asm_on(new_assembly_for_tests(None).await, with_link).await
+}
+
+/// As [build_sweep_asm], on a caller-built assembly (e.g. one whose fake DB and
+/// event queue the test holds).
+pub async fn build_sweep_asm_on(asm: Assembly, with_link: bool) -> (Arc<Assembly>, IpAddr) {
     let node_a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
     let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
     asm.actor_mgr

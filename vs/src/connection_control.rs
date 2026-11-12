@@ -1507,7 +1507,10 @@ impl ConnectionControl {
         // update_actor could race the enforcement sweep's removal (the sweep
         // revokes the OLD record while this write re-persists the actor);
         // this closes that window. Same uniform rejection as the pre-check.
-        if let Err(e) = self.enforce_denylist_after_persist(&asm, &renewed).await {
+        if let Err(e) = self
+            .enforce_denylist_after_persist_impl(&asm, &renewed, self_reauth_guard.is_some())
+            .await
+        {
             info!(target: CC, "SS reauth rejected post-persist: {e}");
             return Err(ApiResponseError::new_code_msg(
                 ErrorCode::AuthError,
@@ -1685,6 +1688,19 @@ impl ConnectionControl {
         asm: &Arc<Assembly>,
         actor: &Actor,
     ) -> Result<(), ServiceError> {
+        self.enforce_denylist_after_persist_impl(asm, actor, false)
+            .await
+    }
+
+    /// [Self::enforce_denylist_after_persist] for a caller that may hold the
+    /// self-renewal lock already (a node's reauthorization of its own actor);
+    /// passed through to [Self::disconnect_impl].
+    async fn enforce_denylist_after_persist_impl(
+        &self,
+        asm: &Arc<Assembly>,
+        actor: &Actor,
+        self_reauth_lock_held: bool,
+    ) -> Result<(), ServiceError> {
         // Same gating as sweep_denylisted_actors: only a bootstrap-admitted
         // device authority is subject to the bootstrap-key denylist, and the
         // VS's own actor is exempt.
@@ -1710,7 +1726,12 @@ impl ConnectionControl {
         warn!(target: CC, "cn {cn} was revoked during connection setup; undoing the admission (zipline#136, PR #42 review)");
         if let Some(addr) = actor.get_zpr_addr() {
             if let Err(e) = self
-                .disconnect(asm.clone(), *addr, vsapi::DisconnectReason::Admin)
+                .disconnect_impl(
+                    asm.clone(),
+                    *addr,
+                    vsapi::DisconnectReason::Admin,
+                    self_reauth_lock_held,
+                )
                 .await
             {
                 // The refusal stands either way; the periodic sweep retries
@@ -2202,7 +2223,30 @@ impl ConnectionControl {
         zpr_addr: IpAddr,
         reason: vsapi::DisconnectReason,
     ) -> Result<(), ServiceError> {
+        self.disconnect_impl(asm, zpr_addr, reason, false).await
+    }
+
+    /// [Self::disconnect], for a caller that may already hold the self-renewal
+    /// lock. The actor record is removed under `self_reauth_lock` (#63
+    /// review): a node's reauthorization of its own actor holds that lock from
+    /// its session check to its write, so a removal landing in between would
+    /// be undone by that write, reviving the disconnected node. The rest of the
+    /// teardown runs without the lock. `self_reauth_lock_held` is true only on
+    /// the reauthorize path's post-persist denylist re-check, which runs under
+    /// the lock already (tokio's mutex is not re-entrant).
+    async fn disconnect_impl(
+        &self,
+        asm: Arc<Assembly>,
+        zpr_addr: IpAddr,
+        reason: vsapi::DisconnectReason,
+        self_reauth_lock_held: bool,
+    ) -> Result<(), ServiceError> {
         info!(target: CC, "disconnect actor at {} for reason {:?}", zpr_addr, reason);
+        let removal_guard = if self_reauth_lock_held {
+            None
+        } else {
+            Some(self.self_reauth_lock.lock().await)
+        };
 
         let maybe_actor = asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await?;
         if maybe_actor.is_none() {
@@ -2221,6 +2265,7 @@ impl ConnectionControl {
                 error!(target: CC, "failed to remove disconnected actor with addr {zpr_addr} from actor db: {e}");
             }
         };
+        drop(removal_guard);
 
         let mut removed_zpr_addrs = Vec::new();
         removed_zpr_addrs.push(zpr_addr);
@@ -8746,6 +8791,46 @@ mod tests {
         assert!(
             requeued,
             "an incomplete sweep must hand its work to the event manager"
+        );
+    }
+
+    /// Review fix (#63 round 6, Codex P1): a disconnect removes the actor
+    /// record under the self-renewal lock, so it cannot land between a
+    /// self-renewal's session check and its write (which would recreate the
+    /// removed actor).
+    #[tokio::test]
+    async fn test_disconnect_waits_for_self_renewal_lock() {
+        let cn = "zode-z.zpr";
+        let (asm, cc, addr, _privkey) = zode_fixture(cn).await;
+        let cc = Arc::new(cc);
+        let guard = cc.self_reauth_lock.lock().await;
+        let task = tokio::spawn({
+            let (asm, cc) = (asm.clone(), cc.clone());
+            async move {
+                cc.disconnect(asm, addr, vsapi::DisconnectReason::Admin)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!task.is_finished(), "the disconnect must wait for the lock");
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .is_some(),
+            "the actor record must still be there while the lock is held"
+        );
+        drop(guard);
+        task.await
+            .unwrap()
+            .expect("the disconnect completes once the lock is free");
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

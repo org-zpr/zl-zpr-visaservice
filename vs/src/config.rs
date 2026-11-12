@@ -88,6 +88,10 @@ pub const LOGIN_NONCE_MAX_PER_ACTOR: usize = 4;
 /// incomplete sweep to the event manager (zl-zipline#232).
 pub const NAMESPACE_SWEEP_ATTEMPTS: usize = 3;
 
+/// Delay before an attribute-change reconcile whose visa sweep could not
+/// record every verdict runs again (zl-zipline#232 review).
+pub const RECONCILE_RETRY: Duration = Duration::from_secs(30);
+
 pub const MAX_VISA_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
 /// A visa must be valid for at least this long to be worth issuing. Below this the node
