@@ -58,6 +58,12 @@ pub struct RevalidationReport {
     pub links_repaired: usize,
     /// Known nodes left with no remaining links. Detected and reported only.
     pub orphaned_nodes: Vec<IpAddr>,
+    /// Links this reconciliation took from up to down -- a rebuilt link whose
+    /// link-state reports no longer agree under the new policy -- or removed while
+    /// up. The caller revokes the visas that cross them (zl-zipline#224): a visa
+    /// committed under the new policy before this ran is not re-checked by the
+    /// policy sweep, whose generation gate considers it current.
+    pub links_down: Vec<(IpAddr, IpAddr)>,
 }
 
 /// Special error returned by [TopologyMgr::add_linked_node] that records
@@ -146,29 +152,28 @@ impl TopologyMgr {
         b: &IpAddr,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
     ) -> bool {
-        let (a_cn, b_cn) = (cn_of(a), cn_of(b));
-        self.link_state
-            .lock()
-            .unwrap()
-            .edge_usable(a, a_cn.as_deref(), b, b_cn.as_deref())
+        Self::usable_in(&self.link_state.lock().unwrap(), a, b, cn_of)
     }
 
-    /// `None` if every link of a route still exists and is up (see [Router::links_up]).
-    /// Otherwise the endpoints of the route's links that are present but down, so a
-    /// failed revocation can be retried per link. A route link missing from the
-    /// router entirely also makes the route stale; it contributes no endpoints.
-    pub fn route_down_links(&self, links: &[LinkId]) -> Option<Vec<(IpAddr, IpAddr)>> {
-        if self.router.links_up(links) {
-            return None;
-        }
-        Some(
-            self.router
-                .link_snapshot()
-                .into_iter()
-                .filter(|l| !l.up && links.contains(&l.id))
-                .map(|l| (l.a, l.b))
-                .collect(),
-        )
+    /// As [Self::usable_now], against a table the caller already holds locked.
+    fn usable_in(
+        table: &LinkStateTable,
+        a: &IpAddr,
+        b: &IpAddr,
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
+    ) -> bool {
+        let (a_cn, b_cn) = (cn_of(a), cn_of(b));
+        table.edge_usable(a, a_cn.as_deref(), b, b_cn.as_deref())
+    }
+
+    /// True if a link connects `a` and `b` and it is up.
+    pub fn link_up(&self, a: &IpAddr, b: &IpAddr) -> bool {
+        self.router.link_between(a, b).is_some_and(|l| l.up)
+    }
+
+    /// True if every link of a route still exists and is up. See [Router::links_up].
+    pub fn route_links_up(&self, links: &[LinkId]) -> bool {
+        self.router.links_up(links)
     }
 
     /// The links whose visas must be revoked after a report from `node`: the ones that
@@ -249,7 +254,13 @@ impl TopologyMgr {
         link_desc: LinkDescription,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
     ) -> Result<(), TopologyError> {
-        let up = self.usable_now(a, b, cn_of);
+        // Hold the link-state table from reading the flag until the link is in the
+        // router. A concurrent report stores its snapshot under this lock and then
+        // refreshes the links it can see: it either runs before (and this read sees
+        // its snapshot) or after (and its refresh sees this link). Lock order is
+        // table, then router; no path takes them the other way round.
+        let table = self.link_state.lock().unwrap();
+        let up = Self::usable_in(&table, a, b, cn_of);
         self.router.add_link_with_state(
             a.clone(),
             b.clone(),
@@ -521,12 +532,16 @@ impl TopologyMgr {
             persisted: bool,
             desc: LinkDescription,
             action: Action,
+            /// Whether the router link was up before this reconciliation.
+            was_up: bool,
         }
         struct Removal {
             a: IpAddr,
             b: IpAddr,
             persisted: bool,
             old_id: Option<LinkId>,
+            /// Whether the router link was up before this reconciliation.
+            was_up: bool,
         }
 
         let cn_of = Self::policy_cn_lookup(snapshot);
@@ -540,6 +555,7 @@ impl TopologyMgr {
                     a,
                     b,
                     persisted,
+                    was_up: router_link.as_ref().is_some_and(|rl| rl.up),
                     old_id: router_link.map(|rl| rl.id),
                 }),
                 EdgeDecision::Install(desc) => {
@@ -567,6 +583,7 @@ impl TopologyMgr {
                         persisted,
                         desc,
                         action,
+                        was_up: router_link.as_ref().is_some_and(|rl| rl.up),
                     });
                 }
             }
@@ -610,9 +627,17 @@ impl TopologyMgr {
         // every changed edge) are listed first so each reassigned id is free before reuse.
         let mut removal_ids: Vec<LinkId> =
             removals.iter().filter_map(|r| r.old_id.clone()).collect();
+        report.links_down = removals
+            .iter()
+            .filter(|r| r.was_up)
+            .map(|r| (r.a, r.b))
+            .collect();
         let mut additions: Vec<LinkSpec> = Vec::new();
         // Link state comes from link-state reports, not policy: every installed or
         // rebuilt link gets the flag its reports call for, inside the atomic batch.
+        // The table stays locked until the batch is applied, for the same reason as
+        // in install_router_link: a concurrent report cannot slip in between.
+        let table = self.link_state.lock().unwrap();
         for e in surviving {
             let spec = LinkSpec {
                 a: e.a,
@@ -620,8 +645,11 @@ impl TopologyMgr {
                 id: e.desc.link_id.into(),
                 attributes: e.desc.attrs,
                 cost: e.desc.cost,
-                up: self.usable_now(&e.a, &e.b, &cn_of),
+                up: Self::usable_in(&table, &e.a, &e.b, &cn_of),
             };
+            if e.was_up && !spec.up {
+                report.links_down.push((e.a, e.b));
+            }
             match e.action {
                 Action::Keep => {}
                 Action::Fresh => {
@@ -636,6 +664,7 @@ impl TopologyMgr {
             }
         }
         self.router.apply_link_batch(&removal_ids, additions)?;
+        drop(table);
 
         // Detect + report orphans. An orphan node is a legitimate state and stays in the
         // topology so long as it remains a known node; removing it belongs to the
@@ -1682,5 +1711,12 @@ mod tests {
             !topo.router.link_between(&a, &b).unwrap().up,
             "the kept link must follow the new CN mapping"
         );
+        assert_eq!(
+            report.links_down.len(),
+            1,
+            "the up->down transition is reported so its visas get revoked"
+        );
+        let (x, y) = report.links_down[0];
+        assert!((x, y) == (a, b) || (x, y) == (b, a));
     }
 }

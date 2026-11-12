@@ -443,7 +443,7 @@ mod tests {
     /// revoked as it is committed, not left for a sweep that already ran.
     #[tokio::test]
     async fn test_visa_on_a_route_that_went_down_is_revoked_at_commit() {
-        use crate::test_helpers::create_sweep_visa_on_route;
+        use crate::test_helpers::try_create_sweep_visa_on_route;
         let (asm, node_a) = build_sweep_asm(true).await;
         let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
         let route = asm.topo_mgr.get_best_route(&node_a, &node_b).unwrap();
@@ -453,14 +453,19 @@ mod tests {
             .topo_mgr
             .record_link_states(&node_a, vec![], &|_: &IpAddr| None);
         assert_eq!(down, vec![(node_a, node_b)]);
-        let id = create_sweep_visa_on_route(&asm, &node_a, 0, &route).await;
+        assert!(
+            try_create_sweep_visa_on_route(&asm, &node_a, 0, &route)
+                .await
+                .is_err(),
+            "a visa on a route that went down is not issued, even once revoked"
+        );
 
         let revoked = asm
             .visa_mgr
             .get_pending_revoke_visa_ids_for_node(&node_a)
             .await
             .unwrap();
-        assert_eq!(revoked, vec![id]);
+        assert_eq!(revoked.len(), 1, "the stored visa is revoked");
     }
 
     /// A revocation whose state write fails is reported as failed, so the caller can
@@ -486,8 +491,8 @@ mod tests {
         );
     }
 
-    /// A commit-time revocation whose state write fails is kept for retry on the
-    /// downed link, and the issuance fails rather than succeeding.
+    /// A commit-time revocation whose state write fails quarantines the visa: the
+    /// issuance fails, the visa is not handed out, and its revocation is retried.
     #[tokio::test]
     async fn test_commit_time_revocation_failure_is_retained_for_retry() {
         use crate::db::FaultMode;
@@ -498,6 +503,7 @@ mod tests {
         let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
 
         // The link goes down; the commit-time check runs and its revocation fails.
+        // (Same for a route link that was removed outright: no endpoints needed.)
         asm.topo_mgr
             .record_link_states(&node_a, vec![], &|_: &IpAddr| None);
         db.set_set_ex_fault(FaultMode::Reject);
@@ -508,11 +514,32 @@ mod tests {
                 .is_err(),
             "a stale visa that could not be revoked must not be issued"
         );
+        // Quarantined: not handed out while its revocation keeps failing.
+        let pending = asm
+            .visa_mgr
+            .get_pending_visas_for_node(&node_a)
+            .await
+            .unwrap();
+        assert!(
+            pending.iter().all(|v| v.issuer_id != id),
+            "an unrevoked stale visa must not be distributed"
+        );
+
+        // Once the write works again, the next pending-visa read revokes it.
         db.set_set_ex_fault(FaultMode::None);
+        let pending = asm
+            .visa_mgr
+            .get_pending_visas_for_node(&node_a)
+            .await
+            .unwrap();
+        assert!(pending.iter().all(|v| v.issuer_id != id));
         assert_eq!(
-            asm.topo_mgr.links_to_revoke(&node_a, vec![]),
-            vec![(node_a, node_b)],
-            "the downed link is kept for retry"
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap(),
+            vec![id],
+            "the retry revoked it"
         );
 
         // A route that is still up is left alone.

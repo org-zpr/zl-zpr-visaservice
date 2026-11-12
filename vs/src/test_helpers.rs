@@ -785,6 +785,19 @@ pub async fn create_sweep_visa_on_route(
     vinst: u64,
     route: &Route,
 ) -> u64 {
+    try_create_sweep_visa_on_route(asm, req, vinst, route)
+        .await
+        .unwrap()
+}
+
+/// As [create_sweep_visa_on_route], but returns the issuance result instead of
+/// unwrapping it.
+pub async fn try_create_sweep_visa_on_route(
+    asm: &Arc<Assembly>,
+    req: &IpAddr,
+    vinst: u64,
+    route: &Route,
+) -> Result<u64, crate::error::ServiceError> {
     let pdesc = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 1234, 80).unwrap();
     let hit = Hit::new_no_signal(0, Direction::Forward);
     let vwmd = asm
@@ -800,9 +813,8 @@ pub async fn create_sweep_visa_on_route(
             vinst,
             SystemTime::now() + DEFAULT_EXPIRES,
         )
-        .await
-        .unwrap();
-    vwmd.visa.issuer_id
+        .await?;
+    Ok(vwmd.visa.issuer_id)
 }
 
 // ---- attribute-change sweep ----

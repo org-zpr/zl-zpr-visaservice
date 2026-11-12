@@ -259,6 +259,17 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
             report.orphaned_nodes.len()
         );
 
+        // Links the reconciliation took down or removed: revoke the visas crossing them
+        // through the ungated link path (zl-zipline#224). The policy sweep would skip a
+        // visa committed under this policy before the link went down, because its
+        // generation gate considers it current. Failures are kept for retry.
+        for (a, b) in &report.links_down {
+            let ok = crate::visa_reconciler::revoke_visas_over_link(asm, a, b)
+                .await
+                .is_ok();
+            asm.topo_mgr.note_revocation(a, b, ok);
+        }
+
         // Queue up setTopology messages in parallel.
         let futs = valid_node_addrs.iter().filter_map(|naddr| {
             let peers = psnap.resolved_peers_for_node(naddr);

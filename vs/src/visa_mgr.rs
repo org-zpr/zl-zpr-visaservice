@@ -1,7 +1,8 @@
 //! Manage the creating, storage and retrieval of visas for the visa service.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tracing::{debug, error, warn};
 
@@ -36,6 +37,10 @@ pub struct VisaMgr {
     /// Serializes the check-then-create in [VisaMgr::vsapi_bootstrap_visa_for_future_peer].
     /// Behind an `Arc` so every clone of the manager shares the one lock.
     bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Visas found on a downed route at commit whose revocation failed
+    /// ([VisaMgr::revoke_if_route_down]). They are never handed out, and their
+    /// revocation is retried on every [VisaMgr::get_pending_visas_for_node].
+    quarantine: Arc<Mutex<HashSet<u64>>>,
 }
 
 pub struct VisaWithMetadata {
@@ -142,6 +147,7 @@ impl VisaMgr {
         VisaMgr {
             repo: db,
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quarantine: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -542,28 +548,32 @@ impl VisaMgr {
     /// this one. Called once the visa is committed: if the link went down before this
     /// check, the check catches it; if it goes down after, the pass finds the visa.
     ///
-    /// A stale visa is marked `PendingRevoke`. If that write fails, the downed links are
-    /// recorded for retry (`TopologyMgr::note_revocation`, retried on the next report
-    /// from either end) and an error is returned so the visa is not handed out.
+    /// A stale visa is marked `PendingRevoke` and an error is returned either way, so
+    /// `create_visa` never hands it out. If the revocation write fails, the visa is also
+    /// quarantined -- never handed out by [VisaMgr::get_pending_visas_for_node], which
+    /// also retries the revocation -- and an error is returned so `create_visa` does not
+    /// return it either. This works whether a route link went down or was removed.
     pub(crate) async fn revoke_if_route_down(
         &self,
         asm: &Assembly,
         visa_id: u64,
         links: &[LinkId],
     ) -> Result<(), ServiceError> {
-        let Some(down) = asm.topo_mgr.route_down_links(links) else {
+        if asm.topo_mgr.route_links_up(links) {
             return Ok(());
-        };
+        }
         warn!(target: VISA, "visa {visa_id}: a link on its route went down while it was issued; revoking it");
         if let Err(e) = self.mark_visa_revoked(visa_id).await {
-            for (a, b) in &down {
-                asm.topo_mgr.note_revocation(a, b, false);
-            }
+            self.quarantine.lock().unwrap().insert(visa_id);
             return Err(ServiceError::Internal(format!(
                 "visa {visa_id}: its route went down while it was issued and revoking it failed: {e}"
             )));
         }
-        Ok(())
+        // Revoked, but never hand it out: the requester would otherwise get an Allow
+        // and a visa on a route that is already down.
+        Err(ServiceError::Internal(format!(
+            "visa {visa_id}: its route went down while it was issued; revoked"
+        )))
     }
 
     /// As [VisaMgr::create_visa], but with the node path supplied rather than derived from
@@ -679,14 +689,39 @@ impl VisaMgr {
         Ok(VisaWithMetadata::new(visa, metadata))
     }
 
+    /// Visas waiting to be installed on `node_addr`. Quarantined visas (see
+    /// [VisaMgr::revoke_if_route_down]) are never returned; this call also retries
+    /// their revocation, so housekeeping drives the retry.
     pub async fn get_pending_visas_for_node(
         &self,
         node_addr: &IpAddr,
     ) -> Result<Vec<Visa>, ServiceError> {
+        self.retry_quarantined_revocations().await;
+        let quarantined = self.quarantine.lock().unwrap().clone();
         let visas = self
             .repo
-            .get_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)?;
+            .get_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)?
+            .into_iter()
+            .filter(|v| !quarantined.contains(&v.issuer_id))
+            .collect();
         Ok(visas)
+    }
+
+    /// Try again to revoke every quarantined visa; drop each one whose revocation
+    /// now succeeds (or that no longer exists).
+    async fn retry_quarantined_revocations(&self) {
+        let ids: Vec<u64> = self.quarantine.lock().unwrap().iter().copied().collect();
+        for visa_id in ids {
+            match self.mark_visa_revoked(visa_id).await {
+                Ok(_) => {
+                    self.quarantine.lock().unwrap().remove(&visa_id);
+                    info!(target: VISA, "visa {visa_id}: quarantined stale visa revoked on retry");
+                }
+                Err(e) => {
+                    warn!(target: VISA, "visa {visa_id}: quarantined stale visa still not revoked: {e}")
+                }
+            }
+        }
     }
 
     pub async fn get_pending_visa_ids_for_node(
