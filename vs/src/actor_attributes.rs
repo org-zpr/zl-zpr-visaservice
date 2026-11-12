@@ -82,14 +82,22 @@ pub(crate) async fn refresh_and_persist_actor(
     actor: &mut Actor,
 ) -> Result<bool, ServiceError> {
     let policy = asm.policy_mgr.get_current();
+    // The actor as read, before the refresh: its trusted services are queried outside
+    // the topology lock, so the commit below applies only what the refresh changed.
+    let read_before = actor.clone();
     let outcome =
         refresh_expired_attributes(&asm.ts_mgr, &policy.lookup_identity_keys(), actor).await;
     if outcome.changed {
         // The attributes moved, so the services they grant may have too.
         restamp_services(&policy, actor);
-        asm.actor_mgr
-            .update_actor(actor, &asm.policy_service_names())
-            .await?;
+        if !commit_refresh(asm, &read_before, actor).await? {
+            // The actor left while the refresh was in flight: nothing to write back,
+            // and no revision to record against a departed actor.
+            return Err(ServiceError::Internal(format!(
+                "actor {:?} left during attribute refresh",
+                actor.get_zpr_addr()
+            )));
+        }
     }
 
     // No ZPR address means refresh_expired_attributes did nothing at all (an actor
@@ -108,6 +116,59 @@ pub(crate) async fn refresh_and_persist_actor(
         )));
     }
     Ok(outcome.changed)
+}
+
+/// Write a refreshed actor back under the topology operation lock
+/// ([crate::topology_mgr::TopoOps]): re-read the actor as stored now and apply to it
+/// only the attributes the refresh changed (`refreshed` against `read_before`), so a
+/// session, substrate claim or anything else written meanwhile -- by a reconnect, say
+/// -- is not rolled back to the copy the refresh started from. `actor` (`refreshed`)
+/// becomes the merged result. Returns false, writing nothing, if the actor is no
+/// longer stored (it left while the refresh was in flight).
+async fn commit_refresh(
+    asm: &Assembly,
+    read_before: &Actor,
+    refreshed: &mut Actor,
+) -> Result<bool, ServiceError> {
+    let Some(zpr_addr) = refreshed.get_zpr_addr().copied() else {
+        return Ok(false);
+    };
+    let ops = asm.topo_mgr.ops().await;
+    let Some(mut stored) = asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await? else {
+        return Ok(false);
+    };
+    apply_changed_attributes(read_before, refreshed, &mut stored)?;
+    asm.actor_mgr
+        .update_actor(&stored, &asm.policy_service_names())
+        .await?;
+    drop(ops);
+    *refreshed = stored;
+    Ok(true)
+}
+
+/// Apply to `target` every attribute that differs between `before` and `after`:
+/// changed or added ones are set, removed ones are removed. Attributes the two agree
+/// on are left as `target` has them.
+fn apply_changed_attributes(
+    before: &Actor,
+    after: &Actor,
+    target: &mut Actor,
+) -> Result<(), libeval::actor::AttributeError> {
+    let keys: HashSet<String> = before
+        .attrs_iter()
+        .chain(after.attrs_iter())
+        .map(|a| a.get_key().to_string())
+        .collect();
+    for k in keys {
+        match (before.get_attribute(&k), after.get_attribute(&k)) {
+            (b, a) if b == a => {}
+            (_, Some(a)) => target.add_attribute(a.clone())?,
+            (_, None) => {
+                target.remove_attribute(&k);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Recompute the services the actor provides ([key::SERVICES]) from its current
@@ -1160,6 +1221,93 @@ mod tests {
                  hash-order-dependent promotion, zipline#26 Codex P1)"
             );
         }
+    }
+}
+
+/// Commit of a refresh against concurrent actor writes (round 15).
+#[cfg(test)]
+mod refresh_commit {
+    use super::*;
+    use crate::test_helpers::{
+        TS_KEY, build_sweep_asm, register_ts, seed_source_attr, stored_attr,
+    };
+
+    const ACTOR: &str = "fd5a:5052:4000::a";
+
+    /// Round 15 (Copilot): the refresh queries trusted services outside the topology
+    /// lock with an actor read before them. Its commit applies only the attributes the
+    /// refresh changed onto the actor as stored now, so a session a reconnect
+    /// persisted meanwhile survives, and the refreshed attribute still lands.
+    #[tokio::test]
+    async fn test_refresh_commit_keeps_a_newer_session() {
+        let (asm, _node) = build_sweep_asm(false).await;
+        register_ts(&asm, &[(TS_KEY, "engineering")]);
+        seed_source_attr(&asm, ACTOR, TS_KEY, "sales").await;
+        let addr: IpAddr = ACTOR.parse().unwrap();
+        let mut read_before = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A reconnect persists a new session while the refresh is in flight.
+        let mut reconnected = read_before.clone();
+        reconnected
+            .add_attribute(Attribute::builder(key::SESSION).value("99-new"))
+            .unwrap();
+        asm.actor_mgr
+            .update_actor(&reconnected, &asm.policy_service_names())
+            .await
+            .unwrap();
+
+        assert!(
+            refresh_and_persist_actor(&asm, &mut read_before)
+                .await
+                .unwrap()
+        );
+
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.get_attribute(key::SESSION).unwrap().get_value(),
+            ["99-new".to_string()],
+            "the newer session must survive the refresh commit"
+        );
+        assert_eq!(
+            stored_attr(&asm, ACTOR, TS_KEY).await,
+            Some("engineering".to_string())
+        );
+    }
+
+    /// A refresh never writes back an actor that left while it was in flight.
+    #[tokio::test]
+    async fn test_refresh_commit_does_not_resurrect_a_departed_actor() {
+        let (asm, _node) = build_sweep_asm(false).await;
+        register_ts(&asm, &[(TS_KEY, "engineering")]);
+        seed_source_attr(&asm, ACTOR, TS_KEY, "sales").await;
+        let addr: IpAddr = ACTOR.parse().unwrap();
+        let mut read_before = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await.unwrap();
+
+        let _ = refresh_and_persist_actor(&asm, &mut read_before).await;
+
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
 

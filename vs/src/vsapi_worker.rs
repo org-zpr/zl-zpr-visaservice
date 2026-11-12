@@ -1385,8 +1385,16 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         let saddr: SocketAddr = vss_sockaddr.into();
         let amgr_asm = self.asm.clone();
 
-        // Topology operation lock (see TopoOps): the caller's liveness is rechecked
-        // under it and held through the VSS registration and worker start, so a
+        let prepared = self
+            .asm
+            .visa_mgr
+            .post_register_vss_visas_for_node(amgr_asm, node_zpr_addr, &saddr)
+            .await;
+
+        // Topology operation lock (see TopoOps), taken after the visa preparation
+        // above (which can wait on the visa request queue and remote attribute
+        // services, so it stays outside): the caller's liveness is rechecked under it
+        // and it is held through the local registration and worker start, so a
         // handle whose node reconnected or disconnected meanwhile cannot register a
         // VSS for the new session or for a node that is gone.
         let ops = self.asm.topo_mgr.ops().await;
@@ -1401,13 +1409,9 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             );
             return Ok(());
         }
-
-        let initial_visas = match self
-            .asm
-            .visa_mgr
-            .post_register_vss_visas_for_node(amgr_asm, node_zpr_addr, &saddr)
-            .await
-        {
+        // A superseded handle is told to re-authenticate (above) before it hears
+        // about a preparation failure.
+        let initial_visas = match prepared {
             Ok(visas) => visas,
             Err(e) => {
                 error!(target: API, "failed to initialize node VSS for {:?}: {}", self.node.get_cn(), e);

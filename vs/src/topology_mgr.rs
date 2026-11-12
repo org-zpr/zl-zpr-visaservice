@@ -52,10 +52,17 @@ use zpr::vsapi_types::LinkStateReport;
 /// Rules: never take a second guard while holding one: the lock is not re-entrant
 /// (pass the guard down instead, as `disconnect_locked` and `AuthenticateUndo::undo`
 /// take it). Under the guard await only local work (state store writes, actor
-/// updates): never an event-queue send or a node RPC, which can wait on a task that
-/// wants the guard. So `authenticate` drops it before recording `ActorJoins`,
-/// `disconnect` before stopping the node's VSS worker, and the policy pass before
-/// sending `setTopology`.
+/// updates): never the visa request queue, a trusted service, an event-queue send or
+/// a node RPC. Those can be slow, and can wait on a task that wants the guard (a visa
+/// request refreshes actor attributes, whose commit takes it). So `authenticate` drops
+/// it before recording `ActorJoins`, `disconnect` before stopping the node's VSS
+/// worker, `register_vss` prepares its visas before taking it, and the policy pass
+/// drops it before sending `setTopology`.
+///
+/// Actor attribute refreshes query trusted services outside the guard and commit
+/// under it, applying only the attributes they changed onto the actor as stored then
+/// (`commit_refresh` in `actor_attributes`), so they never roll back a session or
+/// claim written meanwhile.
 ///
 /// The one path outside it is visa issuance, which is not a topology write: it reads
 /// routes lock-free and checks its route again once the visa is stored (see
