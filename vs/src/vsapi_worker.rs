@@ -209,10 +209,16 @@ impl VSGateImpl {
 }
 
 impl VSHandleImpl {
+    /// Build the handle for a node's freshly (re)authenticated session. Minting a handle
+    /// is where a new session begins, so this also starts the node's link-state session
+    /// (zl-zipline#224): reports from earlier handles are no longer accepted.
     fn new(asm: Arc<Assembly>, node: Actor) -> Self {
         let session = node
             .get_attribute(key::SESSION)
             .and_then(|a| a.get_single_value().ok().map(str::to_string));
+        if let Some(addr) = node.get_zpr_addr() {
+            asm.topo_mgr.begin_link_session(addr, session.clone());
+        }
         VSHandleImpl { asm, node, session }
     }
 
@@ -1862,10 +1868,12 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             );
             return Ok(());
         }
-        let went_down = self
-            .asm
-            .topo_mgr
-            .record_link_states(&reporter, entries, &current_policy);
+        let went_down = self.asm.topo_mgr.record_link_states(
+            &reporter,
+            self.session.as_deref(),
+            entries,
+            &current_policy,
+        );
         // Revoke the visas crossing every link that just went down. A visa whose
         // revocation write fails is quarantined and retried per visa (VisaMgr), so the
         // report itself succeeds either way.

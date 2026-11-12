@@ -2736,7 +2736,7 @@ mod tests {
             .unwrap();
         // A reports an empty snapshot: its link to B is not up.
         asm.topo_mgr
-            .record_link_states_with_cns(&addr_a, vec![], &|_: &IpAddr| None);
+            .record_link_states_with_cns(&addr_a, None, vec![], &|_: &IpAddr| None);
 
         let details = fetch_network(&asm).await;
 

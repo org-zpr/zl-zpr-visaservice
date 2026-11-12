@@ -117,9 +117,14 @@ impl TopologyMgr {
     /// Returns the links that went from up to down, as `(reporter, peer)`, so the caller
     /// can revoke the visas that use them. A link coming up is not returned: it affects
     /// new visas only (Zodes plan §5.8).
+    ///
+    /// `session` is the VS-API session the report came from. It must be the node's
+    /// current link session ([Self::begin_link_session]); a late report from a session
+    /// the node has since replaced (a soft reconnect keeps the router node) is dropped.
     pub fn record_link_states(
         &self,
         reporter: &IpAddr,
+        session: Option<&str>,
         entries: Vec<LinkStateReport>,
         current_policy: &dyn Fn() -> PolicySnapshot,
     ) -> Vec<(IpAddr, IpAddr)> {
@@ -128,9 +133,22 @@ impl TopologyMgr {
         self.record_locked(
             &mut table,
             reporter,
+            session,
             entries,
             &Self::policy_cn_lookup(&snapshot),
         )
+    }
+
+    /// The node at `node` (re)connected with VS-API session `session` (called when its
+    /// handle is minted): its reports from earlier sessions are dropped, and only this
+    /// session's reports are accepted from now on. Under the table lock, so a report is
+    /// checked against the session atomically with being stored.
+    pub fn begin_link_session(&self, node: &IpAddr, session: Option<String>) {
+        let mut table = self.link_state.lock().unwrap();
+        table.begin_session(*node, session);
+        // Its old snapshot no longer counts; re-evaluate its links. The node is now a
+        // non-reporter, so its end agrees whatever the CNs (legacy rule until it reports).
+        self.refresh_links_locked(&table, node, &|_: &IpAddr| None);
     }
 
     /// As [Self::record_link_states], with a fixed node-address -> CN lookup instead of a
@@ -139,11 +157,12 @@ impl TopologyMgr {
     pub fn record_link_states_with_cns(
         &self,
         reporter: &IpAddr,
+        session: Option<&str>,
         entries: Vec<LinkStateReport>,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
     ) -> Vec<(IpAddr, IpAddr)> {
         let mut table = self.link_state.lock().unwrap();
-        self.record_locked(&mut table, reporter, entries, cn_of)
+        self.record_locked(&mut table, reporter, session, entries, cn_of)
     }
 
     /// Body of [Self::record_link_states], with the table locked by the caller: one
@@ -154,9 +173,14 @@ impl TopologyMgr {
         &self,
         table: &mut LinkStateTable,
         reporter: &IpAddr,
+        session: Option<&str>,
         entries: Vec<LinkStateReport>,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
     ) -> Vec<(IpAddr, IpAddr)> {
+        if !table.session_current(reporter, session) {
+            debug!(target: TOPO, "link-state report from {reporter}: from a superseded session; dropped");
+            return Vec::new();
+        }
         // A report from a node that is no longer in the router -- a stale handle whose
         // node was disconnected meanwhile -- is dropped: storing it would let a
         // pre-disconnect snapshot govern the link after the node reconnects.
@@ -662,6 +686,16 @@ impl TopologyMgr {
         // in install_router_link: a concurrent report cannot slip in between.
         let table = self.link_state.lock().unwrap();
         let current = current_policy();
+        // A superseded pass (a newer policy was installed while this one awaited
+        // persistence) applies nothing: its link decisions come from an old policy, and
+        // the queued pass for the current policy will make them. Its persistence repairs
+        // above are harmless; the next pass reconciles router and state again.
+        if current.vinst() != snapshot.vinst() {
+            info!(target: TOPO, "revalidate: policy vinst {} superseded by {}; topology left to the newer pass", snapshot.vinst(), current.vinst());
+            // Nothing was removed or taken down here, so nothing to revoke.
+            report.links_down.clear();
+            return Ok(report);
+        }
         let flag_cn_of = Self::policy_cn_lookup(&current);
         for e in surviving {
             let spec = LinkSpec {
@@ -1634,27 +1668,43 @@ mod tests {
         let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
 
         // A says up, B has not reported (legacy): still up, nothing went down.
-        let down =
-            topo.record_link_states_with_cns(&a, vec![report("b.zpr", LinkState::Up)], &cn_of);
+        let down = topo.record_link_states_with_cns(
+            &a,
+            None,
+            vec![report("b.zpr", LinkState::Up)],
+            &cn_of,
+        );
         assert!(down.is_empty());
         assert!(topo.router.link_between(&a, &b).unwrap().up);
 
         // B says down: the edge goes down and is reported as such, once.
-        let down =
-            topo.record_link_states_with_cns(&b, vec![report("a.zpr", LinkState::Down)], &cn_of);
+        let down = topo.record_link_states_with_cns(
+            &b,
+            None,
+            vec![report("a.zpr", LinkState::Down)],
+            &cn_of,
+        );
         assert_eq!(down, vec![(b, a)]);
         assert!(!topo.router.link_between(&a, &b).unwrap().up);
         assert!(topo.get_best_route(&a, &b).is_none());
-        let again =
-            topo.record_link_states_with_cns(&b, vec![report("a.zpr", LinkState::Down)], &cn_of);
+        let again = topo.record_link_states_with_cns(
+            &b,
+            None,
+            vec![report("a.zpr", LinkState::Down)],
+            &cn_of,
+        );
         assert!(
             again.is_empty(),
             "an edge already down is not reported again"
         );
 
         // B says up again: the edge comes back; coming up is not a "went down".
-        let down =
-            topo.record_link_states_with_cns(&b, vec![report("a.zpr", LinkState::Up)], &cn_of);
+        let down = topo.record_link_states_with_cns(
+            &b,
+            None,
+            vec![report("a.zpr", LinkState::Up)],
+            &cn_of,
+        );
         assert!(down.is_empty());
         assert!(topo.router.link_between(&a, &b).unwrap().up);
         assert!(topo.get_best_route(&a, &b).is_some());
@@ -1672,7 +1722,7 @@ mod tests {
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
         topo.add_node(a).unwrap();
 
-        let down = topo.record_link_states_with_cns(&a, vec![], &|_: &IpAddr| None);
+        let down = topo.record_link_states_with_cns(&a, None, vec![], &|_: &IpAddr| None);
         assert!(down.is_empty(), "no edge yet, so nothing went down");
 
         let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
@@ -1699,7 +1749,7 @@ mod tests {
         topo.add_node(b).unwrap();
         topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
         let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
-        topo.record_link_states_with_cns(&a, vec![report("b.zpr", LinkState::Down)], &cn_of);
+        topo.record_link_states_with_cns(&a, None, vec![report("b.zpr", LinkState::Down)], &cn_of);
         assert!(!topo.router.link_between(&a, &b).unwrap().up);
 
         topo.remove_node(&a).await;
@@ -1731,7 +1781,7 @@ mod tests {
 
         // Under an earlier CN mapping, A's report matches B and the link is up.
         let old_cns = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
-        topo.record_link_states_with_cns(&a, vec![report("b.zpr", LinkState::Up)], &old_cns);
+        topo.record_link_states_with_cns(&a, None, vec![report("b.zpr", LinkState::Up)], &old_cns);
         assert!(topo.router.link_between(&a, &b).unwrap().up);
 
         // The current policy no longer knows B's CN, so A's entry cannot match it.
@@ -1766,7 +1816,7 @@ mod tests {
         let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
 
         // A is not a router node: its (down) report is dropped.
-        topo.record_link_states_with_cns(&a, vec![report("b.zpr", LinkState::Down)], &cn_of);
+        topo.record_link_states_with_cns(&a, None, vec![report("b.zpr", LinkState::Down)], &cn_of);
 
         // A reconnects and its link is installed: A is a non-reporter, so legacy-up.
         topo.add_node(a).unwrap();
@@ -1808,7 +1858,7 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
 
         // A reports B up under the name "b.zpr": no longer B's CN under the new policy.
-        topo.record_link_states(&a, vec![report("b.zpr", LinkState::Up)], &|| {
+        topo.record_link_states(&a, None, vec![report("b.zpr", LinkState::Up)], &|| {
             new.get_current_snapshot()
         });
         assert!(!topo.router.link_between(&a, &b).unwrap().up);
@@ -1827,8 +1877,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_revalidation_rechecks_kept_links_against_the_current_policy() {
-        // The pass snapshot says Keep (its CNs still match A's report), but the current
-        // policy renamed B: the kept link must go down and be reported for revocation.
+        // A's report was applied under the old policy (B was "b.zpr"); the new policy
+        // renamed B. The pass for the new policy must take the unchanged link down and
+        // report it for revocation.
         use crate::test_helpers::policy_with_peerings_and_node_cns;
         let db = Arc::new(FakeDb::new());
         let a = ip("fd5a:5052::1");
@@ -1857,14 +1908,15 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
 
         // Under the old policy A's report matches B: the link is up.
-        topo.record_link_states(&a, vec![report("b.zpr", LinkState::Up)], &|| {
+        topo.record_link_states(&a, None, vec![report("b.zpr", LinkState::Up)], &|| {
             old.get_current_snapshot()
         });
         assert!(topo.router.link_between(&a, &b).unwrap().up);
 
-        // A pass with the old snapshot runs after the new policy became current.
+        // The flag was set under the old policy; a pass for the new (current) policy
+        // must re-check it even though the link itself is unchanged.
         let report = topo
-            .revalidate_against_policy(&old.get_current_snapshot(), &[a, b], &|| {
+            .revalidate_against_policy(&new.get_current_snapshot(), &[a, b], &|| {
                 new.get_current_snapshot()
             })
             .await
@@ -1878,5 +1930,85 @@ mod tests {
             1,
             "and its down transition is reported"
         );
+    }
+
+    #[test]
+    fn test_report_from_a_superseded_session_is_dropped() {
+        // A soft reconnect keeps the router node; a late report from the old session
+        // must not overwrite the new session's state.
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let topo = TopologyMgr::new(LinkRepo::new(Arc::new(FakeDb::new())));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+
+        topo.begin_link_session(&a, Some("s2".into()));
+        topo.record_link_states_with_cns(
+            &a,
+            Some("s1"),
+            vec![report("b.zpr", LinkState::Down)],
+            &cn_of,
+        );
+        assert!(
+            topo.router.link_between(&a, &b).unwrap().up,
+            "the old session's report is dropped"
+        );
+        topo.record_link_states_with_cns(
+            &a,
+            Some("s2"),
+            vec![report("b.zpr", LinkState::Down)],
+            &cn_of,
+        );
+        assert!(
+            !topo.router.link_between(&a, &b).unwrap().up,
+            "the current session's applies"
+        );
+
+        // A new session starts clean: the node is a non-reporter until it reports.
+        topo.begin_link_session(&a, Some("s3".into()));
+        topo.refresh_links_for_node(&a, &cn_of);
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+    }
+
+    #[tokio::test]
+    async fn test_superseded_policy_pass_applies_nothing() {
+        // A pass whose policy is no longer current must not mutate the topology: the
+        // queued pass for the current policy does that.
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        // The pass's (old) policy declares no links, so it would GC a-b.
+        let policy_mgr =
+            make_policy_mgr_from_bytes(db.clone(), policy_bytes_from_peerings(&[])).await;
+        let old = policy_mgr.get_current_snapshot();
+        policy_mgr
+            .update_policy_from_container_bytes(make_container_bytes(
+                config::POLICY_MIN_COMPILER_MAJOR,
+                config::POLICY_MIN_COMPILER_MINOR,
+                config::POLICY_MIN_COMPILER_PATCH,
+                &policy_with_link(a, b, "link-ab"),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(old.vinst(), policy_mgr.get_current_snapshot().vinst());
+
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("link-ab".into()), vec![], 1)
+            .unwrap();
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+
+        let report = topo
+            .revalidate_against_policy(&old, &[a, b], &|| policy_mgr.get_current_snapshot())
+            .await
+            .unwrap();
+        assert!(
+            topo.router.link_between(&a, &b).is_some(),
+            "the stale pass removed nothing"
+        );
+        assert!(report.links_down.is_empty(), "and asks for no revocation");
     }
 }

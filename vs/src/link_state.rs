@@ -30,6 +30,10 @@ use zpr::vsapi_types::{LinkState, LinkStateReport};
 pub struct LinkStateTable {
     /// Reporting node's ZPR address -> (peer CN -> reported state).
     snapshots: HashMap<IpAddr, HashMap<String, LinkState>>,
+    /// Node's ZPR address -> the VS-API session its reports must come from. Set when
+    /// the node (re)connects ([LinkStateTable::begin_session]); a report from any other
+    /// session is stale. A node with no entry accepts any report.
+    sessions: HashMap<IpAddr, Option<String>>,
 }
 
 impl LinkStateTable {
@@ -48,6 +52,23 @@ impl LinkStateTable {
     /// non-reporter again.
     pub fn remove_node(&mut self, node: &IpAddr) {
         self.snapshots.remove(node);
+        self.sessions.remove(node);
+    }
+
+    /// The node (re)connected with VS-API session `session`: drop its reports from any
+    /// earlier session (it re-sends a snapshot after every (re)connect) and accept
+    /// reports only from this session from now on.
+    pub fn begin_session(&mut self, node: IpAddr, session: Option<String>) {
+        self.snapshots.remove(&node);
+        self.sessions.insert(node, session);
+    }
+
+    /// True if a report from `session` may be stored for `node`: no session is
+    /// recorded, or it is the recorded one.
+    pub fn session_current(&self, node: &IpAddr, session: Option<&str>) -> bool {
+        self.sessions
+            .get(node)
+            .is_none_or(|current| current.as_deref() == session)
     }
 
     /// Does the `reporter` end of a link agree that the link to the peer whose CN is
