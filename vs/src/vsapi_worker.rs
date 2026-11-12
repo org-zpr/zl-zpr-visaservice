@@ -1612,7 +1612,13 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         let actor = match self
             .asm
             .cc
-            .reauthorize_actor(self.asm.clone(), zpr_addr, blobs, connect_via)
+            .reauthorize_actor(
+                self.asm.clone(),
+                zpr_addr,
+                blobs,
+                connect_via,
+                self.session.as_deref(),
+            )
             .await
         {
             Ok(actor) => actor,

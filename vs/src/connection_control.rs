@@ -1177,12 +1177,17 @@ impl ConnectionControl {
     /// that actor in its current VS-API session, or drop it (log out) by
     /// omitting the OIDC blob. The `device` blob is mandatory either way.
     /// After a gain or drop every live visa is re-checked.
+    ///
+    /// `caller_session` is the VS-API session generation (`zpr.session`) the
+    /// calling handle was minted under; a node's renewal of its own actor is
+    /// refused unless it is the actor's current one.
     pub(crate) async fn reauthorize_actor(
         &self,
         asm: Arc<Assembly>,
         zpr_addr: IpAddr,
         blobs: Vec<AuthBlob>,
         connect_via: &IpAddr,
+        caller_session: Option<&str>,
     ) -> Result<Actor, ServiceError> {
         if blobs.is_empty() {
             return Err(ApiResponseError::new_code_msg(
@@ -1251,6 +1256,23 @@ impl ConnectionControl {
         // VS-API, not through a dock); the calling node renewing ITSELF is
         // bound by the node session that carries this call (zl-zipline#232).
         let self_renewal = is_self_renewal(&actor, &zpr_addr, connect_via);
+        // A node renewing ITSELF must do so from its current handle (#63
+        // review): a handle minted under an earlier session that passed the
+        // liveness gate just before a reconnect must not act on the actor of
+        // the new session -- e.g. log out a user the new session logged in.
+        if self_renewal {
+            let loaded_session = actor
+                .get_attribute(key::SESSION)
+                .and_then(|a| a.get_single_value().ok());
+            if caller_session.is_none() || loaded_session.as_deref() != caller_session {
+                info!(target: CC, "self-renewal of {zpr_addr} refused: the calling handle's session is not the node's current one");
+                return Err(ApiResponseError::new_code_msg(
+                    ErrorCode::AuthError,
+                    "authentication rejected",
+                )
+                .into());
+            }
+        }
         let via_matches = actor
             .get_attribute(key::CONNECT_VIA)
             .and_then(|a| a.get_single_value().ok())
@@ -5180,7 +5202,7 @@ mod tests {
             iat1,
         ))))];
         let renewed = cc
-            .reauthorize_actor(asm.clone(), addr, blobs, &connect_via)
+            .reauthorize_actor(asm.clone(), addr, blobs, &connect_via, None)
             .await
             .expect("reauthorize must succeed");
 
@@ -5243,7 +5265,7 @@ mod tests {
             iat1,
         ))))];
         let renewed = cc
-            .reauthorize_actor(asm, addr, blobs, &connect_via)
+            .reauthorize_actor(asm, addr, blobs, &connect_via, None)
             .await
             .expect("reauthorize must succeed");
 
@@ -5285,7 +5307,7 @@ mod tests {
         claims["email_verified"] = json!(false);
         let blobs = vec![AuthBlob::Oidc(oidc_raw_blob(mint_signed(claims)))];
         let renewed = cc
-            .reauthorize_actor(asm, addr, blobs, &connect_via)
+            .reauthorize_actor(asm, addr, blobs, &connect_via, None)
             .await
             .expect("reauthorize must succeed");
 
@@ -5349,6 +5371,7 @@ mod tests {
             addr,
             vec![AuthBlob::Oidc(oidc_raw_blob(token.clone()))],
             &connect_via,
+            None,
         )
         .await
         .expect("the first renewal must succeed");
@@ -5359,6 +5382,7 @@ mod tests {
                 addr,
                 vec![AuthBlob::Oidc(oidc_raw_blob(token))],
                 &connect_via,
+                None,
             )
             .await,
         );
@@ -5448,7 +5472,7 @@ mod tests {
             AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)))),
         ];
         let renewed = cc
-            .reauthorize_actor(asm, addr, blobs, &connect_via)
+            .reauthorize_actor(asm, addr, blobs, &connect_via, None)
             .await
             .expect("reauthorize must succeed");
 
@@ -5579,7 +5603,10 @@ mod tests {
         let (privkey, _) = gen_rsa_test_keypair();
         let blobs = vec![make_fresh_ss_blob(&privkey, "some.cn")];
 
-        let api = api_err(cc.reauthorize_actor(asm, addr, blobs, &connect_via).await);
+        let api = api_err(
+            cc.reauthorize_actor(asm, addr, blobs, &connect_via, None)
+                .await,
+        );
         assert!(
             matches!(api.code, ErrorCode::ParamError),
             "unexpected code {:?}",
@@ -5599,7 +5626,7 @@ mod tests {
         let addr = *actor.get_zpr_addr().unwrap();
 
         let api = api_err(
-            cc.reauthorize_actor(asm, addr, Vec::new(), &connect_via)
+            cc.reauthorize_actor(asm, addr, Vec::new(), &connect_via, None)
                 .await,
         );
         assert!(
@@ -5621,8 +5648,14 @@ mod tests {
         ))))];
 
         let api = api_err(
-            cc.reauthorize_actor(asm, "fd5a:5052::dead".parse().unwrap(), blobs, &connect_via)
-                .await,
+            cc.reauthorize_actor(
+                asm,
+                "fd5a:5052::dead".parse().unwrap(),
+                blobs,
+                &connect_via,
+                None,
+            )
+            .await,
         );
         assert!(
             matches!(api.code, ErrorCode::ParamError),
@@ -5643,7 +5676,10 @@ mod tests {
             iat1,
         ))))];
 
-        let api = api_err(cc.reauthorize_actor(asm, addr, blobs, &other_node).await);
+        let api = api_err(
+            cc.reauthorize_actor(asm, addr, blobs, &other_node, None)
+                .await,
+        );
         assert!(
             matches!(api.code, ErrorCode::ParamError),
             "unexpected code {:?}",
@@ -5786,6 +5822,7 @@ mod tests {
                 addr,
                 vec![make_fresh_ss_blob(&privkey, cn)],
                 &connect_via,
+                None,
             )
             .await
             .expect("SS reauthorize must succeed");
@@ -5833,7 +5870,7 @@ mod tests {
             AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)))),
         ];
         let renewed = cc
-            .reauthorize_actor(asm, addr, blobs, &connect_via)
+            .reauthorize_actor(asm, addr, blobs, &connect_via, None)
             .await
             .expect("two-namespace reauthorize must succeed");
 
@@ -5898,6 +5935,7 @@ mod tests {
                 addr,
                 vec![make_fresh_ss_blob(&privkey, cn)],
                 &connect_via,
+                None,
             )
             .await
             .expect("SS-only renewal must succeed for a TS-enriched actor");
@@ -5936,7 +5974,10 @@ mod tests {
             make_fresh_ss_blob(&privkey, cn),
             AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)))),
         ];
-        let api = api_err(cc.reauthorize_actor(asm, addr, blobs, &connect_via).await);
+        let api = api_err(
+            cc.reauthorize_actor(asm, addr, blobs, &connect_via, None)
+                .await,
+        );
         assert!(
             matches!(api.code, ErrorCode::ParamError),
             "unexpected code {:?}",
@@ -5960,7 +6001,10 @@ mod tests {
             AuthBlob::Oidc(oidc_raw_blob(token)),
         ];
 
-        let api = api_err(cc.reauthorize_actor(asm, addr, blobs, &connect_via).await);
+        let api = api_err(
+            cc.reauthorize_actor(asm, addr, blobs, &connect_via, None)
+                .await,
+        );
         assert!(
             matches!(api.code, ErrorCode::ParamError),
             "unexpected code {:?}",
@@ -5982,7 +6026,10 @@ mod tests {
             iat1,
         ))))];
 
-        let api = api_err(cc.reauthorize_actor(asm, addr, blobs, &connect_via).await);
+        let api = api_err(
+            cc.reauthorize_actor(asm, addr, blobs, &connect_via, None)
+                .await,
+        );
         assert!(
             matches!(api.code, ErrorCode::ParamError),
             "unexpected code {:?}",
@@ -6007,7 +6054,10 @@ mod tests {
             AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)))),
         ];
 
-        let api = api_err(cc.reauthorize_actor(asm, addr, blobs, &connect_via).await);
+        let api = api_err(
+            cc.reauthorize_actor(asm, addr, blobs, &connect_via, None)
+                .await,
+        );
         assert!(
             matches!(api.code, ErrorCode::ParamError),
             "unexpected code {:?}",
@@ -6037,6 +6087,7 @@ mod tests {
                 addr,
                 vec![make_fresh_ss_blob(&privkey, cn)],
                 &connect_via,
+                None,
             )
             .await,
         );
@@ -6072,6 +6123,7 @@ mod tests {
                 addr,
                 vec![make_fresh_ss_blob(&privkey, cn)],
                 &connect_via,
+                None,
             )
             .await,
         );
@@ -6093,6 +6145,7 @@ mod tests {
                 addr,
                 vec![make_fresh_ss_blob(&privkey, "other.zpr")],
                 &connect_via,
+                None,
             )
             .await,
         );
@@ -6115,6 +6168,7 @@ mod tests {
                 addr,
                 vec![make_ss_blob_at(&privkey, cn, skewed)],
                 &connect_via,
+                None,
             )
             .await,
         );
@@ -7326,6 +7380,7 @@ mod tests {
             addr,
             vec![make_fresh_ss_blob(&privkey, cn)],
             &connect_via,
+            None,
         )
         .await
         .expect("renewal must succeed before revocation");
@@ -7341,6 +7396,7 @@ mod tests {
                 addr,
                 vec![make_fresh_ss_blob(&privkey, cn)],
                 &connect_via,
+                None,
             )
             .await,
         );
@@ -7867,6 +7923,7 @@ mod tests {
             addr,
             zode_login_blobs(privkey, cn, &nonce, oidc_base_claims()),
             &addr,
+            Some(ZODE_SESSION),
         )
         .await
         .expect("a node's own login must succeed")
@@ -7885,6 +7942,7 @@ mod tests {
             addr,
             vec![make_fresh_ss_blob(privkey, cn)],
             &addr,
+            Some(ZODE_SESSION),
         )
         .await
         .expect("a node's own logout must succeed")
@@ -8103,6 +8161,7 @@ mod tests {
             addr,
             vec![make_fresh_ss_blob(&privkey, cn)],
             &addr,
+            Some(ZODE_SESSION),
         )
         .await
         .expect("device-only renewal must succeed");
@@ -8126,7 +8185,10 @@ mod tests {
         if let AuthBlob::Oidc(ob) = &mut blobs[1] {
             ob.id_token.push('x'); // corrupt the signature
         }
-        let api = api_err(cc.reauthorize_actor(asm.clone(), addr, blobs, &addr).await);
+        let api = api_err(
+            cc.reauthorize_actor(asm.clone(), addr, blobs, &addr, Some(ZODE_SESSION))
+                .await,
+        );
         assert!(
             matches!(api.code, ErrorCode::InvalidSignature),
             "got {:?}",
@@ -8151,7 +8213,10 @@ mod tests {
         claims["sub"] = json!("another-user");
         claims["iat"] = json!(unix_now() + 1);
         let blobs = zode_login_blobs(&privkey, cn, &nonce, claims);
-        assert_auth_rejected(api_err(cc.reauthorize_actor(asm, addr, blobs, &addr).await));
+        assert_auth_rejected(api_err(
+            cc.reauthorize_actor(asm, addr, blobs, &addr, Some(ZODE_SESSION))
+                .await,
+        ));
     }
 
     /// Test 8: a node cannot change the namespaces of an adapter docked to
@@ -8167,7 +8232,10 @@ mod tests {
             .unwrap()
             .0;
         let blobs = zode_login_blobs(&privkey, cn, &nonce, oidc_base_claims());
-        let api = api_err(cc.reauthorize_actor(asm, addr, blobs, &connect_via).await);
+        let api = api_err(
+            cc.reauthorize_actor(asm, addr, blobs, &connect_via, None)
+                .await,
+        );
         assert!(
             matches!(api.code, ErrorCode::ParamError),
             "got {:?}",
@@ -8184,7 +8252,10 @@ mod tests {
         let nonce = mint_zode_nonce(&cc, addr);
         let mut blobs = zode_login_blobs(&privkey, cn, &nonce, oidc_base_claims());
         let oidc_only = vec![blobs.remove(1)];
-        let api = api_err(cc.reauthorize_actor(asm, addr, oidc_only, &addr).await);
+        let api = api_err(
+            cc.reauthorize_actor(asm, addr, oidc_only, &addr, Some(ZODE_SESSION))
+                .await,
+        );
         assert!(
             matches!(api.code, ErrorCode::ParamError),
             "got {:?}",
@@ -8204,6 +8275,7 @@ mod tests {
             addr,
             zode_login_blobs(&privkey, cn, &nonce, oidc_base_claims()),
             &addr,
+            Some(ZODE_SESSION),
         )
         .await
         .expect("first login succeeds");
@@ -8212,7 +8284,8 @@ mod tests {
         // The same token (same claims, same nonce) presented again.
         let replay = zode_login_blobs(&privkey, cn, &nonce, oidc_base_claims());
         assert_auth_rejected(api_err(
-            cc.reauthorize_actor(asm, addr, replay, &addr).await,
+            cc.reauthorize_actor(asm, addr, replay, &addr, Some(ZODE_SESSION))
+                .await,
         ));
     }
 
@@ -8228,7 +8301,10 @@ mod tests {
             .unwrap()
             .0;
         let blobs = zode_login_blobs(&privkey, cn, &nonce, oidc_base_claims());
-        assert_auth_rejected(api_err(cc.reauthorize_actor(asm, addr, blobs, &addr).await));
+        assert_auth_rejected(api_err(
+            cc.reauthorize_actor(asm, addr, blobs, &addr, Some(ZODE_SESSION))
+                .await,
+        ));
         assert!(
             !cc.login_nonces
                 .consume(&nonce, other, ZODE_SESSION, SystemTime::now())
@@ -8247,7 +8323,10 @@ mod tests {
             .unwrap()
             .0;
         let blobs = zode_login_blobs(&privkey, cn, &nonce, oidc_base_claims());
-        assert_auth_rejected(api_err(cc.reauthorize_actor(asm, addr, blobs, &addr).await));
+        assert_auth_rejected(api_err(
+            cc.reauthorize_actor(asm, addr, blobs, &addr, Some(ZODE_SESSION))
+                .await,
+        ));
     }
 
     /// Test 14 (reauthorize level; the exact boundary is a store test): an
@@ -8263,7 +8342,10 @@ mod tests {
             .unwrap()
             .0;
         let blobs = zode_login_blobs(&privkey, cn, &nonce, oidc_base_claims());
-        assert_auth_rejected(api_err(cc.reauthorize_actor(asm, addr, blobs, &addr).await));
+        assert_auth_rejected(api_err(
+            cc.reauthorize_actor(asm, addr, blobs, &addr, Some(ZODE_SESSION))
+                .await,
+        ));
     }
 
     /// Test 15: a nonce presented once with a bad token cannot be reused with
@@ -8277,9 +8359,14 @@ mod tests {
         if let AuthBlob::Oidc(ob) = &mut bad[1] {
             ob.id_token.push('x');
         }
-        let _ = cc.reauthorize_actor(asm.clone(), addr, bad, &addr).await;
+        let _ = cc
+            .reauthorize_actor(asm.clone(), addr, bad, &addr, Some(ZODE_SESSION))
+            .await;
         let good = zode_login_blobs(&privkey, cn, &nonce, oidc_base_claims());
-        assert_auth_rejected(api_err(cc.reauthorize_actor(asm, addr, good, &addr).await));
+        assert_auth_rejected(api_err(
+            cc.reauthorize_actor(asm, addr, good, &addr, Some(ZODE_SESSION))
+                .await,
+        ));
     }
 
     /// Test 16: a nonce the visa service never issued -- the node minted its
@@ -8289,7 +8376,10 @@ mod tests {
         let cn = "zode-o.zpr";
         let (asm, cc, addr, privkey) = zode_fixture(cn).await;
         let blobs = zode_login_blobs(&privkey, cn, "node-minted-nonce", oidc_base_claims());
-        assert_auth_rejected(api_err(cc.reauthorize_actor(asm, addr, blobs, &addr).await));
+        assert_auth_rejected(api_err(
+            cc.reauthorize_actor(asm, addr, blobs, &addr, Some(ZODE_SESSION))
+                .await,
+        ));
     }
 
     /// Test 18: login and logout keep the node's VS-API session generation,
@@ -8364,7 +8454,8 @@ mod tests {
                 let mut claims = oidc_base_claims();
                 claims["sub"] = json!(sub);
                 let blobs = zode_login_blobs(&privkey, cn, &nonce, claims);
-                cc.reauthorize_actor(asm, addr, blobs, &addr).await
+                cc.reauthorize_actor(asm, addr, blobs, &addr, Some(ZODE_SESSION))
+                    .await
             }
         };
         let (a, b) = tokio::join!(
@@ -8415,7 +8506,10 @@ mod tests {
         let task = tokio::spawn({
             let (asm, cc) = (asm.clone(), cc.clone());
             let blobs = vec![make_fresh_ss_blob(&privkey, cn)];
-            async move { cc.reauthorize_actor(asm, addr, blobs, &addr).await }
+            async move {
+                cc.reauthorize_actor(asm, addr, blobs, &addr, Some(ZODE_SESSION))
+                    .await
+            }
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!task.is_finished(), "a self-renewal must wait for the lock");
@@ -8436,7 +8530,10 @@ mod tests {
         let (other_key, _) = gen_rsa_test_keypair();
         let mut blobs = zode_login_blobs(&privkey, cn, &nonce, oidc_base_claims());
         blobs[0] = make_fresh_ss_blob(&other_key, cn); // wrong device key
-        assert_auth_rejected(api_err(cc.reauthorize_actor(asm, addr, blobs, &addr).await));
+        assert_auth_rejected(api_err(
+            cc.reauthorize_actor(asm, addr, blobs, &addr, Some(ZODE_SESSION))
+                .await,
+        ));
         assert!(
             !cc.login_nonces
                 .consume(&nonce, addr, ZODE_SESSION, SystemTime::now()),
@@ -8507,6 +8604,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!has_user_attrs(&stored), "the logout must persist");
+    }
+
+    /// Review fix (#63, Codex P2): a self-renewal from a stale handle -- its
+    /// session is no longer the stored one, because the node re-authenticated
+    /// -- is refused, so it cannot log out a user of the new session.
+    #[tokio::test]
+    async fn test_self_renewal_from_stale_handle_refused() {
+        let cn = "zode-w.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let api = api_err(
+            cc.reauthorize_actor(
+                asm.clone(),
+                addr,
+                vec![make_fresh_ss_blob(&privkey, cn)],
+                &addr,
+                Some("an-older-session"),
+            )
+            .await,
+        );
+        assert_auth_rejected(api);
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            has_user_attrs(&stored),
+            "the new session's login must survive"
+        );
     }
 
     /// The namespace-change decision table (vs.capnp "Re-Authorization").
