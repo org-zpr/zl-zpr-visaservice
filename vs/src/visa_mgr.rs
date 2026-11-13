@@ -234,8 +234,10 @@ impl VisaMgr {
         asm: Arc<Assembly>,
         node_addr: &IpAddr,
         vss_addr: &SocketAddr,
+        session: Option<&str>,
     ) -> Result<Vec<Visa>, ServiceError> {
-        let visa_id = crate::core_visas::issue_vss_visa(&asm, node_addr, vss_addr.port()).await?;
+        let visa_id =
+            crate::core_visas::issue_vss_visa(&asm, node_addr, vss_addr.port(), session).await?;
         let visa = self.repo.get_visa_by_id(visa_id)?;
         Ok(vec![
             self.actualize_visa_for_target_node(visa, node_addr).await?,

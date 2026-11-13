@@ -8028,7 +8028,7 @@ mod tests {
             let vss_sockaddr = SocketAddr::new(node_addr, VSS_PORT);
             let visas = asm
                 .visa_mgr
-                .post_register_vss_visas_for_node(asm.clone(), &node_addr, &vss_sockaddr)
+                .post_register_vss_visas_for_node(asm.clone(), &node_addr, &vss_sockaddr, None)
                 .await
                 .expect(
                     "register_vss must not depend on the VS adapter's re-auth \

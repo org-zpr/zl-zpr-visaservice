@@ -31,6 +31,7 @@
 
 use std::net::IpAddr;
 
+use libeval::attribute::key;
 use tracing::{debug, info};
 use zpr::vsapi_types::{CommFlag, PacketDesc, VsapiFiveTuple};
 
@@ -66,6 +67,44 @@ fn vss_five_tuple(
     make_fivetuple_tcp(asm.config.get_vs_addr(), *node, 0, vss_port)
 }
 
+/// Serializes core-visa issuance, so the session check, the mint and the revocation of the
+/// superseded visas run as one step. Without it two overlapping calls for one node (two
+/// sessions, or two `registerVss`) could each revoke the visas the other just minted. With
+/// it, a call for a session that has been replaced in the meantime fails its session check,
+/// and a call for the current session revokes only visas minted before its own.
+///
+/// ponytail: one global lock, held across a visa request (milliseconds, bounded by
+/// `config::DEFAULT_VISA_REQ_TIMEOUT`). Issuance happens once per session start,
+/// `registerVss` and renewal; switch to per-node locks if that ever becomes a hot path.
+static ISSUE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Err unless `session` is `node`'s current VS-API session: the `zpr.session` of its stored
+/// node actor (two `None`s match, as in the VS-API handle's liveness check). A node with no
+/// stored node actor has no session at all.
+async fn require_current_session(
+    asm: &Assembly,
+    node: &IpAddr,
+    session: Option<&str>,
+) -> Result<(), ServiceError> {
+    let stored = match asm.actor_mgr.get_actor_by_zpr_addr(node).await? {
+        Some(actor) if actor.is_node() => actor,
+        _ => {
+            return Err(ServiceError::Internal(format!(
+                "node {node} has no VS-API session: no core visas"
+            )));
+        }
+    };
+    let current = stored
+        .get_attribute(key::SESSION)
+        .and_then(|a| a.get_single_value().ok());
+    if current != session {
+        return Err(ServiceError::Internal(format!(
+            "node {node}: session {session:?} is no longer current: no core visas"
+        )));
+    }
+    Ok(())
+}
+
 /// J5a: issue `node` its own VSAPI pair for a VS-API session that has just started, and
 /// revoke the pair from its previous session, if any. Returns the new IDs, forward first.
 ///
@@ -74,10 +113,17 @@ fn vss_five_tuple(
 ///
 /// Revoking the previous session's pair is safe because every session starts with a join
 /// (J6, J10): the node's links were wiped (R9), so nothing still runs over those visas.
+///
+/// `session` is the VS-API session (`zpr.session`) this is issued for. If it is no longer
+/// the node's current session, nothing is minted or revoked and an error is returned: see
+/// [ISSUE_LOCK].
 pub(crate) async fn issue_vsapi_visas(
     asm: &Assembly,
     node: &IpAddr,
+    session: Option<&str>,
 ) -> Result<[u64; 2], ServiceError> {
+    let _issuing = ISSUE_LOCK.lock().await;
+    require_current_session(asm, node, session).await?;
     let fts = vsapi_five_tuples(asm, node)?;
     // The forward packet's ports as a client sends them (wildcard source port); the reverse
     // is the same packet seen from the server, which policy evaluates as the reply. Both
@@ -86,7 +132,7 @@ pub(crate) async fn issue_vsapi_visas(
     let fwd = mint_core_visa(asm, packet_for(fwd_ft)).await?;
     let rev = mint_core_visa(asm, packet_for(rev_ft)).await?;
     info!(target: VISA, "node {node}: new VSAPI visas {fwd} (forward) and {rev} (reverse) for its session (J5a)");
-    revoke_superseded(asm, node, &fts, &[fwd, rev]).await?;
+    revoke_superseded(asm, node, &fts, fwd.min(rev)).await?;
     Ok([fwd, rev])
 }
 
@@ -96,15 +142,20 @@ pub(crate) async fn issue_vsapi_visas(
 /// A new visa every time, never a reused one: after a rejoin the node has lost every visa
 /// (R9), and an installed record here says nothing about what the node holds now. The
 /// previous VSS visa carries nothing either: `registerVss` replaces the VSS connection.
+///
+/// `session` is the caller's VS-API session, checked as in [issue_vsapi_visas].
 pub(crate) async fn issue_vss_visa(
     asm: &Assembly,
     node: &IpAddr,
     vss_port: u16,
+    session: Option<&str>,
 ) -> Result<u64, ServiceError> {
+    let _issuing = ISSUE_LOCK.lock().await;
+    require_current_session(asm, node, session).await?;
     let ft = vss_five_tuple(asm, node, vss_port)?;
     let id = mint_core_visa(asm, packet_for(&ft)).await?;
     info!(target: VISA, "node {node}: new VSS visa {id} (J5b)");
-    revoke_superseded(asm, node, &[ft], &[id]).await?;
+    revoke_superseded(asm, node, &[ft], id).await?;
     Ok(id)
 }
 
@@ -139,18 +190,19 @@ async fn mint_core_visa(asm: &Assembly, pkt: PacketDesc) -> Result<u64, ServiceE
     }
 }
 
-/// Revoke every visa with `node` as an endpoint whose dock PEP is one of `fts`, except the
-/// ones in `keep` and the node's bootstrap visas (left to expire, J5c). These are the core
-/// visas a newer issue has just superseded. They are revoked, never edited.
+/// Revoke every visa with `node` as an endpoint whose dock PEP is one of `fts` and whose ID
+/// is below `first_new` (the lowest ID just minted; IDs only go up), except the node's
+/// bootstrap visas (left to expire, J5c). These are the core visas a newer issue has just
+/// superseded. They are revoked, never edited.
 async fn revoke_superseded(
     asm: &Assembly,
     node: &IpAddr,
     fts: &[VsapiFiveTuple],
-    keep: &[u64],
+    first_new: u64,
 ) -> Result<(), ServiceError> {
     let mut superseded = Vec::new();
     for id in asm.visa_mgr.get_visa_ids_for_actors(&[*node]).await? {
-        if keep.contains(&id) {
+        if id >= first_new {
             continue;
         }
         let Some(vwm) = asm.visa_mgr.get_visa_with_metadata_by_id(id).await? else {
@@ -180,7 +232,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use libeval::attribute::{Attribute, ROLE_ADAPTER, ROLE_NODE, key};
+    use libeval::attribute::{Attribute, ROLE_ADAPTER, ROLE_NODE};
     use libeval::eval_result::Direction;
     use libeval::route::LinkId;
     use tokio::sync::mpsc;
@@ -335,7 +387,7 @@ pub(crate) mod tests {
         let (asm, relay, zode) = build_net().await;
         let bootstrap = mint_bootstrap_pair(&asm, &relay, &zode).await;
 
-        let ids = issue_vsapi_visas(&asm, &zode).await.unwrap();
+        let ids = issue_vsapi_visas(&asm, &zode, None).await.unwrap();
 
         for (new_id, old) in ids.iter().zip(bootstrap.iter()) {
             assert_ne!(
@@ -373,8 +425,8 @@ pub(crate) mod tests {
         let (asm, relay, zode) = build_net().await;
         let bootstrap = mint_bootstrap_pair(&asm, &relay, &zode).await;
 
-        let first = issue_vsapi_visas(&asm, &zode).await.unwrap();
-        let second = issue_vsapi_visas(&asm, &zode).await.unwrap();
+        let first = issue_vsapi_visas(&asm, &zode, None).await.unwrap();
+        let second = issue_vsapi_visas(&asm, &zode, None).await.unwrap();
 
         for id in first {
             assert!(!second.contains(&id), "every session gets new visas");
@@ -403,7 +455,7 @@ pub(crate) mod tests {
 
         let first = asm
             .visa_mgr
-            .post_register_vss_visas_for_node(asm.clone(), &zode, &vss)
+            .post_register_vss_visas_for_node(asm.clone(), &zode, &vss, None)
             .await
             .unwrap();
         assert_eq!(first.len(), 1);
@@ -414,7 +466,7 @@ pub(crate) mod tests {
             .unwrap();
         let second = asm
             .visa_mgr
-            .post_register_vss_visas_for_node(asm.clone(), &zode, &vss)
+            .post_register_vss_visas_for_node(asm.clone(), &zode, &vss, None)
             .await
             .unwrap();
         assert_eq!(second.len(), 1);
@@ -434,7 +486,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn register_vss_reply_is_only_the_vss_visa() {
         let (asm, _relay, zode) = build_net().await;
-        let vsapi = issue_vsapi_visas(&asm, &zode).await.unwrap();
+        let vsapi = issue_vsapi_visas(&asm, &zode, None).await.unwrap();
 
         let reply = asm
             .visa_mgr
@@ -442,6 +494,7 @@ pub(crate) mod tests {
                 asm.clone(),
                 &zode,
                 &std::net::SocketAddr::new(zode, VSS_PORT),
+                None,
             )
             .await
             .unwrap();
@@ -450,6 +503,54 @@ pub(crate) mod tests {
         assert_eq!(pep_tuple(&reply[0]).3, VSS_PORT);
         // It is the node's (egress) copy: no forwarding.
         assert!(reply[0].fwd_pep.is_none());
+    }
+
+    /// Issuance belongs to one VS-API session. A call made for a session that is no longer
+    /// the node's current one mints nothing and revokes nothing, so two overlapping
+    /// sessions (or `registerVss` calls) can never revoke each other's new visas.
+    #[tokio::test]
+    async fn a_stale_session_issues_and_revokes_nothing() {
+        let (asm, relay, zode) = build_net().await;
+        let mut actor = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&zode)
+            .await
+            .unwrap()
+            .unwrap();
+        actor
+            .add_attribute(Attribute::builder(key::SESSION).value("2-current"))
+            .unwrap();
+        asm.actor_mgr
+            .update_actor(&actor, &Default::default())
+            .await
+            .unwrap();
+
+        let current = issue_vsapi_visas(&asm, &zode, Some("2-current"))
+            .await
+            .unwrap();
+        let vss = issue_vss_visa(&asm, &zode, VSS_PORT, Some("2-current"))
+            .await
+            .unwrap();
+        let before = asm.visa_mgr.get_visa_ids_for_actors(&[zode]).await.unwrap();
+
+        assert!(issue_vsapi_visas(&asm, &zode, Some("1-old")).await.is_err());
+        assert!(
+            issue_vss_visa(&asm, &zode, VSS_PORT, Some("1-old"))
+                .await
+                .is_err()
+        );
+
+        let mut after = asm.visa_mgr.get_visa_ids_for_actors(&[zode]).await.unwrap();
+        let mut before = before;
+        before.sort();
+        after.sort();
+        assert_eq!(after, before, "nothing minted for the stale session");
+        for id in current.iter().chain([&vss]) {
+            assert!(
+                not_revoked(&asm, *id, &[relay, zode]).await,
+                "nothing revoked"
+            );
+        }
     }
 
     /// Ordered push, end to end: the forward VSAPI visa ingresses at the Zode, so the relay's
@@ -461,7 +562,7 @@ pub(crate) mod tests {
         let (tx, mut relay_vss) = mpsc::channel(8);
         asm.vss_mgr.insert_test_handle(relay, tx);
 
-        let [fwd, _rev] = issue_vsapi_visas(&asm, &zode).await.unwrap();
+        let [fwd, _rev] = issue_vsapi_visas(&asm, &zode, None).await.unwrap();
 
         // The relay is asked to install its copy of the forward visa...
         let resp = loop {

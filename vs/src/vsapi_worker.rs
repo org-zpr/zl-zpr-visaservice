@@ -568,8 +568,14 @@ fn repropose_failed_pairs(asm: &Arc<Assembly>, ops: &TopoOps<'_>, node: &IpAddr)
 /// A failure is logged, not returned: the session itself is good, and the node keeps
 /// working over its bootstrap pair. If that pair expires first, the session breaks and
 /// the node rejoins (J10), which starts a new session and tries again.
-async fn start_session_core_visas(asm: &Assembly, node: &IpAddr) {
-    if let Err(e) = crate::core_visas::issue_vsapi_visas(asm, node).await {
+async fn start_session_core_visas(asm: &Assembly, node_actor: &Actor) {
+    let Some(node) = node_actor.get_zpr_addr() else {
+        return; // every authenticated node has one; nothing to issue for without it
+    };
+    let session = node_actor
+        .get_attribute(key::SESSION)
+        .and_then(|a| a.get_single_value().ok());
+    if let Err(e) = crate::core_visas::issue_vsapi_visas(asm, node, session).await {
         error!(target: API, "node {node}: failed to issue its VSAPI visas (J5a): {e}");
     }
 }
@@ -1068,7 +1074,7 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
 
         drop(ops);
 
-        start_session_core_visas(&self.asm, &node_zpr_addr).await;
+        start_session_core_visas(&self.asm, &existing_actor).await;
 
         // Skip ahead to the handle:
         let vs_handle: vsapi::v_s_handle::Client =
@@ -1410,7 +1416,7 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
             );
         }
 
-        start_session_core_visas(&self.asm, &node_zpr_addr).await;
+        start_session_core_visas(&self.asm, &node_actor).await;
 
         let vs_handle: vsapi::v_s_handle::Client =
             capnp_rpc::new_client(VSHandleImpl::new(self.asm.clone(), node_actor));
@@ -1485,7 +1491,12 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         let prepared = self
             .asm
             .visa_mgr
-            .post_register_vss_visas_for_node(amgr_asm, node_zpr_addr, &saddr)
+            .post_register_vss_visas_for_node(
+                amgr_asm,
+                node_zpr_addr,
+                &saddr,
+                self.session.as_deref(),
+            )
             .await;
 
         // Topology operation lock (see TopoOps), taken after the visa preparation
