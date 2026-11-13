@@ -138,6 +138,7 @@ impl Policy {
         let identity_attr_keys = resolve_identity_attr_keys(&trusted_services);
         let cpol_sources = load_cpol_sources(&policy)?;
         let peerings = load_peerings(&policy)?;
+        let transit_nodes = load_transit_nodes(&policy)?;
         let peer_table = if let Some(ref peerings) = peerings {
             load_peer_table(peerings)
         } else {
@@ -165,6 +166,7 @@ impl Policy {
             peer_table,
             link_attrs,
             node_cn_by_addr,
+            transit_nodes,
             ..Default::default()
         })
     }
@@ -644,6 +646,28 @@ fn load_join_policies(policy: &policy_capnp::policy::Reader) -> Result<Vec<JPoli
         }
     }
     Ok(join_policies)
+}
+
+/// Read `Policy.transitNodes`: the ZPR addresses of the transit-capable nodes. An unset
+/// list yields the empty set (no node is transit-capable). An entry that is not an IP
+/// address fails the load: the compiler writes only addresses, so such a policy is not
+/// what it claims to be, and guessing would risk making the wrong node transit.
+fn load_transit_nodes(
+    policy: &policy_capnp::policy::Reader,
+) -> Result<HashSet<IpAddr>, PolicyError> {
+    let mut transit_nodes = HashSet::new();
+    if policy.has_transit_nodes() {
+        for entry in policy.get_transit_nodes()?.iter() {
+            let text = entry?.to_str()?;
+            let addr = text.parse::<IpAddr>().map_err(|_| {
+                PolicyError::InvalidFormat(format!(
+                    "transitNodes entry is not an IP address: {text:?}"
+                ))
+            })?;
+            transit_nodes.insert(addr);
+        }
+    }
+    Ok(transit_nodes)
 }
 
 fn load_cpol_sources(policy: &policy_capnp::policy::Reader) -> Result<Vec<String>, PolicyError> {
