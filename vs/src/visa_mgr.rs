@@ -942,7 +942,9 @@ impl VisaMgr {
     /// Revoke each of `ids` everywhere: mark every node holding it `PendingRevoke`, so VSS
     /// housekeeping revokes it from those nodes and removes it on their acks. A visa with
     /// no node left to revoke from is removed at once instead of waiting for its TTL.
-    /// Failures are logged and the rest carry on. The visas themselves are never changed.
+    /// A visa whose revocation write fails is quarantined ([VisaMgr::quarantine]): never
+    /// handed out, and its revocation retried by housekeeping. The rest carry on. The visas
+    /// themselves are never changed.
     pub async fn revoke_visa_ids(&self, ids: &[u64]) {
         for &id in ids {
             // Log-and-continue: one failure must not strand the remaining visas.
@@ -950,7 +952,8 @@ impl VisaMgr {
                 Ok(true) => {}
                 Ok(false) => continue, // vanished/expired between query and mark
                 Err(e) => {
-                    warn!(target: VISA, "failed to mark visa {id} revoked: {e}");
+                    self.quarantine(id);
+                    warn!(target: VISA, "failed to mark visa {id} revoked, quarantined for retry: {e}");
                     continue;
                 }
             }
@@ -2172,6 +2175,40 @@ mod tests {
     }
 
     /// A node with no visas is a no-op.
+    /// A revocation whose state write fails quarantines the visa, as the link-down and
+    /// commit-time revocations do: it is never handed out meanwhile, and the next
+    /// pending-visa read retries the revocation.
+    #[tokio::test]
+    async fn test_failed_revoke_visa_ids_quarantines_the_visa() {
+        use crate::db::FaultMode;
+        use crate::test_helpers::{build_sweep_asm_with_db, create_routed_sweep_visa};
+        let (asm, node_a, db) = build_sweep_asm_with_db(true).await;
+        let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
+
+        db.set_set_ex_fault(FaultMode::Reject);
+        asm.visa_mgr.revoke_visa_ids(&[id]).await;
+        let pending = asm
+            .visa_mgr
+            .get_pending_visas_for_node(&node_a)
+            .await
+            .unwrap();
+        assert!(pending.iter().all(|v| v.issuer_id != id), "quarantined");
+
+        db.set_set_ex_fault(FaultMode::None);
+        asm.visa_mgr
+            .get_pending_visas_for_node(&node_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap(),
+            vec![id],
+            "the quarantine retry revoked it"
+        );
+    }
+
     #[tokio::test]
     async fn test_remove_visas_for_node_noop() {
         let mgr = make_mgr().await;

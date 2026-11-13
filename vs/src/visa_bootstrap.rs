@@ -40,7 +40,6 @@ use crate::error::ServiceError;
 use crate::logging::targets::API;
 use crate::policy_mgr::PolicySnapshot;
 use crate::topology_mgr::TopoOps;
-use crate::vss_mgr::VssHandle;
 
 /// Stands in for the ZPL source on a bootstrap visa, which has no matching com policy.
 /// The core-visa code reads it to tell a bootstrap visa from a core visa (J5c).
@@ -131,10 +130,13 @@ pub(crate) async fn request_bootstrap_visas(
     let Some(peer) = topology_peer_addr(asm, &psnap, relay, peer_cn) else {
         return Err(Refusal::UnknownPeer);
     };
-    let old_vss = end_previous_join(asm, &ops, &issuing, &peer)
-        .await
-        .map_err(Refusal::Failed)?;
-    let minted = mint_pair(asm, psnap.policy(), &peer, relay).await;
+    // Any VSS worker the joiner has belongs to its previous join, which this request proves
+    // is over. It is stopped whatever happens below, once both locks are released.
+    let old_vss = asm.vss_mgr.get_handle(&peer);
+    let minted = match end_previous_join(asm, &ops, &issuing, &peer).await {
+        Ok(()) => mint_pair(asm, psnap.policy(), &peer, relay).await,
+        Err(e) => Err(e),
+    };
     drop(ops);
     drop(issuing);
     ConnectionControl::stop_vss_worker(old_vss, &peer).await;
@@ -157,8 +159,8 @@ pub(crate) async fn request_bootstrap_visas(
 ///   VS-API session, its core visas ([core_visas::revoke_previous_join]).
 /// - If the peer still has a VS-API session (its node actor is stored), the session is
 ///   ended: a new session id is stamped on the actor, so every handle of the old session
-///   fails its liveness check, and the old session's VSS worker handle is returned for the
-///   caller to stop. Every other visa installed on the peer is marked pending install, so it
+///   fails its liveness check (the caller stops its VSS worker). Every other visa installed
+///   on the peer is marked pending install, so it
 ///   is pushed again after a `reconnect` (`VisaMgr::forget_installs_on_node`). The node
 ///   actor and its adapters stay, so the visa service can still accept a `reconnect` (R16).
 ///
@@ -170,7 +172,7 @@ async fn end_previous_join(
     _ops: &TopoOps<'_>,
     issuing: &IssueGuard,
     peer: &IpAddr,
-) -> Result<Option<VssHandle>, ServiceError> {
+) -> Result<(), ServiceError> {
     let has_session = {
         let _commit = asm.policy_mgr.node_commit_lock.lock().await;
         match asm.actor_mgr.get_actor_by_zpr_addr(peer).await? {
@@ -190,14 +192,14 @@ async fn end_previous_join(
     };
     core_visas::revoke_previous_join(asm, issuing, peer, vss_port).await?;
     if !has_session {
-        return Ok(None);
+        return Ok(());
     }
     // ponytail: an install ack of the old session still in flight can land after this and
     // mark one visa installed again although the node lost it. The node then re-requests
     // that flow on its next packet (F6). Fence acks by session if that ever matters.
     let repush = asm.visa_mgr.forget_installs_on_node(peer).await?;
     info!(target: API, "joiner {peer} rejoins: its VS-API session is ended; visas {repush:?} will be pushed again");
-    Ok(asm.vss_mgr.get_handle(peer))
+    Ok(())
 }
 
 /// Mint both directions of `peer`'s VS-API flow through `relay`, forward first, and return

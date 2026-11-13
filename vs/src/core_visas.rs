@@ -5,9 +5,14 @@
 //! - its VSS visa, `vs:0 -> node:VSS` (J5b), issued on every `registerVss`.
 //!
 //! **Visas are immutable** (core tenet). Everything here issues *new* visas. A granted visa
-//! is never edited: a node's previous core visas are revoked through the normal revoke path,
-//! and its bootstrap pair is left to expire (J5c). A live stream moves onto a new visa for
-//! the same five-tuple by supersede-and-rebind (J11), which the nodes do.
+//! is never edited. A live stream moves onto a new visa for the same five-tuple by
+//! supersede-and-rebind (J11), which the nodes do.
+//!
+//! **A newer issue never revokes an older one.** The visas it supersedes -- a previous
+//! session's pair, a previous VSS visa, a renewed visa, the bootstrap pair -- are left to
+//! expire. Revoking them at issue time could pull a visa a node still uses before its
+//! replacement has reached every hop (ingress last, below). Core visas are revoked only when
+//! the join they belong to is over: by a rejoin ([revoke_previous_join]) or a disconnect.
 //!
 //! **Minting.** Every core visa goes through the ordinary visa-request pipeline, so policy
 //! evaluates it (the compiler's built-in "allow node access to visa service" and "allow visa
@@ -68,11 +73,10 @@ fn vss_five_tuple(
     make_fivetuple_tcp(asm.config.get_vs_addr(), *node, 0, vss_port)
 }
 
-/// Serializes core-visa issuance, so the session check, the mint and the revocation of the
-/// superseded visas run as one step. Without it two overlapping calls for one node (two
-/// sessions, or two `registerVss`) could each revoke the visas the other just minted. With
-/// it, a call for a session that has been replaced in the meantime fails its session check,
-/// and a call for the current session revokes only visas minted before its own.
+/// Serializes core-visa issuance, so the session check and the mint run as one step: a call
+/// for a session that has been replaced in the meantime fails its session check and mints
+/// nothing. The rejoin teardown takes it too ([lock_issuance]), so it never interleaves with
+/// an issuance for the session it ends.
 ///
 /// ponytail: one global lock, held across a visa request (milliseconds, bounded by
 /// `config::DEFAULT_VISA_REQ_TIMEOUT`). Issuance happens once per session start,
@@ -120,17 +124,15 @@ pub(crate) async fn require_current_session(
     Ok(())
 }
 
-/// J5a: issue `node` its own VSAPI pair for a VS-API session that has just started, and
-/// revoke the pair from its previous session, if any. Returns the new IDs, forward first.
+/// J5a: issue `node` its own VSAPI pair for a VS-API session that has just started. Returns
+/// the new IDs, forward first.
 ///
-/// The node's bootstrap pair (same five-tuples) is left alone: it carries the session until
-/// the node rebinds onto the new pair (J11), then expires (J5c).
-///
-/// Revoking the previous session's pair is safe because every session starts with a join
-/// (J6, J10): the node's links were wiped (R9), so nothing still runs over those visas.
+/// The visas with the same five-tuples -- the bootstrap pair, a previous session's pair --
+/// are left alone: they carry the session until the node rebinds onto the new pair (J11),
+/// then expire (J5c, module docs).
 ///
 /// `session` is the VS-API session (`zpr.session`) this is issued for. If it is no longer
-/// the node's current session, nothing is minted or revoked and an error is returned: see
+/// the node's current session, nothing is minted and an error is returned: see
 /// [ISSUE_LOCK].
 pub(crate) async fn issue_vsapi_visas(
     asm: &Assembly,
@@ -147,16 +149,14 @@ pub(crate) async fn issue_vsapi_visas(
     let fwd = mint_core_visa(asm, packet_for(fwd_ft)).await?;
     let rev = mint_core_visa(asm, packet_for(rev_ft)).await?;
     info!(target: VISA, "node {node}: new VSAPI visas {fwd} (forward) and {rev} (reverse) for its session (J5a)");
-    revoke_superseded(asm, node, &fts, fwd.min(rev)).await?;
     Ok([fwd, rev])
 }
 
-/// J5b: issue `node` a new VSS visa for the VSS it has just registered on `vss_port`, and
-/// revoke its previous VSS visa, if any. Returns the new ID.
+/// J5b: issue `node` a new VSS visa for the VSS it has just registered on `vss_port`.
+/// Returns the new ID. The previous VSS visa, if any, is left to expire (module docs).
 ///
 /// A new visa every time, never a reused one: after a rejoin the node has lost every visa
-/// (R9), and an installed record here says nothing about what the node holds now. The
-/// previous VSS visa carries nothing either: `registerVss` replaces the VSS connection.
+/// (R9), and an installed record here says nothing about what the node holds now.
 ///
 /// `session` is the caller's VS-API session, checked as in [issue_vsapi_visas].
 pub(crate) async fn issue_vss_visa(
@@ -170,7 +170,6 @@ pub(crate) async fn issue_vss_visa(
     let ft = vss_five_tuple(asm, node, vss_port)?;
     let id = mint_core_visa(asm, packet_for(&ft)).await?;
     info!(target: VISA, "node {node}: new VSS visa {id} (J5b)");
-    revoke_superseded(asm, node, &[ft], id).await?;
     Ok(id)
 }
 
@@ -213,7 +212,7 @@ pub(crate) async fn renew_core_visas(
     now: SystemTime,
 ) -> Result<Vec<u64>, ServiceError> {
     // Under the issuance lock: a renewal must not interleave with a session's
-    // issue-and-supersede step (see [ISSUE_LOCK]).
+    // issuance or rejoin step (see [ISSUE_LOCK]).
     let _issuing = ISSUE_LOCK.lock().await;
     match asm.actor_mgr.get_actor_by_zpr_addr(node).await? {
         Some(actor) if actor.is_node() => {}
@@ -332,30 +331,6 @@ pub(crate) async fn revoke_previous_join(
     if !ids.is_empty() {
         info!(target: VISA, "node {node}: rejoin revokes the visas of its previous join {ids:?}");
         asm.visa_mgr.revoke_visa_ids(&ids).await;
-    }
-    Ok(())
-}
-
-/// Revoke `node`'s core visas for each of `fts` whose ID is below `first_new` (the lowest
-/// ID just minted; IDs only go up): the visas a newer issue has just superseded. They are
-/// revoked, never edited. Bootstrap visas are not core visas and are left to expire (J5c).
-async fn revoke_superseded(
-    asm: &Assembly,
-    node: &IpAddr,
-    fts: &[VsapiFiveTuple],
-    first_new: u64,
-) -> Result<(), ServiceError> {
-    let mut superseded = Vec::new();
-    for ft in fts {
-        for vwm in core_visas_for(asm, node, ft).await? {
-            if vwm.visa.issuer_id < first_new {
-                superseded.push(vwm.visa.issuer_id);
-            }
-        }
-    }
-    if !superseded.is_empty() {
-        debug!(target: VISA, "node {node}: revoking superseded core visas {superseded:?}");
-        asm.visa_mgr.revoke_visa_ids(&superseded).await;
     }
     Ok(())
 }
@@ -562,10 +537,13 @@ pub(crate) mod tests {
         assert_eq!(path_of(&asm, ids[1]).await, Some(vec![relay, zode]));
     }
 
-    /// A new session revokes the previous session's VSAPI pair, but never the bootstrap pair
-    /// or the new one.
+    /// A new session gets a new VSAPI pair and revokes nothing: neither the previous
+    /// session's pair nor the bootstrap pair. Superseded core visas expire on their own, as
+    /// renewed ones do (J9, J11): revoking them at issue could pull a pair a node still uses
+    /// before its replacement has reached every hop. Only the end of a join revokes them
+    /// (`revoke_previous_join`).
     #[tokio::test]
-    async fn new_session_revokes_previous_vsapi_pair_only() {
+    async fn new_session_revokes_nothing() {
         let (asm, relay, zode) = build_net().await;
         let bootstrap = mint_bootstrap_pair(&asm, &relay, &zode).await;
 
@@ -574,24 +552,21 @@ pub(crate) mod tests {
 
         for id in first {
             assert!(!second.contains(&id), "every session gets new visas");
-            assert!(
-                !not_revoked(&asm, id, &[relay, zode]).await,
-                "previous pair revoked"
-            );
         }
-        for id in second {
-            assert!(not_revoked(&asm, id, &[relay, zode]).await, "new pair kept");
-        }
-        for b in bootstrap {
+        for id in first
+            .iter()
+            .chain(&second)
+            .chain(&bootstrap.map(|b| b.issuer_id))
+        {
             assert!(
-                not_revoked(&asm, b.issuer_id, &[relay, zode]).await,
-                "bootstrap kept"
+                not_revoked(&asm, *id, &[relay, zode]).await,
+                "visa {id} kept"
             );
         }
     }
 
     /// J5b: every `registerVss` mints a new VSS visa -- even when the previous one is
-    /// recorded installed -- and revokes the previous one.
+    /// recorded installed -- and leaves the previous one to expire.
     #[tokio::test]
     async fn register_vss_mints_a_new_vss_visa_every_time() {
         let (asm, relay, zode) = build_net().await;
@@ -621,7 +596,7 @@ pub(crate) mod tests {
             pep_tuple(&second[0]),
             (asm.config.get_vs_addr(), 0, zode, VSS_PORT)
         );
-        assert!(!not_revoked(&asm, first[0].issuer_id, &[relay, zode]).await);
+        assert!(not_revoked(&asm, first[0].issuer_id, &[relay, zode]).await);
         assert!(not_revoked(&asm, second[0].issuer_id, &[relay, zode]).await);
     }
 
@@ -650,8 +625,7 @@ pub(crate) mod tests {
     }
 
     /// Issuance belongs to one VS-API session. A call made for a session that is no longer
-    /// the node's current one mints nothing and revokes nothing, so two overlapping
-    /// sessions (or `registerVss` calls) can never revoke each other's new visas.
+    /// the node's current one mints nothing and revokes nothing.
     #[tokio::test]
     async fn a_stale_session_issues_and_revokes_nothing() {
         let (asm, relay, zode) = build_net().await;
