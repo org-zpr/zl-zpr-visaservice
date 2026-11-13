@@ -563,22 +563,50 @@ fn repropose_failed_pairs(asm: &Arc<Assembly>, ops: &TopoOps<'_>, node: &IpAddr)
     });
 }
 
+/// How often a J5a issue that failed is tried again for the same session (see
+/// [start_session_core_visas]).
+const CORE_VISA_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
 /// J5a: a VS-API session for `node` has just started (`authenticate`, or `open` for a
 /// reconnect), so issue the node its own VSAPI pair ([crate::core_visas::issue_vsapi_visas]).
 ///
-/// A failure is logged, not returned: the session itself is good, and the node keeps
-/// working over its bootstrap pair. If that pair expires first, the session breaks and
-/// the node rejoins (J10), which starts a new session and tries again.
-async fn start_session_core_visas(asm: &Assembly, node_actor: &Actor) {
-    let Some(node) = node_actor.get_zpr_addr() else {
+/// The first try runs inline. On a first join it usually fails: the joiner has not yet
+/// reported its link to the relay, so the link is not routable (R14) and the pair has no
+/// route. So a failure is retried every [CORE_VISA_RETRY_INTERVAL], in the background, until
+/// the pair is issued, the session is no longer the node's current one (issuance refuses a
+/// stale session), or [crate::visa_bootstrap::BOOTSTRAP_VISA_LIFETIME] has passed. By then
+/// the bootstrap pair has expired, the session breaks, and the node rejoins (J10), which
+/// starts a new session and tries again.
+async fn start_session_core_visas(asm: &Arc<Assembly>, node_actor: &Actor) {
+    let Some(node) = node_actor.get_zpr_addr().copied() else {
         return; // every authenticated node has one; nothing to issue for without it
     };
     let session = node_actor
         .get_attribute(key::SESSION)
-        .and_then(|a| a.get_single_value().ok());
-    if let Err(e) = crate::core_visas::issue_vsapi_visas(asm, node, session).await {
-        error!(target: API, "node {node}: failed to issue its VSAPI visas (J5a): {e}");
-    }
+        .and_then(|a| a.get_single_value().ok().map(str::to_string));
+    let Err(e) = crate::core_visas::issue_vsapi_visas(asm, &node, session.as_deref()).await else {
+        return;
+    };
+    warn!(target: API, "node {node}: cannot issue its VSAPI visas yet (J5a), retrying: {e}");
+    let asm = asm.clone();
+    tokio::task::spawn_local(async move {
+        let deadline = tokio::time::Instant::now() + crate::visa_bootstrap::BOOTSTRAP_VISA_LIFETIME;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(CORE_VISA_RETRY_INTERVAL).await;
+            if crate::core_visas::require_current_session(&asm, &node, session.as_deref())
+                .await
+                .is_err()
+            {
+                debug!(target: API, "node {node}: session replaced; J5a retry stops");
+                return;
+            }
+            match crate::core_visas::issue_vsapi_visas(&asm, &node, session.as_deref()).await {
+                Ok(_) => return,
+                Err(e) => debug!(target: API, "node {node}: J5a retry failed: {e}"),
+            }
+        }
+        error!(target: API, "node {node}: gave up issuing its VSAPI visas (J5a); it rejoins when its bootstrap visas expire (J10)");
+    });
 }
 
 /// Helper to write an error into a capnp error builder with a retry of zero.
@@ -4947,6 +4975,83 @@ mod tests {
                             visa.issuer_id
                         );
                     }
+                })
+                .await;
+        }
+
+        /// J5a on a first join: the joiner authenticates before it has reported its link to
+        /// the relay, so the link is not routable yet (R14) and its VSAPI pair cannot be
+        /// minted. The issue is retried for that session, and succeeds once both ends have
+        /// reported the link up.
+        #[tokio::test]
+        async fn a_vsapi_pair_that_cannot_be_issued_yet_is_retried_until_the_link_is_up() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, zode) = join_net().await;
+                    let report = |node: IpAddr, peer_cn: &'static str| {
+                        let asm = asm.clone();
+                        async move {
+                            asm.topo_mgr.record_link_states(
+                                &asm.topo_mgr.ops().await,
+                                &node,
+                                None,
+                                vec![LinkStateReport {
+                                    peer_cn: peer_cn.to_string(),
+                                    state: LinkState::Up,
+                                }],
+                                &|| asm.policy_mgr.get_current_snapshot(),
+                            );
+                        }
+                    };
+                    // Only the relay has reported: the link is down.
+                    report(relay, "zode.zpr").await;
+                    assert!(!asm.topo_mgr.link_up(&relay, &zode));
+                    let mut actor = asm
+                        .actor_mgr
+                        .get_actor_by_zpr_addr(&zode)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    stamp_new_session(&mut actor);
+                    asm.actor_mgr
+                        .update_actor(&actor, &Default::default())
+                        .await
+                        .unwrap();
+
+                    start_session_core_visas(&asm, &actor).await;
+                    let vsapi_visas = || {
+                        let asm = asm.clone();
+                        async move {
+                            let vs = asm.config.get_vs_addr();
+                            let mut n = 0;
+                            for id in asm.visa_mgr.get_visa_ids_for_actors(&[zode]).await.unwrap() {
+                                let visa = asm.visa_mgr.get_visa_by_id(id).await.unwrap().unwrap();
+                                let pep = visa.dock_pep.unwrap();
+                                if pep.source_addr == vs || pep.dest_addr == vs {
+                                    n += 1;
+                                }
+                            }
+                            n
+                        }
+                    };
+                    assert_eq!(
+                        vsapi_visas().await,
+                        0,
+                        "nothing minted while the link is down"
+                    );
+
+                    // The joiner reports too: the link comes up, and the retry issues the pair.
+                    report(zode, "relay.zpr").await;
+                    assert!(asm.topo_mgr.link_up(&relay, &zode));
+                    let mut issued = 0;
+                    for _ in 0..40 {
+                        issued = vsapi_visas().await;
+                        if issued == 2 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    assert_eq!(issued, 2, "the VSAPI pair is issued once the link is up");
                 })
                 .await;
         }
