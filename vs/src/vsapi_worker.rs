@@ -5196,8 +5196,8 @@ mod tests {
                 .run_until(async {
                     let (asm, relay, zode) = join_net().await;
                     // The joiner's live session: a session id, an adapter, a registered VSS,
-                    // its three core visas, and one other visa (to the relay's VSS port),
-                    // all installed on it.
+                    // its three core visas, and one other visa (its adapter to its own VSS
+                    // port, which crosses no link), all installed on it.
                     let mut actor = asm
                         .actor_mgr
                         .get_actor_by_zpr_addr(&zode)
@@ -5242,8 +5242,13 @@ mod tests {
                     let other = match request_visa_wait_response(
                         &asm,
                         &zode,
-                        PacketDesc::new_tcp(&zode.to_string(), &relay.to_string(), 40000, VSS_PORT)
-                            .unwrap(),
+                        PacketDesc::new_tcp(
+                            &adapter.to_string(),
+                            &zode.to_string(),
+                            40000,
+                            VSS_PORT,
+                        )
+                        .unwrap(),
                         config::DEFAULT_VISA_REQ_TIMEOUT,
                     )
                     .await
@@ -5257,6 +5262,20 @@ mod tests {
                     }
                     let (vss_tx, mut vss_rx) = tokio::sync::mpsc::channel(8);
                     asm.vss_mgr.insert_test_handle(zode, vss_tx);
+                    // Both ends have reported their link up.
+                    for (node, peer_cn) in [(relay, "zode.zpr"), (zode, "relay.zpr")] {
+                        asm.topo_mgr.record_link_states(
+                            &asm.topo_mgr.ops().await,
+                            &node,
+                            None,
+                            vec![LinkStateReport {
+                                peer_cn: peer_cn.to_string(),
+                                state: LinkState::Up,
+                            }],
+                            &|| asm.policy_mgr.get_current_snapshot(),
+                        );
+                    }
+                    assert!(asm.topo_mgr.link_up(&relay, &zode));
 
                     let bv = request(&handle_for(&asm, &relay).await, "zode.zpr")
                         .await
@@ -5265,6 +5284,10 @@ mod tests {
                     assert!(
                         !old_handle.node_is_live().await,
                         "the old session's handle is dead"
+                    );
+                    assert!(
+                        !asm.topo_mgr.link_up(&relay, &zode),
+                        "the joiner's link reports are forgotten: down until it reports again"
                     );
                     let stored = asm.actor_mgr.get_actor_by_zpr_addr(&zode).await.unwrap();
                     assert!(stored.is_some_and(|a| a.is_node()), "the node actor stays");

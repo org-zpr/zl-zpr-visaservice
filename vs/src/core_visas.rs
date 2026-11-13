@@ -273,43 +273,43 @@ async fn mint_core_visa(asm: &Assembly, pkt: PacketDesc) -> Result<u64, ServiceE
     }
 }
 
-/// Every live visa with `node` as an endpoint whose dock PEP is one of `fts`.
-async fn node_visas_for(
+/// Every live visa with `node` as an endpoint for which `wanted` holds.
+async fn node_visas_where(
     asm: &Assembly,
     node: &IpAddr,
-    fts: &[VsapiFiveTuple],
+    wanted: impl Fn(&VisaWithMetadata) -> bool,
 ) -> Result<Vec<VisaWithMetadata>, ServiceError> {
     let mut out = Vec::new();
     for id in asm.visa_mgr.get_visa_ids_for_actors(&[*node]).await? {
         let Some(vwm) = asm.visa_mgr.get_visa_with_metadata_by_id(id).await? else {
             continue; // expired meanwhile
         };
-        if fts
-            .iter()
-            .any(|ft| dock_pep_matches_five_tuple(&vwm.visa, ft))
-        {
+        if wanted(&vwm) {
             out.push(vwm);
         }
     }
     Ok(out)
 }
 
-/// `node`'s core visas for `ft`: its visas for `ft` ([node_visas_for]) except its bootstrap
+/// `node`'s core visas for `ft`: its visas whose dock PEP is `ft`, except its bootstrap
 /// visas, which are not core visas (J5c).
 async fn core_visas_for(
     asm: &Assembly,
     node: &IpAddr,
     ft: &VsapiFiveTuple,
 ) -> Result<Vec<VisaWithMetadata>, ServiceError> {
-    let mut visas = node_visas_for(asm, node, std::slice::from_ref(ft)).await?;
-    visas.retain(|vwm| vwm.metadata.zpl != BOOTSTRAP_VISA_ZPL);
-    Ok(visas)
+    node_visas_where(asm, node, |vwm| {
+        vwm.metadata.zpl != BOOTSTRAP_VISA_ZPL && dock_pep_matches_five_tuple(&vwm.visa, ft)
+    })
+    .await
 }
 
 /// Rejoin (J6, ZODE_LINKS.md "Settled after the builder check"): revoke every visa that
-/// carried `node`'s previous join -- its bootstrap pair, its VSAPI pair and, when it has a VSS
-/// registered on `vss_port`, its VSS visa. The new join starts from fresh bootstrap visas.
-/// The visas are revoked through the normal revoke path, never edited.
+/// carried `node`'s previous join -- every visa between `node` and the visa service: its
+/// bootstrap pairs, its VSAPI pairs and its VSS visas, whatever VSS port each was issued
+/// for (issuance leaves superseded ones to expire, so there can be several). The new join
+/// starts from fresh bootstrap visas. The visas are revoked through the normal revoke path,
+/// never edited.
 ///
 /// The caller holds the issuance lock (`_issuing`), so no issuance for the session being
 /// ended runs alongside this (see [ISSUE_LOCK]).
@@ -322,17 +322,17 @@ pub(crate) async fn revoke_previous_join(
     asm: &Assembly,
     _issuing: &IssueGuard,
     node: &IpAddr,
-    vss_port: Option<u16>,
 ) -> Result<(), ServiceError> {
-    let mut fts = vsapi_five_tuples(asm, node)?.to_vec();
-    if let Some(port) = vss_port {
-        fts.push(vss_five_tuple(asm, node, port)?);
-    }
-    let ids: Vec<u64> = node_visas_for(asm, node, &fts)
-        .await?
-        .iter()
-        .map(|vwm| vwm.visa.issuer_id)
-        .collect();
+    let vs = asm.config.get_vs_addr();
+    let ids: Vec<u64> = node_visas_where(asm, node, |vwm| {
+        let ft = &vwm.metadata.five_tuple;
+        (ft.source_addr == *node && ft.dest_addr == vs)
+            || (ft.source_addr == vs && ft.dest_addr == *node)
+    })
+    .await?
+    .iter()
+    .map(|vwm| vwm.visa.issuer_id)
+    .collect();
     if !ids.is_empty() {
         info!(target: VISA, "node {node}: rejoin revokes the visas of its previous join {ids:?}");
         asm.visa_mgr.revoke_visa_ids(&ids).await;
@@ -603,6 +603,35 @@ pub(crate) mod tests {
         );
         assert!(not_revoked(&asm, first[0].issuer_id, &[relay, zode]).await);
         assert!(not_revoked(&asm, second[0].issuer_id, &[relay, zode]).await);
+    }
+
+    /// The end of a join revokes every VSS visa of that join, also one for a VSS port the
+    /// node registered earlier and then replaced: issuance leaves the older one to expire,
+    /// so the teardown cannot go by the latest registered port alone.
+    #[tokio::test]
+    async fn revoke_previous_join_takes_vss_visas_of_every_port() {
+        let (asm, relay, zode) = build_net_with_policy(make_allow_policy_for_tcp_services(&[
+            ("vsapi", config::VSAPI_PORT),
+            ("vss", VSS_PORT),
+            ("vss", VSS_PORT + 1),
+        ]))
+        .await;
+        let first = issue_vss_visa(&asm, &zode, VSS_PORT, None).await.unwrap();
+        let second = issue_vss_visa(&asm, &zode, VSS_PORT + 1, None)
+            .await
+            .unwrap();
+        let [fwd, rev] = issue_vsapi_visas(&asm, &zode, None).await.unwrap();
+
+        revoke_previous_join(&asm, &lock_issuance().await, &zode)
+            .await
+            .unwrap();
+
+        for id in [first, second, fwd, rev] {
+            assert!(
+                !not_revoked(&asm, id, &[relay, zode]).await,
+                "visa {id} revoked"
+            );
+        }
     }
 
     /// The `registerVss` reply carries only the node's copy of its VSS visa. Everything else

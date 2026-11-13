@@ -27,6 +27,7 @@
 //! needs the visa store's internals.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use libeval::eval_result::Direction;
 use libeval::policy::Policy;
@@ -40,6 +41,7 @@ use crate::error::ServiceError;
 use crate::logging::targets::API;
 use crate::policy_mgr::PolicySnapshot;
 use crate::topology_mgr::TopoOps;
+use crate::visa_reconciler::revoke_visas_over_link;
 
 /// Stands in for the ZPL source on a bootstrap visa, which has no matching com policy.
 /// The core-visa code reads it to tell a bootstrap visa from a core visa (J5c).
@@ -109,7 +111,7 @@ fn topology_peer_addr(
 /// Stopping the old session's VSS worker waits on that worker, so it runs after both locks
 /// are released.
 pub(crate) async fn request_bootstrap_visas(
-    asm: &Assembly,
+    asm: &Arc<Assembly>,
     relay: &IpAddr,
     relay_session: Option<&str>,
     peer_cn: &str,
@@ -155,21 +157,23 @@ pub(crate) async fn request_bootstrap_visas(
 /// that it is gone: a peer has one link at a time (rule 5), so the relay holds no other live
 /// link for it, and the peer's links were wiped (R9).
 ///
-/// - Every visa of the previous join is revoked: bootstrap visas and, if the peer has a
-///   VS-API session, its core visas ([core_visas::revoke_previous_join]).
+/// - Every visa of the previous join is revoked: every visa between the peer and the visa
+///   service ([core_visas::revoke_previous_join]).
 /// - If the peer still has a VS-API session (its node actor is stored), the session is
 ///   ended: a new session id is stamped on the actor, so every handle of the old session
-///   fails its liveness check (the caller stops its VSS worker). Every other visa installed
-///   on the peer is marked pending install, so it
+///   fails its liveness check (the caller stops its VSS worker). Its link-state reports
+///   are forgotten, so its links are down until it reports again (R14), and the visas
+///   crossing a link that went down are revoked. Every other visa installed on the peer is
+///   marked pending install, so it
 ///   is pushed again after a `reconnect` (`VisaMgr::forget_installs_on_node`). The node
 ///   actor and its adapters stay, so the visa service can still accept a `reconnect` (R16).
 ///
-/// Only install state and revocation change here; no visa is edited. Runs under the
-/// caller's issuance lock and topology lock (`_ops`); takes the node commit lock for the
-/// actor write, as every writer of a node's own actor does.
+/// Only install state, link-state reports and revocation change here; no visa is edited.
+/// Runs under the caller's issuance lock and topology lock (`ops`); takes the node commit
+/// lock for the actor write, as every writer of a node's own actor does.
 async fn end_previous_join(
-    asm: &Assembly,
-    _ops: &TopoOps<'_>,
+    asm: &Arc<Assembly>,
+    ops: &TopoOps<'_>,
     issuing: &IssueGuard,
     peer: &IpAddr,
 ) -> Result<(), ServiceError> {
@@ -186,13 +190,18 @@ async fn end_previous_join(
             _ => false,
         }
     };
-    let vss_port = match has_session {
-        true => asm.actor_mgr.get_node_vss(peer).await?.map(|a| a.port()),
-        false => None,
-    };
-    core_visas::revoke_previous_join(asm, issuing, peer, vss_port).await?;
+    core_visas::revoke_previous_join(asm, issuing, peer).await?;
     if !has_session {
         return Ok(());
+    }
+    // Its links are gone too (R9): forget its link reports, so they are down until it
+    // reports again (R14), and revoke the visas crossing any that just went down, as a
+    // link-down report would.
+    let went_down = asm
+        .topo_mgr
+        .forget_link_states(ops, peer, &|| asm.policy_mgr.get_current_snapshot());
+    for (a, b) in went_down {
+        let _ = revoke_visas_over_link(asm, &a, &b).await;
     }
     // ponytail: an install ack of the old session still in flight can land after this and
     // mark one visa installed again although the node lost it. The node then re-requests

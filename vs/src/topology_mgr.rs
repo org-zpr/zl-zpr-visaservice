@@ -308,6 +308,24 @@ impl TopologyMgr {
         self.refresh_links_locked(table, reporter, cn_of)
     }
 
+    /// Forget `node`'s link-state reports and re-evaluate every router link incident to it,
+    /// so those links are down until it reports again (R14). For a node that lost all its
+    /// links (a rejoin, R9) but keeps its state in the visa service. Returns the links that
+    /// went from up to down, as `(node, peer)`, for the caller to revoke the visas crossing
+    /// them. CNs come from `current_policy`, called once under the table lock, as in
+    /// [Self::record_link_states].
+    pub fn forget_link_states(
+        &self,
+        _ops: &TopoOps<'_>,
+        node: &IpAddr,
+        current_policy: &dyn Fn() -> PolicySnapshot,
+    ) -> Vec<(IpAddr, IpAddr)> {
+        let mut table = self.link_state.lock().unwrap();
+        table.remove_node(node);
+        let snapshot = current_policy();
+        self.refresh_links_locked(&table, node, &Self::policy_cn_lookup(&snapshot))
+    }
+
     /// Re-evaluate every router link incident to `node`. Returns the links that went from
     /// up to down, as `(node, peer)`. Production code re-evaluates through
     /// [Self::record_link_states] and the install paths; tests use this directly.
