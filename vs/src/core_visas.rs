@@ -205,15 +205,40 @@ fn renewal_due(created: SystemTime, expires: SystemTime, now: SystemTime) -> boo
 /// old visa is still due then. A node with no VS-API session (no stored node actor) gets
 /// nothing: it comes back through a rejoin (J10). A five-tuple with no core visa at all is
 /// skipped; issuing them is J5a/J5b's job.
+///
+/// The issuance lock is global and every heartbeat of every node calls this, so it is taken
+/// only once something is due (g94 q2): a beat with nothing due never waits on another
+/// node's issuance. What is due is then read again under the lock, because an issuance or a
+/// rejoin may have run in between (see [ISSUE_LOCK]).
 pub(crate) async fn renew_core_visas(
     asm: &Assembly,
     node: &IpAddr,
     vss_port: u16,
     now: SystemTime,
 ) -> Result<Vec<u64>, ServiceError> {
-    // Under the issuance lock: a renewal must not interleave with a session's
-    // issuance or rejoin step (see [ISSUE_LOCK]).
+    if due_renewals(asm, node, vss_port, now).await?.is_empty() {
+        return Ok(Vec::new());
+    }
     let _issuing = ISSUE_LOCK.lock().await;
+    let mut renewed = Vec::new();
+    for (ft, current) in due_renewals(asm, node, vss_port, now).await? {
+        let id = mint_core_visa(asm, packet_for(&ft)).await?;
+        info!(target: VISA, "node {node}: core visa {current} renewed as {id} (J9)");
+        renewed.push(id);
+    }
+    Ok(renewed)
+}
+
+/// The core visas of `node` due for renewal at `now` (see [renew_core_visas]): for each of
+/// the VSAPI pair and the VSS visa on `vss_port`, the five-tuple and the ID of its newest
+/// visa still grantable to the node, if that one has reached [RENEW_AT]. Empty for a node
+/// with no VS-API session.
+async fn due_renewals(
+    asm: &Assembly,
+    node: &IpAddr,
+    vss_port: u16,
+    now: SystemTime,
+) -> Result<Vec<(VsapiFiveTuple, u64)>, ServiceError> {
     match asm.actor_mgr.get_actor_by_zpr_addr(node).await? {
         Some(actor) if actor.is_node() => {}
         _ => {
@@ -222,7 +247,7 @@ pub(crate) async fn renew_core_visas(
         }
     }
     let [fwd, rev] = vsapi_five_tuples(asm, node)?;
-    let mut renewed = Vec::new();
+    let mut due = Vec::new();
     for ft in [fwd, rev, vss_five_tuple(asm, node, vss_port)?] {
         let newest = core_visas_for(asm, node, &ft)
             .await?
@@ -232,14 +257,11 @@ pub(crate) async fn renew_core_visas(
         let Some(current) = newest else {
             continue;
         };
-        if !renewal_due(current.metadata.ctime, current.visa.expires, now) {
-            continue;
+        if renewal_due(current.metadata.ctime, current.visa.expires, now) {
+            due.push((ft, current.visa.issuer_id));
         }
-        let id = mint_core_visa(asm, packet_for(&ft)).await?;
-        info!(target: VISA, "node {node}: core visa {} renewed as {id} (J9)", current.visa.issuer_id);
-        renewed.push(id);
     }
-    Ok(renewed)
+    Ok(due)
 }
 
 /// The packet a core visa is requested for. TCP, both directions allowed: the dock PEP the
@@ -834,6 +856,26 @@ pub(crate) mod tests {
         assert!(renewed.is_empty());
         let after = asm.visa_mgr.get_visa_ids_for_actors(&[zode]).await.unwrap();
         assert_eq!(after.len(), before.len());
+    }
+
+    /// The heartbeat never waits on the issuance lock when nothing is due (g94 q2): every
+    /// VSS heartbeat calls [renew_core_visas], and the lock is global, so a beat with no
+    /// renewal due must return at once even while another issuance holds it.
+    #[tokio::test]
+    async fn nothing_due_does_not_wait_for_the_issuance_lock() {
+        let (asm, _relay, zode) = build_net().await;
+        let ids = issue_all(&asm, &zode).await;
+        let at = renew_point(&asm, &ids).await - Duration::from_secs(5);
+
+        let _held = lock_issuance().await;
+        let renewed = tokio::time::timeout(
+            Duration::from_secs(2),
+            renew_core_visas(&asm, &zode, VSS_PORT, at),
+        )
+        .await
+        .expect("a beat with nothing due must not wait for the issuance lock")
+        .unwrap();
+        assert!(renewed.is_empty());
     }
 
     /// At RENEW_AT three NEW visas appear for the identical five-tuples, and the old ones are
