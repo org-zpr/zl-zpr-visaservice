@@ -312,7 +312,12 @@ async fn core_visas_for(
 /// The visas are revoked through the normal revoke path, never edited.
 ///
 /// The caller holds the issuance lock (`_issuing`), so no issuance for the session being
-/// ended can mint a core visa after this has run (see [ISSUE_LOCK]).
+/// ended runs alongside this (see [ISSUE_LOCK]).
+///
+/// ponytail: a core-visa request that timed out is not cancelled by the pipeline, so it can
+/// still commit after this has run. That visa is policy-evaluated and covers only the
+/// node's own VS-API or VSS flow, so it grants nothing new; it expires on its own. Fence
+/// pipeline commits by session if that ever matters.
 pub(crate) async fn revoke_previous_join(
     asm: &Assembly,
     _issuing: &IssueGuard,
