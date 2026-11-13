@@ -456,21 +456,9 @@ impl ConnectionControl {
 
         let mut authd_claims: Vec<Attribute> = Vec::new();
 
-        // Policy topology may declare this node's substrate address; if so the node's
-        // advertised value must match it. With no topology entry (single-node deploy,
-        // no peerings) the advertised value is all we have, and it is trusted operator
-        // config just like a policy-declared substrate.
-        let substrate_addr = match substrate_addr_from_topology(&asm, &node_req_addr) {
-            Some(sa) => {
-                if sa != reported_substrate {
-                    return Err(ServiceError::Param(format!(
-                        "substrate address mismatch: policy declares {sa}, node reported {reported_substrate}"
-                    )));
-                }
-                sa
-            }
-            None => reported_substrate,
-        };
+        // The node's substrate address: policy's, if it declares one (the report must
+        // match), else the reported one (plan §7 check 3, zl-zipline#255).
+        let substrate_addr = accept_reported_substrate(&asm, &node_req_addr, reported_substrate)?;
         authd_claims
             .push(Attribute::builder(key::SUBSTRATE_ADDR).value(substrate_addr.to_string()));
         match a2a_dh_pubkey.and_then(a2a_dh_pubkey_claim) {
@@ -2558,12 +2546,31 @@ pub fn substrate_addr_from_topology(asm: &Assembly, node_addr: &IpAddr) -> Optio
     None
 }
 
-/// STUB (tests first): today's policy check only; replaced in the next commit.
+/// The substrate address to record for the node at `node_addr`, which reported
+/// `reported` (the address its peers should dial). The one rule for every path that
+/// records it -- `authenticate_node` (`connect`) and `open` (zl-zipline#255):
+///
+/// - a report that names no place to dial -- an unspecified IP or port 0 -- is a
+///   [ServiceError::Param] ([require_dialable_substrate]); there is no fallback;
+/// - policy declares an address for the node ([substrate_addr_from_topology]): the
+///   report must equal it, or this is a [ServiceError::Param];
+/// - policy declares none -- no peerings at all, or links whose end for this node has
+///   no address (a laptop endpoint that changes networks, zl-zipline#225) -- the
+///   reported address stands (plan §7 check 3).
+///
+/// The address is then fixed for the session: it changes only by a new `connect` or
+/// `open`.
+///
+/// Trusting the report steers only where peers dial: a link still needs the peer's
+/// CA-signed certificate with the expected CN, so a wrong address yields a failed
+/// link, not an impersonation. Whether a Zode can misuse the address it reports is
+/// zl-zipline#264.
 pub fn accept_reported_substrate(
     asm: &Assembly,
     node_addr: &IpAddr,
     reported: SocketAddr,
 ) -> Result<SocketAddr, ServiceError> {
+    require_dialable_substrate(reported)?;
     match substrate_addr_from_topology(asm, node_addr) {
         Some(declared) if declared != reported => Err(ServiceError::Param(format!(
             "substrate address mismatch: policy declares {declared}, node reported {reported}"
@@ -2571,6 +2578,18 @@ pub fn accept_reported_substrate(
         Some(declared) => Ok(declared),
         None => Ok(reported),
     }
+}
+
+/// Refuse a reported substrate address that names no place to dial: an unspecified IP
+/// (`0.0.0.0`, `::`, or the IPv4-mapped `::ffff:0.0.0.0`) or port 0. The visa service
+/// cannot check that an address is reachable, but it can refuse one that never is.
+pub fn require_dialable_substrate(reported: SocketAddr) -> Result<(), ServiceError> {
+    if reported.ip().to_canonical().is_unspecified() || reported.port() == 0 {
+        return Err(ServiceError::Param(format!(
+            "substrate address must be a specific address with a non-zero port, got {reported}"
+        )));
+    }
+    Ok(())
 }
 
 /// Required claims must be present and non-empty.

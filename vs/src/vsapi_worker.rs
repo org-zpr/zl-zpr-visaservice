@@ -433,18 +433,15 @@ async fn resume_node_actor_for_open(
         ));
     }
 
-    // If policy topology declares a substrate for this node it must agree with the
-    // reported one; with no topology entry the reported value stands.
-    if let Some(sa) = crate::connection_control::substrate_addr_from_topology(asm, &node_zpr_addr)
-        && sa != reported_substrate
-    {
-        return Err((
-            vsapi::ErrorCode::ParamError,
-            format!(
-                "substrate address mismatch: policy declares {sa}, node reported {reported_substrate}"
-            ),
-        ));
-    }
+    // The same substrate rule as `connect`: an unusable report is refused, and
+    // policy's address wins if it declares one (the report must match), else the
+    // reported one stands (zl-zipline#255).
+    let reported_substrate = crate::connection_control::accept_reported_substrate(
+        asm,
+        &node_zpr_addr,
+        reported_substrate,
+    )
+    .map_err(|e| (vsapi::ErrorCode::ParamError, e.to_string()))?;
 
     // A soft reconnect may carry a changed dock address; keep the stored claim current.
     let stored = existing_actor
@@ -774,12 +771,9 @@ fn parse_substrate_addr_str(s: &str) -> Result<SocketAddr, ServiceError> {
             pname::SUBSTRATE_ADDR
         ))
     })?;
-    if sa.ip().is_unspecified() || sa.port() == 0 {
-        return Err(ServiceError::Param(format!(
-            "param {} must be a specific address with a non-zero port, got '{sa}'",
-            pname::SUBSTRATE_ADDR
-        )));
-    }
+    // Refused here, at the wire, before any work; accept_reported_substrate applies
+    // the same check again where the address is recorded.
+    crate::connection_control::require_dialable_substrate(sa)?;
     Ok(sa)
 }
 
