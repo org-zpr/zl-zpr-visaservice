@@ -440,14 +440,12 @@ impl Router {
     }
 
     /// Replace the set of transit-capable nodes: the only nodes a route may pass
-    /// through (`Policy.transitNodes`, zl-zipline#227). Any node may still start or end
+    /// through (`Policy.transitNodes`, zl-zipline#255). Any node may still start or end
     /// a route. Starts empty (fail closed).
     ///
     /// If the set changed, best routes are recomputed and the route cache is flushed
-    /// under the same write lock. Returns the nodes that lost transit, sorted, so the
-    /// caller can revoke the visas that pass through them.
-    // Until TopologyMgr sets it from policy (next task of zl-zipline#227), only tests call it.
-    #[allow(dead_code)]
+    /// under the same write lock. Returns the nodes that lost transit, sorted, for the
+    /// log and tests.
     pub fn set_transit_nodes(&self, transit: HashSet<IpAddr>) -> Vec<IpAddr> {
         let mut inner = self.inner.write().unwrap();
         let transit: HashSet<NodeId> = transit.iter().map(NodeId::from).collect();
@@ -492,13 +490,9 @@ impl Router {
             return false;
         }
         let inner = self.inner.read().unwrap();
-        // Every interior node must still be transit-capable (zl-zipline#227): policy can
+        // Every interior node must still be transit-capable (zl-zipline#255): policy can
         // take a node's transit flag away after the route was chosen.
-        let interior = path.get(1..path.len().saturating_sub(1)).unwrap_or(&[]);
-        if !interior
-            .iter()
-            .all(|n| inner.topology.is_transit(&NodeId::from(n)))
-        {
+        if !inner.topology.interior_is_transit(path) {
             return false;
         }
         ids.iter().all(|id| {
@@ -508,6 +502,17 @@ impl Router {
                 l.up && hops.contains(&pair)
             })
         })
+    }
+
+    /// True if every interior node of `path` (a visa's recorded node path) is
+    /// transit-capable: the transit half of [Self::route_matches], for a visa restored
+    /// from the store, which records no link ids.
+    pub fn interior_is_transit(&self, path: &[IpAddr]) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .topology
+            .interior_is_transit(path)
     }
 
     /// Current link between two node addrs, in either order (edges are undirected).
@@ -731,7 +736,7 @@ struct Graph {
     edges: HashMap<LinkId, Link>,
     best_routes: HashMap<(NodeId, NodeId), (Vec<LinkId>, u32)>,
     /// Nodes that may be an interior hop of a route (`Policy.transitNodes`,
-    /// zl-zipline#227). Every other node may only start or end one. Empty by default:
+    /// zl-zipline#255). Every other node may only start or end one. Empty by default:
     /// fail closed, so a router nobody has told about transit routes only over one link.
     transit: HashSet<NodeId>,
 }
@@ -968,9 +973,15 @@ impl Graph {
         self.transit.contains(node_id)
     }
 
+    /// True if every interior node of `path` -- all but its first and last -- is
+    /// transit-capable. A path of one or two nodes has no interior.
+    fn interior_is_transit(&self, path: &[IpAddr]) -> bool {
+        let interior = path.get(1..path.len().saturating_sub(1)).unwrap_or(&[]);
+        interior.iter().all(|n| self.is_transit(&NodeId::from(n)))
+    }
+
     /// Replace the transit set and recompute best routes if it changed. Returns the
     /// nodes that were transit-capable before and are not now, sorted.
-    #[allow(dead_code)] // see Router::set_transit_nodes
     fn set_transit(&mut self, transit: HashSet<NodeId>) -> Vec<IpAddr> {
         if transit == self.transit {
             return Vec::new();
@@ -1068,7 +1079,7 @@ impl Graph {
                 continue;
             }
 
-            // Only a transit-capable node may be passed through (zl-zipline#227); any
+            // Only a transit-capable node may be passed through (zl-zipline#255); any
             // other node is a dead end unless it is the destination, handled above.
             if !self.is_transit(neighbor) {
                 continue;
@@ -1132,7 +1143,7 @@ impl Graph {
 
             // A node that is not transit-capable is reached (it may be a destination)
             // but never expanded: no route leaves it again unless it is the start
-            // (zl-zipline#227).
+            // (zl-zipline#255).
             if &node != start && !self.is_transit(&node) {
                 continue;
             }
@@ -1199,7 +1210,7 @@ mod tests {
     }
 
     /// Three nodes, no links, every node transit-capable: the tests written before
-    /// transit existed (zl-zipline#227) route through any node.
+    /// transit existed (zl-zipline#255) route through any node.
     fn make_router_abc() -> (Router, IpAddr, IpAddr, IpAddr) {
         let (r, a, b, c) = make_router_abc_no_transit();
         all_transit(&r, &[a, b, c]);
@@ -2358,7 +2369,7 @@ mod tests {
         assert!(!r.route_matches(&[ab], &[a, b, c]));
     }
 
-    // --- Non-transit nodes (zl-zipline#227) ---
+    // --- Non-transit nodes (zl-zipline#255) ---
 
     /// The issue's case at router level: A and B have a direct link that is down, and
     /// the only other way between them is through C, which policy does not mark

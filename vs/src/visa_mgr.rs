@@ -1512,7 +1512,7 @@ mod tests {
         asm.topo_mgr
             .add_link(mid, dst, LinkId("link-mid-dst".into()), vec![], 1)
             .unwrap();
-        // MID carries SRC-DST traffic, so policy must list it as transit (zl-zipline#227).
+        // MID carries SRC-DST traffic, so policy must list it as transit (zl-zipline#255).
         asm.topo_mgr.set_transit_nodes(&[mid]);
         for (adapter, node, cn) in [
             (MH_SRC_ADAPTER, src, "mh-src-adapter"),
@@ -1995,7 +1995,7 @@ mod tests {
         asm.topo_mgr
             .add_link(b, c, LinkId("bc".into()), vec![], 1)
             .unwrap();
-        // b carries a-c traffic, so policy must list it as transit (zl-zipline#227).
+        // b carries a-c traffic, so policy must list it as transit (zl-zipline#255).
         asm.topo_mgr.set_transit_nodes(&[b]);
         for (addr, cn) in [(a, "node-a"), (c, "node-c")] {
             asm.actor_mgr

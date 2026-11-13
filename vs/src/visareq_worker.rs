@@ -1431,14 +1431,12 @@ mod tests {
         assert!(matches!(result, VisaDecision::Deny(DenyCode::NoRoute)));
     }
 
-    /// zl-zipline#227 acceptance: the direct link between the two docks is down, and
+    /// zl-zipline#255 acceptance: the direct link between the two docks is down, and
     /// the only other way is through C, which policy does not mark transit-capable.
     /// The visa request is denied `NoRoute`; it is not routed through C.
     #[tokio::test]
     async fn process_visa_request_denied_no_route_through_a_non_transit_node() {
-        use crate::test_helpers::{
-            build_transit_asm, take_transit_asm_direct_link_down, transit_policy,
-        };
+        use crate::test_helpers::{build_transit_asm, report_transit_asm_links, transit_policy};
         let (asm, _a, _b, _c) = build_transit_asm().await;
         asm.policy_mgr
             .update_policy_from_container_bytes(transit_policy(&[]))
@@ -1448,7 +1446,7 @@ mod tests {
             &asm.topo_mgr.ops().await,
             &asm.policy_mgr.get_current_snapshot(),
         );
-        take_transit_asm_direct_link_down(&asm);
+        report_transit_asm_links(&asm, false);
 
         let requesting_node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
         let pkt = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 1234, 80).unwrap();
@@ -1465,9 +1463,7 @@ mod tests {
     /// succeeded).
     #[tokio::test]
     async fn process_visa_request_routes_through_a_transit_node() {
-        use crate::test_helpers::{
-            build_transit_asm, take_transit_asm_direct_link_down, transit_policy,
-        };
+        use crate::test_helpers::{build_transit_asm, report_transit_asm_links, transit_policy};
         use libeval::route::LinkId;
         let (asm, a, b, c) = build_transit_asm().await;
         asm.policy_mgr
@@ -1478,7 +1474,7 @@ mod tests {
             &asm.topo_mgr.ops().await,
             &asm.policy_mgr.get_current_snapshot(),
         );
-        take_transit_asm_direct_link_down(&asm);
+        report_transit_asm_links(&asm, false);
         assert_eq!(
             asm.topo_mgr.get_best_route(&a, &b).unwrap().links,
             vec![LinkId("ac".into()), LinkId("cb".into())]

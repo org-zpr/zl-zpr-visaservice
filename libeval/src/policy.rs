@@ -440,7 +440,7 @@ impl Policy {
     }
 
     /// Whether policy lets the node at `node_zpr_addr` carry traffic between other
-    /// nodes, i.e. be an interior hop of a route (zl-zipline#227). Fails closed: a node
+    /// nodes, i.e. be an interior hop of a route (zl-zipline#255). Fails closed: a node
     /// that `Policy.transitNodes` does not list is not transit-capable, and an unset or
     /// empty list means no node is. A node is always allowed at either end of a route.
     pub fn is_transit_node(&self, node_zpr_addr: &IpAddr) -> bool {
@@ -1642,7 +1642,7 @@ mod test {
         assert_eq!(result.attrs[0].get_key(), "link.class");
     }
 
-    // --- transitNodes (zl-zipline#227) ---
+    // --- transitNodes (zl-zipline#255) ---
 
     /// Build a policy whose `transitNodes` list is `entries`, or left unset for `None`.
     fn policy_bytes_with_transit_nodes(entries: Option<&[&str]>) -> Bytes {

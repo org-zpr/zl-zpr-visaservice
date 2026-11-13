@@ -396,18 +396,34 @@ impl TopologyMgr {
         self.link_state.lock().unwrap().clear_failed_for(node)
     }
 
-    /// STUB (tests first): replaced in the next commit.
+    /// Make the router's transit set the one `snapshot`'s policy declares
+    /// (`Policy.transitNodes`, zl-zipline#255): only those nodes may be an interior hop
+    /// of a route. Takes the caller's [TopoOps] because it is a topology write.
+    ///
+    /// Returns the nodes that lost transit, for the log and tests. The caller revokes
+    /// the visas through every non-transit node afterwards
+    /// (`visa_reconciler::revoke_visas_through_non_transit`). The flag is cleared before
+    /// that lists visas, so a visa committed concurrently is either listed by it or
+    /// fails the commit-time route check ([Self::route_still_valid]), as for a link
+    /// going down.
     pub fn apply_transit_nodes(
         &self,
         _ops: &TopoOps<'_>,
-        _snapshot: &PolicySnapshot,
+        snapshot: &PolicySnapshot,
     ) -> Vec<IpAddr> {
-        Vec::new()
+        let lost = self
+            .router
+            .set_transit_nodes(snapshot.policy().transit_nodes().clone());
+        if !lost.is_empty() {
+            info!(target: TOPO, "policy vinst {}: nodes no longer transit-capable: {:?}", snapshot.vinst(), lost);
+        }
+        lost
     }
 
-    /// STUB (tests first): replaced in the next commit.
-    pub fn interior_is_transit(&self, _path: &[IpAddr]) -> bool {
-        true
+    /// True if every interior node of a visa's recorded node `path` is transit-capable
+    /// ([Router::interior_is_transit]).
+    pub fn interior_is_transit(&self, path: &[IpAddr]) -> bool {
+        self.router.interior_is_transit(path)
     }
 
     /// Is `addr` a node in the router?
@@ -628,6 +644,13 @@ impl TopologyMgr {
         snapshot: &PolicySnapshot,
         node_addrs: &[IpAddr],
     ) -> Result<Vec<(IpAddr, IpAddr)>, ServiceError> {
+        // Which nodes may pass traffic through comes from policy (zl-zipline#255). The
+        // router is empty here, so this reports no loss even when the policy took a
+        // node's flag away before a restart: the caller revokes the restored visas that
+        // pass through a node that is not transit-capable
+        // (`revoke_visas_through_non_transit`).
+        self.apply_transit_nodes(_ops, snapshot);
+
         // In this code path there should be no cases for errors from add_node.
         for addr in node_addrs {
             self.router.add_node(addr.clone())?;

@@ -668,6 +668,17 @@ pub fn policy_with_peerings_cns_and_tcp_services(
     node_cns: &[(IpAddr, &str)],
     services: &[(&str, u16)],
 ) -> Vec<u8> {
+    policy_with_peerings_cns_services_and_transit(peerings, node_cns, services, &[])
+}
+
+/// As [policy_with_peerings_cns_and_tcp_services], with `Policy.transitNodes` =
+/// `transit` (left unset when empty, which means no node is transit-capable).
+pub fn policy_with_peerings_cns_services_and_transit(
+    peerings: &[Peering],
+    node_cns: &[(IpAddr, &str)],
+    services: &[(&str, u16)],
+    transit: &[IpAddr],
+) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
     {
         let mut policy = msg.init_root::<capnp_policy::policy::Builder>();
@@ -695,6 +706,12 @@ pub fn policy_with_peerings_cns_and_tcp_services(
                     addr_cond.init_value(1).set(0, addr.to_string());
                 }
                 jp.init_flags(1).set(0, capnp_policy::JoinFlag::Node);
+            }
+        }
+        if !transit.is_empty() {
+            let mut list = policy.reborrow().init_transit_nodes(transit.len() as u32);
+            for (i, addr) in transit.iter().enumerate() {
+                list.set(i as u32, addr.to_string());
             }
         }
     }
@@ -796,7 +813,7 @@ pub async fn build_sweep_asm_on(asm: Assembly, with_link: bool) -> (Arc<Assembly
     (Arc::new(asm), node_a)
 }
 
-// ---- transit fixtures (zl-zipline#227) ----
+// ---- transit fixtures (zl-zipline#255) ----
 
 /// The third node of [build_transit_asm]: linked to both sweep nodes, so the only
 /// other way between them besides their direct link.
@@ -841,57 +858,40 @@ pub async fn build_transit_asm_with_db() -> (
     (asm, node_a, node_b, node_c, db)
 }
 
-/// Container bytes of the policy for [build_transit_asm]: a node join policy every
-/// node satisfies (so a policy pass keeps all three connected), the three links
-/// `l`, `ac` and `cb`, and `transitNodes` = `transit`.
+/// Container bytes of the policy for [build_transit_asm]: a node join policy per node
+/// with its CN (so a policy pass keeps all three connected and judges their links with
+/// those CNs), the three links `l`, `ac` and `cb`, and `transitNodes` = `transit`.
 pub fn transit_policy(transit: &[IpAddr]) -> Vec<u8> {
-    let a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
-    let b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
-    let c: IpAddr = TRANSIT_NODE_C.parse().unwrap();
+    let (a, b, c) = transit_asm_nodes();
     let peerings = [
         make_peering(a, b, "l", vec![]),
         make_peering(a, c, "ac", vec![]),
         make_peering(c, b, "cb", vec![]),
     ];
-    let mut msg = capnp::message::Builder::new_default();
-    {
-        let mut policy = msg.init_root::<capnp_policy::policy::Builder>();
-        policy.reborrow().set_created("1970-01-01T00:00:00Z");
-        let mut topo = policy.reborrow().init_topology(peerings.len() as u32);
-        for (i, p) in peerings.iter().enumerate() {
-            p.write_to(&mut topo.reborrow().get(i as u32));
-        }
-        let mut jps = policy.reborrow().init_join_policies(1);
-        jps.reborrow()
-            .get(0)
-            .init_flags(1)
-            .set(0, capnp_policy::JoinFlag::Node);
-        if !transit.is_empty() {
-            let mut list = policy.reborrow().init_transit_nodes(transit.len() as u32);
-            for (i, addr) in transit.iter().enumerate() {
-                list.set(i as u32, addr.to_string());
-            }
-        }
-    }
-    let mut bytes = Vec::new();
-    capnp::serialize::write_message(&mut bytes, &msg).unwrap();
-    make_container_bytes(
-        crate::config::POLICY_MIN_COMPILER_MAJOR,
-        crate::config::POLICY_MIN_COMPILER_MINOR,
-        crate::config::POLICY_MIN_COMPILER_PATCH,
-        &bytes,
+    policy_with_peerings_cns_services_and_transit(
+        &peerings,
+        &[(a, "na"), (b, "nb"), (c, "nc")],
+        &[],
+        transit,
     )
 }
 
-/// Take the direct A--B link of [build_transit_asm] down the way link-state reports
-/// do. Under R14 a link is up only while both ends report it up, so every node
-/// reports: C reports A and B up, A reports only C, and B reports only C. A--B goes
-/// down; A--C and C--B are up.
-pub fn take_transit_asm_direct_link_down(asm: &Assembly) {
+/// The nodes A, B and C of [build_transit_asm].
+fn transit_asm_nodes() -> (IpAddr, IpAddr, IpAddr) {
+    (
+        "fd5a:5052:3000::1".parse().unwrap(),
+        "fd5a:5052:3000::2".parse().unwrap(),
+        TRANSIT_NODE_C.parse().unwrap(),
+    )
+}
+
+/// Have every node of [build_transit_asm] report its links, the way link-state reports
+/// do. Under R14 a link is up only while both ends report it up. C reports A and B
+/// up; A and B report C up, and each other only if `direct_up`. So A--C and C--B end
+/// up, and A--B ends up or down as `direct_up` says.
+pub fn report_transit_asm_links(asm: &Assembly, direct_up: bool) {
     use zpr::vsapi_types::{LinkState, LinkStateReport};
-    let a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
-    let b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
-    let c: IpAddr = TRANSIT_NODE_C.parse().unwrap();
+    let (a, b, c) = transit_asm_nodes();
     let cn_of = move |n: &IpAddr| {
         [(a, "na"), (b, "nb"), (c, "nc")]
             .iter()
@@ -906,7 +906,12 @@ pub fn take_transit_asm_direct_link_down(asm: &Assembly) {
             })
             .collect()
     };
-    for (reporter, peers) in [(c, up(&["na", "nb"])), (a, up(&["nc"])), (b, up(&["nc"]))] {
+    let (a_peers, b_peers) = if direct_up {
+        (up(&["nc", "nb"]), up(&["nc", "na"]))
+    } else {
+        (up(&["nc"]), up(&["nc"]))
+    };
+    for (reporter, peers) in [(c, up(&["na", "nb"])), (a, a_peers), (b, b_peers)] {
         asm.topo_mgr.record_link_states_with_cns(
             &asm.topo_mgr.ops_now(),
             &reporter,
@@ -915,7 +920,7 @@ pub fn take_transit_asm_direct_link_down(asm: &Assembly) {
             &cn_of,
         );
     }
-    assert!(!asm.topo_mgr.link_up(&a, &b), "the direct link is down");
+    assert_eq!(asm.topo_mgr.link_up(&a, &b), direct_up);
     assert!(asm.topo_mgr.link_up(&a, &c) && asm.topo_mgr.link_up(&c, &b));
 }
 

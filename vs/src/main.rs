@@ -723,6 +723,10 @@ async fn teardown_culled_nodes(asm: &Assembly, culled: &[crate::actor_mgr::Culle
 /// - R14: no node has reported since the restart, so every restored link is down
 ///   until both its ends report it up again. R15: the persisted visas that cross a
 ///   down link are revoked, as a link-state report would.
+/// - zl-zipline#255: the visas whose path passes through a node that is no longer
+///   transit-capable are revoked. This covers a policy pass the service did not finish
+///   before it stopped: the restored router starts with the new transit set, so no
+///   later pass would see the change.
 ///
 /// A revocation write that fails quarantines the visa and is retried per visa
 /// (VisaMgr), so it does not fail startup.
@@ -736,6 +740,7 @@ async fn restore_topology(asm: &Arc<Assembly>, node_addrs: &[IpAddr]) -> Result<
     for (a, b) in down_links {
         let _ = visa_reconciler::revoke_visas_over_link(asm, &a, &b).await;
     }
+    let _ = visa_reconciler::revoke_visas_through_non_transit(asm).await;
     Ok(())
 }
 

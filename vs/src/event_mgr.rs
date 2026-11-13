@@ -210,6 +210,17 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
           - TO BE SAFE: expire auth from all services - force re-auth of all existing services (after removing non-existing ones)
      */
 
+    // Which nodes may pass traffic through comes from the current policy
+    // (zl-zipline#255). Applied first, under its own short topology guard, before
+    // anything fallible or slow: an error below ends this event with no retry, the
+    // actor refresh can take long, and until this runs the router would keep routing
+    // through a node the policy no longer lets carry traffic. A newer policy's own
+    // pass applies its set again, so a superseded pass does no harm here.
+    {
+        let ops = asm.topo_mgr.ops().await;
+        apply_policy_transit(asm, &ops, &asm.policy_mgr.get_current_snapshot()).await;
+    }
+
     // The snapshot for the attribute and hostname reconciliation below. The
     // topology part of the pass re-reads it under the topology operation lock, and
     // everything from there on (node validity, links, re-auth obligation, visa sweep)
@@ -460,8 +471,23 @@ async fn policy_pass_locked(
     })
 }
 
-/// STUB (tests first): replaced in the next commit.
-async fn apply_policy_transit(_asm: &Arc<Assembly>, _ops: &TopoOps<'_>, _psnap: &PolicySnapshot) {}
+/// Make the router's transit set `psnap`'s (`Policy.transitNodes`, zl-zipline#255) and
+/// revoke every live visa whose path passes through a node that is not
+/// transit-capable, under the caller's [TopoOps]. Applied whether or not any node is
+/// connected, so nodes that connect later route under it.
+///
+/// The revocation checks every visa against the transit set as it now is, not against
+/// what this call changed, so it does not depend on the change being seen once: a
+/// pass that stopped early, or a restart, leaves nothing a later call cannot find.
+/// The revocations go through the ungated path, like `links_down`: the policy sweep
+/// skips a visa committed under this policy before the pass ran. The flag is cleared
+/// before the visas are listed, so a visa committed concurrently is either listed or
+/// fails its commit-time route check. Failed revocations are quarantined and retried
+/// per visa.
+async fn apply_policy_transit(asm: &Arc<Assembly>, ops: &TopoOps<'_>, psnap: &PolicySnapshot) {
+    asm.topo_mgr.apply_transit_nodes(ops, psnap);
+    let _ = crate::visa_reconciler::revoke_visas_through_non_transit(asm).await;
+}
 
 /// The ends of `links_down` the visa service can no longer reach: those with no
 /// route from the node it docks on (the relay). It reached them over a link the
@@ -1030,13 +1056,15 @@ mod tests {
         );
     }
 
-    /// zl-zipline#227: the policy pass sets the router's transit set from the policy,
+    /// zl-zipline#255: the policy pass sets the router's transit set from the policy,
     /// and revokes a visa through a node that lost transit -- including one committed
     /// under the new policy before the pass ran, which the sweep's generation gate
     /// would skip.
     #[tokio::test]
     async fn test_policy_pass_applies_transit_and_revokes_visas_through_lost_nodes() {
-        use crate::test_helpers::{build_transit_asm, create_sweep_visa_on_route, transit_policy};
+        use crate::test_helpers::{
+            build_transit_asm, create_sweep_visa_on_route, report_transit_asm_links, transit_policy,
+        };
         let (asm, a, b, c) = build_transit_asm().await;
         asm.policy_mgr
             .update_policy_from_container_bytes(transit_policy(&[c]))
@@ -1044,6 +1072,8 @@ mod tests {
             .unwrap();
         let vinst = asm.policy_mgr.get_current_snapshot().vinst();
         handle_policy_updated(&asm, vinst).await.unwrap();
+        // Under R14 the links are up once both ends report them.
+        report_transit_asm_links(&asm, true);
         let via_c = asm
             .topo_mgr
             .get_routes(&a, &b, None)
@@ -1152,7 +1182,7 @@ mod tests {
         );
     }
 
-    /// zl-zipline#227: the pass applies the transit set even when no node is connected
+    /// zl-zipline#255: the pass applies the transit set even when no node is connected
     /// (it then skips link reconciliation), so nodes that connect later route under it.
     #[tokio::test]
     async fn test_policy_pass_applies_transit_without_connected_nodes() {
