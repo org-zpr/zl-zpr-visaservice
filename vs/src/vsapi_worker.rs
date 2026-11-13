@@ -4674,6 +4674,99 @@ mod tests {
                 .expect("open's state update completes once the lock is free");
         }
 
+        /// `open` applies the same substrate rule as `connect` (zl-zipline#255): with a
+        /// policy that declares links for the node but no address for it, a changed
+        /// reported address is accepted and stored; where policy declares one, a
+        /// different report is a `paramError`.
+        #[tokio::test]
+        async fn test_open_applies_the_reported_substrate_rule() {
+            let (asm, node, relay) = open_substrate_asm().await;
+            let moved: std::net::SocketAddr = "192.0.2.10:7000".parse().unwrap();
+            let actor = resume_node_actor_for_open(&asm, node, moved, "zode")
+                .await
+                .map_err(|(code, msg)| format!("{code:?}: {msg}"))
+                .expect("a reported address stands when policy declares none");
+            assert_eq!(
+                actor
+                    .get_attribute(key::SUBSTRATE_ADDR)
+                    .unwrap()
+                    .get_value()[0],
+                moved.to_string()
+            );
+
+            // The relay's address is declared ([relay]:7001): another report is refused.
+            let err = resume_node_actor_for_open(&asm, relay, moved, "relay")
+                .await
+                .expect_err("a report that contradicts policy is refused");
+            assert!(matches!(err.0, vsapi::ErrorCode::ParamError), "{err:?}");
+        }
+
+        /// zl-zipline#255: `open` refuses a reported substrate address that names no
+        /// place to dial (an unspecified IP or port 0) with `paramError`, and leaves
+        /// the stored claim as it was.
+        #[tokio::test]
+        async fn test_open_rejects_an_unusable_reported_substrate() {
+            let (asm, node, _relay) = open_substrate_asm().await;
+            for reported in [
+                "0.0.0.0:7000",
+                "[::]:7000",
+                "[::ffff:0.0.0.0]:7000",
+                "192.0.2.10:0",
+            ] {
+                let reported: std::net::SocketAddr = reported.parse().unwrap();
+                let err = resume_node_actor_for_open(&asm, node, reported, "zode")
+                    .await
+                    .expect_err("an unusable report is refused");
+                assert!(
+                    matches!(err.0, vsapi::ErrorCode::ParamError),
+                    "{reported}: {err:?}"
+                );
+            }
+            let stored = asm
+                .actor_mgr
+                .get_actor_by_zpr_addr(&node)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored
+                    .get_attribute(key::SUBSTRATE_ADDR)
+                    .unwrap()
+                    .get_value()[0],
+                "[fd5a:5052:3000::101]:1234"
+            );
+        }
+
+        /// An assembly for the `open` substrate tests: policy links a relay
+        /// (`::9`, declared substrate `[::9]:7001`) to NODE, with no address declared
+        /// for NODE. Both are stored node actors. Returns (asm, NODE, relay).
+        async fn open_substrate_asm() -> (Arc<Assembly>, std::net::IpAddr, std::net::IpAddr) {
+            use crate::test_helpers::{make_peering, policy_with_peerings};
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let node: std::net::IpAddr = NODE.parse().unwrap();
+            let relay: std::net::IpAddr = "fd5a:5052:3000::9".parse().unwrap();
+            let mut peering = make_peering(relay, node, "link-relay-zode", vec![]);
+            peering.substrate_a = Some(zpr::policy_types::NetAddr::new_for_ip_or_host(
+                &relay.to_string(),
+                7001,
+            ));
+            peering.substrate_b = None;
+            asm.policy_mgr
+                .update_policy_from_container_bytes(policy_with_peerings(&[peering]))
+                .await
+                .unwrap();
+            for actor in [
+                make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234"),
+                make_node_actor_defexp("fd5a:5052:3000::9", "relay", "[fd5a:5052:3000::9]:7001"),
+            ] {
+                asm.actor_mgr
+                    .add_node(&actor, false, &Default::default())
+                    .await
+                    .unwrap();
+            }
+            (asm, node, relay)
+        }
+
         /// #63 review (Codex P1): a Reset authentication tears the node's old
         /// state down only inside the locked commit, after the generation
         /// recheck: refused under a moved generation, the old state (here, a
