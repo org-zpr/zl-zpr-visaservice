@@ -2044,7 +2044,7 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             .disconnect_locked(&ops, &self.asm, zpr_addr, reason)
             .await;
         drop(ops);
-        crate::connection_control::ConnectionControl::stop_vss_worker(vss, &zpr_addr).await;
+        crate::connection_control::ConnectionControl::stop_vss_worker(vss, &zpr_addr);
         match result {
             Ok(()) => (),
             Err(e) => {

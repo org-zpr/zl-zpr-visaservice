@@ -288,13 +288,9 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     };
     // The VSS workers of the nodes disconnected, or cut off, under the guard are
     // stopped now that it is released, before any reconciliation error is returned:
-    // those nodes are gone either way. A stop waits for room in the worker's command
-    // queue, behind RPCs that may be waiting out their timeouts, so it runs detached:
-    // the pass never waits on a node's VSS worker (g101).
+    // those nodes are gone either way. The stop does not wait on the worker (g101).
     for (vss, naddr) in stopped_workers {
-        tokio::spawn(async move {
-            crate::connection_control::ConnectionControl::stop_vss_worker(vss, &naddr).await;
-        });
+        crate::connection_control::ConnectionControl::stop_vss_worker(vss, &naddr);
     }
     reconciled?;
 

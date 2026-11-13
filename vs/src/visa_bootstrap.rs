@@ -184,7 +184,7 @@ pub(crate) async fn request_bootstrap_visas(
     };
     drop(ops);
     drop(issuing);
-    ConnectionControl::stop_vss_worker(old_vss, &peer).await;
+    ConnectionControl::stop_vss_worker(old_vss, &peer);
     match &minted {
         Ok(bv) => {
             info!(target: API, "relay {relay}: bootstrap visas {:?} for joiner {peer_cn} at {peer}", bv.peer.iter().map(|v| v.issuer_id).collect::<Vec<_>>());
