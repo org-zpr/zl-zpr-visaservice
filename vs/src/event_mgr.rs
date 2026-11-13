@@ -3,7 +3,6 @@
 //! are not able to report back success/failure to the "caller".
 
 use futures::future::join_all;
-use futures::stream::{self, StreamExt};
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -13,7 +12,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use zpr::vsapi::v1::DisconnectReason;
-use zpr::vsapi_types::ServiceDescriptor;
 
 use libeval::eval::EvalContext;
 
@@ -132,46 +130,71 @@ pub(crate) async fn send_topology_to(asm: &Assembly, psnap: &PolicySnapshot, nod
     join_all(futs).await;
 }
 
-/// Re-push the current auth-services list to all connected nodes. The list is the
-/// policy's OIDC identity providers (see `ActorMgr::get_auth_services_list`), so it
-/// can only change when policy does.
-async fn push_auth_services_all_nodes(asm: &Arc<Assembly>) -> Result<(), ServiceError> {
-    let auth_services = asm.actor_mgr.get_auth_services_list(asm.clone()).await?;
-    set_services_all_nodes(asm, &auth_services).await
-}
-
-/// Helper to use the VSS on all connected nodes to update the auth services list.
-async fn set_services_all_nodes(
+/// Push a policy pass's results to each of `node_addrs` over its VSS: the node's
+/// topology under `psnap`, then the current auth-services list (OIDC providers are
+/// declared in policy, so it can change with it), then -- if `request_reauth` -- the
+/// request to re-authenticate the node and its docked adapters (zipline#123).
+///
+/// One detached task per node (g101): a node whose VSS is slow or unreachable, where
+/// every call waits out its RPC timeout, delays only its own pushes, never the policy
+/// pass or the install queued behind it. A node's calls keep their order. Two passes'
+/// tasks for one node may interleave, which is harmless: a `setTopology` or
+/// `setServices` command makes the node's worker re-send the current topology and
+/// services list at its next heartbeat, and a second re-auth request only repeats
+/// the first.
+///
+/// Failures are logged. The deadline rule in `auth_sweep` re-sends a re-auth request
+/// to whoever still owes, so a missed one costs one sweep period, not the obligation.
+async fn push_policy_to_nodes(
     asm: &Arc<Assembly>,
-    service_set: &[ServiceDescriptor],
-) -> Result<(), ServiceError> {
-    let node_list = asm.actor_mgr.list_node_addrs().await.unwrap_or_default();
-
-    // Make RPC calls to the nodes in parallel.
-
-    stream::iter(node_list)
-        .for_each_concurrent(None, |naddr| {
-            let asm = asm.clone();
-            let service_list: Vec<ServiceDescriptor> = service_set.to_vec();
-            async move {
-                debug!(
-                    target: EVENT,
-                    "attempting to use VSS to set_services on node {naddr}"
-                );
-                if let Some(vss_h) = asm.vss_mgr.get_handle(&naddr) {
-                    if let Err(e) = vss_h.set_services(service_list).await {
-                        error!(
-                            target: EVENT,
-                            "failed to set_services on node {}: {}",
-                            naddr,
-                            e
-                        );
-                    }
+    psnap: &PolicySnapshot,
+    node_addrs: &[IpAddr],
+    request_reauth: bool,
+) {
+    if node_addrs.is_empty() {
+        return;
+    }
+    let services = match asm.actor_mgr.get_auth_services_list(asm.clone()).await {
+        Ok(services) => Some(services),
+        Err(e) => {
+            error!(target: EVENT, "failed to refresh auth services after policy update: {e}");
+            None
+        }
+    };
+    for &naddr in node_addrs {
+        // A node without a worker gets all of this when its worker starts.
+        let Some(vss) = asm.vss_mgr.get_handle(&naddr) else {
+            continue;
+        };
+        // Same snapshot the peers come from: the worker builds the wire Links off it.
+        let peers = psnap.resolved_peers_for_node(&naddr);
+        let policy = psnap.policy_arc();
+        let services = services.clone();
+        let asm = asm.clone();
+        tokio::spawn(async move {
+            if let Err(e) = vss.set_topology(peers, policy).await {
+                error!(target: EVENT, "failed to set topology for node {naddr}: {e}");
+            }
+            if let Some(services) = services {
+                if let Err(e) = vss.set_services(services).await {
+                    error!(target: EVENT, "failed to set_services on node {naddr}: {e}");
                 }
             }
-        })
-        .await;
-    Ok(())
+            if request_reauth {
+                let mut addrs = vec![naddr];
+                match asm.actor_mgr.get_adapters_connected_to_node(&naddr).await {
+                    Ok(adapters) => addrs.extend(adapters),
+                    Err(e) => {
+                        error!(target: EVENT, "failed to list adapters of node {naddr}: {e}");
+                    }
+                }
+                debug!(target: EVENT, "requesting re-authentication of {} actor(s) via node {naddr}", addrs.len());
+                if let Err(e) = vss.request_auths(addrs).await {
+                    error!(target: EVENT, "failed to request_auths on node {naddr}: {e}");
+                }
+            }
+        });
+    }
 }
 
 async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), ServiceError> {
@@ -263,24 +286,17 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     else {
         return Ok(());
     };
-    // Disconnected nodes' VSS workers are stopped now that the guard is released
-    // (stopping waits on the worker), before any reconciliation error is returned:
-    // those nodes are gone either way.
+    // The VSS workers of the nodes disconnected, or cut off, under the guard are
+    // stopped now that it is released, before any reconciliation error is returned:
+    // those nodes are gone either way. A stop waits for room in the worker's command
+    // queue, behind RPCs that may be waiting out their timeouts, so it runs detached:
+    // the pass never waits on a node's VSS worker (g101).
     for (vss, naddr) in stopped_workers {
-        crate::connection_control::ConnectionControl::stop_vss_worker(vss, &naddr).await;
+        tokio::spawn(async move {
+            crate::connection_control::ConnectionControl::stop_vss_worker(vss, &naddr).await;
+        });
     }
     reconciled?;
-
-    if !valid_node_addrs.is_empty() {
-        send_topology_to(asm, &psnap, &valid_node_addrs).await;
-
-        // A policy update can change the auth-services list (OIDC providers are
-        // declared in policy). Re-push the current list so surviving nodes stay in
-        // sync.
-        if let Err(e) = push_auth_services_all_nodes(asm).await {
-            error!(target: EVENT, "failed to refresh auth services after policy update: {e}");
-        }
-    }
 
     // Policy install obliges every connected actor to re-authenticate under
     // the new generation (zipline#123). Record the obligation `(V, T)` durably
@@ -296,7 +312,8 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // be revoked for this generation. Propagating the error means the update
     // is not reported as successfully enforced; the event worker logs it, and
     // the next policy-updated event (or VS restart, which replays the current
-    // policy) retries the write against the same snapshot vinst.
+    // policy) retries the write against the same snapshot vinst. The nodes still
+    // get the new topology and services list, but no re-auth request.
     let deadline_secs = asm
         .config
         .core
@@ -306,17 +323,17 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         vinst: snapshot_vinst,
         deadline: SystemTime::now() + Duration::from_secs(deadline_secs),
     };
-    if let Err(e) = crate::db::ReauthRepo::new(asm.state_db.clone())
+    let recorded = crate::db::ReauthRepo::new(asm.state_db.clone())
         .add_obligation(&obligation)
-        .await
-    {
+        .await;
+    if let Err(e) = &recorded {
         error!(target: EVENT, "failed to record reauth obligation for vinst {snapshot_vinst}: {e}");
-        return Err(e.into());
     }
-    request_auths_all_nodes(asm, &valid_node_addrs).await;
+    push_policy_to_nodes(asm, &psnap, &valid_node_addrs, recorded.is_ok()).await;
+    recorded?;
 
     // Re-check existing visas against the new policy. Runs last so route checks
-    // and the nodes' own link state already reflect the updated topology.
+    // already reflect the updated topology. It does not wait for the pushes above.
     revalidate_visas(asm, &psnap, SweepReason::PolicyUpdate).await;
 
     Ok(())
@@ -329,10 +346,11 @@ enum LockedPass {
     /// Applied under the current policy `psnap`.
     Applied {
         psnap: PolicySnapshot,
-        /// Connected nodes still valid under `psnap`.
+        /// Connected nodes still valid under `psnap` and still reachable by the visa
+        /// service: the nodes the caller pushes the new policy to.
         valid_node_addrs: Vec<IpAddr>,
-        /// VSS workers of the nodes disconnected under the guard, for the caller to
-        /// stop once it has released it.
+        /// VSS workers of the nodes disconnected or cut off under the guard, for the
+        /// caller to stop once it has released it.
         stopped_workers: Vec<(Option<crate::vss_mgr::VssHandle>, IpAddr)>,
         /// Link reconciliation result, returned after the workers are stopped.
         reconciled: Result<(), ServiceError>,
@@ -342,7 +360,8 @@ enum LockedPass {
 /// The topology part of a policy pass, under the caller's [TopoOps]: re-read the
 /// policy (installs commit under the same lock, so it stays current until the guard
 /// is dropped), read the live-node set and judge each node on it, disconnect the
-/// invalid ones, reconcile links and revoke visas over links taken down.
+/// invalid ones, reconcile links, revoke visas over links taken down and set apart
+/// the nodes those links cut off from the visa service ([nodes_cut_off]).
 ///
 /// `refreshed_vinst` is the policy the caller refreshed actor attributes for. If a
 /// newer policy has been installed since, the actors are stale for it: judging nodes
@@ -365,7 +384,7 @@ async fn policy_pass_locked(
     // The new policy may invalidate some existing nodes. Read the live-node set
     // under the guard, so the pass cannot re-add a node that has disconnected.
     let connected_node_addrs = asm.actor_mgr.list_node_addrs().await?;
-    let (valid_node_addrs, invalid_node_addrs) =
+    let (mut valid_node_addrs, invalid_node_addrs) =
         revalidate_nodes(asm, &psnap, connected_node_addrs).await;
 
     // Disconnect the nodes that are no longer approved by the new policy, under the
@@ -418,6 +437,20 @@ async fn policy_pass_locked(
                 for (a, b) in &report.links_down {
                     let _ = crate::visa_reconciler::revoke_visas_over_link(asm, a, b).await;
                 }
+
+                // A node those links cut off from the visa service gets nothing more
+                // over them (g101): every call would wait out its RPC timeout. Its VSS
+                // worker is stopped instead. Its VS-API session ran over the same
+                // link, so it rejoins (J10), and the rejoin starts a new worker.
+                let cut_off = nodes_cut_off(asm, &report.links_down);
+                valid_node_addrs.retain(|naddr| {
+                    if !cut_off.contains(naddr) {
+                        return true;
+                    }
+                    info!(target: EVENT, "policy updated vinst={vinst}: node {naddr} is cut off from the visa service, stopping its VSS worker");
+                    stopped_workers.push((asm.vss_mgr.get_handle(naddr), *naddr));
+                    false
+                });
             }
             Err(e) => reconciled = Err(e),
         }
@@ -431,33 +464,22 @@ async fn policy_pass_locked(
     })
 }
 
-/// Fan the `requestAuthentication` VSS call out to every listed node
-/// (zipline#123), mirroring [set_services_all_nodes]. Each node's address list
-/// is its own address (meaning "re-authenticate yourself to the VS") plus its
-/// docked adapters. Failures are logged: the deadline rule in `auth_sweep`
-/// re-sends to whoever still owes, so a missed request costs one sweep period,
-/// not the obligation.
-async fn request_auths_all_nodes(asm: &Arc<Assembly>, node_addrs: &[IpAddr]) {
-    stream::iter(node_addrs)
-        .for_each_concurrent(None, |naddr| {
-            let asm = asm.clone();
-            async move {
-                let mut addrs = vec![*naddr];
-                match asm.actor_mgr.get_adapters_connected_to_node(naddr).await {
-                    Ok(adapters) => addrs.extend(adapters),
-                    Err(e) => {
-                        error!(target: EVENT, "failed to list adapters of node {naddr} for reauth fan-out: {e}");
-                    }
-                }
-                debug!(target: EVENT, "requesting re-authentication of {} actor(s) via node {naddr}", addrs.len());
-                if let Some(vss_h) = asm.vss_mgr.get_handle(naddr) {
-                    if let Err(e) = vss_h.request_auths(addrs).await {
-                        error!(target: EVENT, "failed to request_auths on node {naddr}: {e}");
-                    }
-                }
-            }
-        })
-        .await;
+/// The ends of `links_down` the visa service can no longer reach: those with no
+/// route from the node it docks on (the relay). It reached them over a link the
+/// policy pass just took down. If the visa service is not docked, it reaches no node
+/// and none is set apart.
+fn nodes_cut_off(asm: &Assembly, links_down: &[(IpAddr, IpAddr)]) -> HashSet<IpAddr> {
+    let Some(dock) = asm
+        .actor_mgr
+        .get_docking_node_for_adapter(&asm.config.get_vs_addr())
+    else {
+        return HashSet::new();
+    };
+    links_down
+        .iter()
+        .flat_map(|&(a, b)| [a, b])
+        .filter(|naddr| asm.topo_mgr.get_best_route(&dock, naddr).is_none())
+        .collect()
 }
 
 /// A trusted service's attribute data changed (eg, an admin refreshed it). The
@@ -1352,6 +1374,131 @@ mod tests {
             repo.get_zpr_addr_for_hostname("keep-name").await.unwrap(),
             Some(addr),
             "reconciliation must not cost the actor its other names"
+        );
+    }
+
+    /// The next command a test VSS handle receives, or `None` if none arrives within
+    /// a second (or the channel closed).
+    async fn next_cmd(rx: &mut mpsc::Receiver<crate::vss::VssCmd>) -> Option<crate::vss::VssCmd> {
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// g101 (zl-zipline#252): a node whose VSS never answers -- here a test handle
+    /// nobody serves, standing in for a node behind a dead link, whose every RPC waits
+    /// out its timeout -- must not hold up the policy pass. Otherwise the next
+    /// install's pass, queued behind it on the event queue, never applies. The pass
+    /// still pushes to that node, per node and off the policy path.
+    #[tokio::test]
+    async fn test_policy_pass_does_not_wait_on_a_hung_vss() {
+        let (asm, node_a) = build_sweep_asm(false).await;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<crate::vss::VssCmd>(16);
+        asm.vss_mgr.insert_test_handle(node_a, cmd_tx);
+
+        let mut applied = Vec::new();
+        for _ in 0..2 {
+            asm.policy_mgr
+                .update_policy_from_container_bytes(make_node_join_policy(None))
+                .await
+                .unwrap();
+            let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+            tokio::time::timeout(Duration::from_secs(5), handle_policy_updated(&asm, vinst))
+                .await
+                .expect("the policy pass must not wait on a node's VSS")
+                .unwrap();
+            applied.push(vinst);
+        }
+
+        // Both passes ran to the end: each recorded its re-auth obligation.
+        let mut recorded: Vec<u64> = crate::db::ReauthRepo::new(asm.state_db.clone())
+            .list_obligations()
+            .await
+            .unwrap()
+            .iter()
+            .map(|o| o.vinst)
+            .collect();
+        recorded.sort();
+        assert_eq!(recorded, applied);
+        // The hung node still got its topology push.
+        let first = tokio::time::timeout(Duration::from_secs(1), cmd_rx.recv())
+            .await
+            .expect("the node's push runs off the policy path")
+            .unwrap();
+        assert!(matches!(first, crate::vss::VssCmd::SetTopology(..)));
+    }
+
+    /// g101 (zl-zipline#252): a policy that removes the only link between the node the
+    /// visa service docks on (the relay) and a Zode cuts the Zode off from the visa
+    /// service. The pass sends it nothing over the link it just removed -- no
+    /// topology, services or re-auth request -- and stops its VSS worker; the Zode
+    /// rejoins (J10). The relay, still reachable, gets its pushes.
+    #[tokio::test]
+    async fn test_policy_pass_sends_nothing_to_a_node_it_cut_off() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let relay: IpAddr = "fd5a:5052::2".parse().unwrap();
+        let zode: IpAddr = "fd5a:5052::3".parse().unwrap();
+        let cns = [(relay, "relay"), (zode, "zb")];
+        for (addr, cn) in cns {
+            asm.actor_mgr
+                .add_node(
+                    &make_node_actor_defexp(&addr.to_string(), cn, "10.0.0.1:1"),
+                    false,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            asm.topo_mgr.add_node(addr).unwrap();
+        }
+        asm.actor_mgr
+            .hack_set_vs_docking_node(&relay)
+            .await
+            .unwrap();
+        // The link is up in the router; the new policy no longer describes it.
+        asm.topo_mgr
+            .add_link(
+                relay,
+                zode,
+                libeval::route::LinkId("relay-zb".into()),
+                vec![],
+                1,
+            )
+            .unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(
+                crate::test_helpers::policy_with_peerings_and_node_cns(&[], &cns),
+            )
+            .await
+            .unwrap();
+        let (relay_tx, mut relay_rx) = mpsc::channel::<crate::vss::VssCmd>(16);
+        asm.vss_mgr.insert_test_handle(relay, relay_tx);
+        let (zode_tx, mut zode_rx) = mpsc::channel::<crate::vss::VssCmd>(16);
+        asm.vss_mgr.insert_test_handle(zode, zode_tx);
+
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        tokio::time::timeout(Duration::from_secs(5), handle_policy_updated(&asm, vinst))
+            .await
+            .expect("the policy pass must not wait on a node's VSS")
+            .unwrap();
+
+        assert!(
+            matches!(
+                next_cmd(&mut zode_rx).await,
+                Some(crate::vss::VssCmd::Stop())
+            ),
+            "the cut-off Zode's VSS worker is stopped"
+        );
+        assert!(
+            next_cmd(&mut zode_rx).await.is_none(),
+            "and nothing is pushed to it over the removed link"
+        );
+        assert!(
+            matches!(
+                next_cmd(&mut relay_rx).await,
+                Some(crate::vss::VssCmd::SetTopology(..))
+            ),
+            "the relay, still reachable, gets its topology"
         );
     }
 
