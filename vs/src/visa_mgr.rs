@@ -1044,13 +1044,41 @@ impl VisaMgr {
 /// The session key for a visa on `pdesc`: the source actor's A2A DH public key as the ingress
 /// key and the destination actor's as the egress key, or no keys at all unless both actors
 /// sent one.
+///
+/// A flow between a node and the visa service gets no keys either (gate g100). Those are a
+/// node's core visas -- its VSAPI pair (J5a), its VSS visa (J5b) and their renewals (J9) --
+/// and they must carry exactly the session keys of the visas they supersede, because a node
+/// refuses to rebind a live stream onto a visa whose session keys differ (J11). The first of
+/// them, the bootstrap pair, cannot carry keys: the joiner has not authenticated, so it has
+/// no authenticated key yet ([VisaMgr::mint_bootstrap_visa]). So none of them does. The
+/// traffic on these flows is the VS-API and VSS connections, which run over TLS of their
+/// own. (Neither TLS client verifies the server's certificate yet: see `vss_worker`.)
 async fn session_key_for(asm: &Assembly, pdesc: &PacketDesc) -> Result<KeySet, ServiceError> {
+    if is_node_vs_flow(asm, pdesc).await? {
+        return Ok(KeySet::new(&[], &[]));
+    }
     let ingress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.source_addr).await?;
     let egress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.dest_addr).await?;
     if ingress_key.is_empty() || egress_key.is_empty() {
         return Ok(KeySet::new(&[], &[]));
     }
     Ok(KeySet::new(&ingress_key, &egress_key))
+}
+
+/// True if `pdesc` runs between the visa service and a node, in either direction: the flows
+/// of a node's core visas (`core_visas`).
+async fn is_node_vs_flow(asm: &Assembly, pdesc: &PacketDesc) -> Result<bool, ServiceError> {
+    let vs = asm.config.get_vs_addr();
+    let ft = &pdesc.five_tuple;
+    let other = if ft.source_addr == vs {
+        ft.dest_addr
+    } else if ft.dest_addr == vs {
+        ft.source_addr
+    } else {
+        return Ok(false);
+    };
+    let actor = asm.actor_mgr.get_actor_by_zpr_addr(&other).await?;
+    Ok(actor.is_some_and(|a| a.is_node()))
 }
 
 /// Gets public key as bytes.

@@ -478,6 +478,39 @@ pub(crate) mod tests {
         out.try_into().unwrap()
     }
 
+    /// Register a distinct A2A DH public key on the stored actor of each of `addrs`, as a
+    /// node or the visa service does when it authenticates. With keys on both ends of a
+    /// flow, an ordinary visa carries them as its session keys.
+    pub(crate) async fn register_a2a_dh_keys(asm: &Assembly, addrs: &[IpAddr]) {
+        use libeval::pubkey::encode_public_key;
+        use zpr::vsapi_types::PublicKey;
+        for (i, addr) in addrs.iter().enumerate() {
+            let mut actor = asm
+                .actor_mgr
+                .get_actor_by_zpr_addr(addr)
+                .await
+                .unwrap()
+                .expect("actor must be stored");
+            let key = [i as u8 + 1; 32];
+            actor
+                .add_attribute(
+                    Attribute::builder(key::A2A_DH_PUBKEY)
+                        .value(encode_public_key(&PublicKey::new(&key))),
+                )
+                .unwrap();
+            asm.actor_mgr
+                .update_actor(&actor, &Default::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    /// True if `visa` carries no session keys at all.
+    fn has_no_session_keys(visa: &Visa) -> bool {
+        let keys = &visa.dock_pep.as_ref().expect("full visa").session_key;
+        keys.ingress_key.is_empty() && keys.egress_key.is_empty()
+    }
+
     /// The stored (full) visa for `id`.
     async fn stored(asm: &Assembly, id: u64) -> Visa {
         asm.visa_mgr
@@ -562,6 +595,55 @@ pub(crate) mod tests {
         // The forward visa ingresses at the Zode, the reverse one at the relay.
         assert_eq!(path_of(&asm, ids[0]).await, Some(vec![zode, relay]));
         assert_eq!(path_of(&asm, ids[1]).await, Some(vec![relay, zode]));
+    }
+
+    /// g100: a node's core visas -- its J5a VSAPI pair, its J5b VSS visa and their J9
+    /// renewals -- carry no session keys, even though the node and the visa service have
+    /// both registered A2A DH keys. The VSAPI pair's dock PEP, keys included, is then
+    /// identical to its bootstrap pair's, which is what lets a node rebind the live VS-API
+    /// stream onto it (J11 refuses a rebind across a change of session keys).
+    #[tokio::test]
+    async fn core_visas_carry_no_session_keys_even_when_both_ends_have_keys() {
+        let (asm, relay, zode) = build_net().await;
+        register_a2a_dh_keys(&asm, &[relay, zode, asm.config.get_vs_addr()]).await;
+        let bootstrap = mint_bootstrap_pair(&asm, &relay, &zode).await;
+
+        let issued = issue_all(&asm, &zode).await;
+        let at = renew_point(&asm, &issued).await;
+        let renewed = renew_core_visas(&asm, &zode, VSS_PORT, at).await.unwrap();
+        assert_eq!(renewed.len(), 3, "the VSAPI pair and the VSS visa");
+
+        for id in issued.iter().chain(&renewed) {
+            assert!(
+                has_no_session_keys(&stored(&asm, *id).await),
+                "core visa {id} carries session keys"
+            );
+        }
+        // Both VSAPI generations (J5a, then its J9 renewal) match the bootstrap pair's dock
+        // PEP byte for byte: same five-tuple, same (empty) session keys.
+        for pair in [&issued[..2], &renewed[..2]] {
+            for (id, old) in pair.iter().zip(bootstrap.iter()) {
+                let new = stored(&asm, *id).await;
+                assert_eq!(pep_tuple(&new), pep_tuple(old), "same five-tuple");
+                assert_eq!(new.dock_pep, old.dock_pep, "visa {id}: same dock PEP");
+            }
+        }
+    }
+
+    /// The g100 exception covers only flows between a node and the visa service: an
+    /// ordinary visa between two keyed actors -- here the relay and the Zode -- still
+    /// carries their keys, source as ingress and destination as egress.
+    #[tokio::test]
+    async fn a_visa_between_two_nodes_keeps_its_session_keys() {
+        let (asm, relay, zode) = build_net().await;
+        register_a2a_dh_keys(&asm, &[relay, zode, asm.config.get_vs_addr()]).await;
+
+        let ft = make_fivetuple_tcp(relay, zode, 0, VSS_PORT).unwrap();
+        let id = mint_core_visa(&asm, packet_for(&ft)).await.unwrap();
+
+        let keys = stored(&asm, id).await.dock_pep.unwrap().session_key;
+        assert_eq!(keys.ingress_key, vec![1u8; 32], "the relay's key");
+        assert_eq!(keys.egress_key, vec![2u8; 32], "the Zode's key");
     }
 
     /// A new session gets a new VSAPI pair and revokes nothing: neither the previous

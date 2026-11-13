@@ -4948,26 +4948,9 @@ mod tests {
         async fn bootstrap_visas_carry_no_session_keys() {
             tokio::task::LocalSet::new()
                 .run_until(async {
-                    use libeval::pubkey::encode_public_key;
+                    use crate::core_visas::tests::register_a2a_dh_keys;
                     let (asm, relay, zode) = join_net().await;
-                    for addr in [zode, asm.config.get_vs_addr()] {
-                        let mut actor = asm
-                            .actor_mgr
-                            .get_actor_by_zpr_addr(&addr)
-                            .await
-                            .unwrap()
-                            .unwrap();
-                        actor
-                            .add_attribute(
-                                Attribute::builder(key::A2A_DH_PUBKEY)
-                                    .value(encode_public_key(&PublicKey::new(&[7u8; 32]))),
-                            )
-                            .unwrap();
-                        asm.actor_mgr
-                            .update_actor(&actor, &Default::default())
-                            .await
-                            .unwrap();
-                    }
+                    register_a2a_dh_keys(&asm, &[zode, asm.config.get_vs_addr()]).await;
                     let bv = request(&handle_for(&asm, &relay).await, "zode.zpr")
                         .await
                         .unwrap();
