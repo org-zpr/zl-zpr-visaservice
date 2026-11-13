@@ -562,6 +562,18 @@ fn repropose_failed_pairs(asm: &Arc<Assembly>, ops: &TopoOps<'_>, node: &IpAddr)
     });
 }
 
+/// J5a: a VS-API session for `node` has just started (`authenticate`, or `open` for a
+/// reconnect), so issue the node its own VSAPI pair ([crate::core_visas::issue_vsapi_visas]).
+///
+/// A failure is logged, not returned: the session itself is good, and the node keeps
+/// working over its bootstrap pair. If that pair expires first, the session breaks and
+/// the node rejoins (J10), which starts a new session and tries again.
+async fn start_session_core_visas(asm: &Assembly, node: &IpAddr) {
+    if let Err(e) = crate::core_visas::issue_vsapi_visas(asm, node).await {
+        error!(target: API, "node {node}: failed to issue its VSAPI visas (J5a): {e}");
+    }
+}
+
 /// Helper to write an error into a capnp error builder with a retry of zero.
 fn write_error(bldr: &mut vsapi::error::Builder, code: vsapi::ErrorCode, message: &str) {
     bldr.set_code(code);
@@ -1056,6 +1068,8 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
 
         drop(ops);
 
+        start_session_core_visas(&self.asm, &node_zpr_addr).await;
+
         // Skip ahead to the handle:
         let vs_handle: vsapi::v_s_handle::Client =
             capnp_rpc::new_client(VSHandleImpl::new(self.asm.clone(), existing_actor));
@@ -1396,6 +1410,8 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
             );
         }
 
+        start_session_core_visas(&self.asm, &node_zpr_addr).await;
+
         let vs_handle: vsapi::v_s_handle::Client =
             capnp_rpc::new_client(VSHandleImpl::new(self.asm.clone(), node_actor));
         let mut res_builder = results.get().init_res();
@@ -1409,8 +1425,9 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
     /// Node should call this after it has authenticated itself and it has installed its
     /// ZPR address into its tables.
     ///
-    /// The VS must generate a visa for VISA->VSS communications and hand it back to
-    /// the node with this call.  Any pending visas for the node are handed back with this.
+    /// The VS mints a NEW visa for VS->VSS communications every time (J5b) and hands the
+    /// node its copy with this call. Everything else pending for the node is pushed over
+    /// VSS once the connection is up (gate g89 q4).
     ///
     async fn register_vss(
         self: Rc<Self>,
@@ -1526,11 +1543,10 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             vop.write_to(&mut vop_builder);
         }
 
-        // Now assume that our reply will make it to the node and mark the visas as installed.
-        //
-        // The node must assume that if it gets an error trying to call register_vss that
-        // there may be visas it is missing.  Since we don't have a way for the node to
-        // ask for its "installed" visas, for now node should call register_vss again.
+        // Now assume that our reply will make it to the node and mark its VSS visa as
+        // installed. That also releases the ingress (relay-side) copy of the visa to the
+        // relay's VSS push (ingress last, gate g89 q4). A node whose call fails calls
+        // register_vss again and gets a new VSS visa (J5b).
         //
         // TODO: Improve vsapi by adding a way for node to request its installed visas.
         // https://github.com/org-zpr/zpr-visaservice/issues/108
@@ -2698,6 +2714,53 @@ mod tests {
             asm.topo_mgr.get_peers(&b),
             vec![a],
             "expected exactly the link to the connected peer A"
+        );
+    }
+
+    /// J5a on `open` (a session reconnect): the node gets two new VSAPI visas, forward
+    /// and reverse, for its own session. `authenticate` calls the same
+    /// [start_session_core_visas].
+    #[tokio::test]
+    async fn open_issues_the_node_new_vsapi_visas() {
+        use crate::core_visas::tests::{ZODE, build_net};
+
+        let (asm, _relay, zode) = build_net().await;
+        let before = asm.visa_mgr.get_visa_ids_for_actors(&[zode]).await.unwrap();
+        assert!(before.is_empty());
+
+        let vs: vsapi::visa_service::Client = capnp_rpc::new_client(VisaServiceImpl {
+            asm: asm.clone(),
+            remote: SocketAddr::new(zode, 1234),
+        });
+        let mut req = vs.open_request();
+        {
+            let mut r = req.get().init_req();
+            r.set_cn("zode");
+            r.set_ctype(vsapi::VSConnT::Reconnect);
+            let mut p = r.init_params(1).get(0);
+            p.set_ptype(vsapi::ParamT::String);
+            p.set_name(pname::SUBSTRATE_ADDR);
+            p.set_value_text(format!("[{ZODE}]:5000"));
+        }
+        let resp = req.send().promise.await.unwrap();
+        assert!(matches!(
+            resp.get().unwrap().get_resp().unwrap().which().unwrap(),
+            vsapi::result::Which::Ok(_)
+        ));
+
+        let vs_addr = asm.config.get_vs_addr();
+        let mut tuples = Vec::new();
+        for id in asm.visa_mgr.get_visa_ids_for_actors(&[zode]).await.unwrap() {
+            let visa = asm.visa_mgr.get_visa_by_id(id).await.unwrap().unwrap();
+            let pep = visa.dock_pep.unwrap();
+            tuples.push((pep.source_addr, pep.dest_addr));
+        }
+        tuples.sort();
+        let mut want = vec![(zode, vs_addr), (vs_addr, zode)];
+        want.sort();
+        assert_eq!(
+            tuples, want,
+            "one new visa per direction of the VSAPI session"
         );
     }
 

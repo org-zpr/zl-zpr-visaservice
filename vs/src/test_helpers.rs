@@ -524,20 +524,30 @@ pub fn make_oidc_policy_with_proxy_service(
 /// `service_id` in its [key::SERVICES] attribute, and the flow's dest port must
 /// be `port` (zipline#167 regression test).
 pub fn make_allow_policy_for_tcp_service(service_id: &str, port: u16) -> Vec<u8> {
+    make_allow_policy_for_tcp_services(&[(service_id, port)])
+}
+
+/// As [make_allow_policy_for_tcp_service], with one unconditional ALLOW
+/// communication policy per `(service_id, port)`.
+pub fn make_allow_policy_for_tcp_services(services: &[(&str, u16)]) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
     {
         let mut policy_bldr = msg.init_root::<capnp_policy::policy::Builder>();
         policy_bldr.set_created("2024-01-01T00:00:00Z");
         policy_bldr.set_version(1);
         policy_bldr.set_metadata("");
-        let mut coms = policy_bldr.reborrow().init_com_policies(1);
-        let mut com = coms.reborrow().get(0);
-        com.set_allow(true);
-        com.set_service_id(service_id);
-        let mut scopes = com.reborrow().init_scope(1);
-        let mut scope = scopes.reborrow().get(0);
-        scope.set_protocol(6); // TCP
-        scope.init_port().set_port_num(port);
+        let mut coms = policy_bldr
+            .reborrow()
+            .init_com_policies(services.len() as u32);
+        for (i, (service_id, port)) in services.iter().enumerate() {
+            let mut com = coms.reborrow().get(i as u32);
+            com.set_allow(true);
+            com.set_service_id(service_id);
+            let mut scopes = com.reborrow().init_scope(1);
+            let mut scope = scopes.reborrow().get(0);
+            scope.set_protocol(6); // TCP
+            scope.init_port().set_port_num(*port);
+        }
     }
     let mut bytes = Vec::new();
     capnp::serialize::write_message(&mut bytes, &msg).unwrap();

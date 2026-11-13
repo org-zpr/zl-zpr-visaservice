@@ -349,7 +349,9 @@ async fn send_pending_visas(
     node_addr: &IpAddr,
     vss_handle: &v1::v_s_s_handle::Client,
 ) {
-    match asm.visa_mgr.get_pending_visas_for_node(node_addr).await {
+    // Ingress copies wait for the other hops' acks (gate g89 q4): see
+    // `VisaMgr::deliverable_visas_for_node`.
+    match asm.visa_mgr.deliverable_visas_for_node(node_addr).await {
         Ok(pending_visas) => {
             let mut actualized = Vec::new();
             for visa in pending_visas {

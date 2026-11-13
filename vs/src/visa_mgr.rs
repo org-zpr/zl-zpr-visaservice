@@ -18,7 +18,6 @@ use crate::visa_bootstrap::{BOOTSTRAP_VISA_ZPL, path_for_future_peer};
 use crate::visa_policy::{
     PolicyOutcome, docking_node_for_addr, evaluate_against_policy, route_for_allow,
 };
-use crate::visareq_worker::{VisaDecision, request_visa_wait_response};
 
 use libeval::eval_result::{Direction, Hit};
 use libeval::policy::Policy;
@@ -106,7 +105,7 @@ async fn path_for_flow(
 /// True if the visa's dock PEP is for exactly this five-tuple: both addresses and both TCP
 /// ports. A visa with no dock PEP cannot match -- only full visas are stored, so that is a bug
 /// worth logging.
-fn dock_pep_matches_five_tuple(visa: &Visa, ft: &VsapiFiveTuple) -> bool {
+pub(crate) fn dock_pep_matches_five_tuple(visa: &Visa, ft: &VsapiFiveTuple) -> bool {
     let Some(dock_pep) = visa.dock_pep.as_ref() else {
         warn!(target: VISA, "found visa in store with no dock_pep ID={}", visa.issuer_id);
         return false;
@@ -222,62 +221,25 @@ impl VisaMgr {
         }
     }
 
-    /// Used when a node has already connected to the VS via the VSAPI and has called
-    /// `register_vss`.
+    /// The visas for the `register_vss` reply of `node_addr`, which has just registered
+    /// its VSS at `vss_addr`: only the node's copy of a NEW VS->VSS visa (J5b, see
+    /// [crate::core_visas::issue_vss_visa]).
     ///
-    /// Creates visas for:
-    /// - allow visa service to talk to node VSS.
-    ///
-    /// `node_addr` - The node, already connected and has just called `register_vss` over
-    /// VSAPI.  The idea is that the VS is next going to open a connection back to the node's
-    /// VSS so this can preempt the visa request.
-    ///
-    /// The visas returned here are any pending visas that should be installed on the
-    /// node `node_addr` which has just called to initialize vss.  If there are intermediary
-    /// nodes between the VS and `node_addr` those other visas are also created and set
-    /// PENDING on the relevant nodes -- but are not returned here.
-    ///
+    /// That copy has to ride in the reply: it is what lets the visa service open the VSS
+    /// connection, so it cannot be pushed over it. Everything else pending for the node --
+    /// its J5a VSAPI pair included -- is pushed over VSS once that connection is up, in
+    /// ingress-last order (gate g89 q4, see [VisaMgr::deliverable_visas_for_node]).
     pub async fn post_register_vss_visas_for_node(
         &self,
         asm: Arc<Assembly>,
         node_addr: &IpAddr,
         vss_addr: &SocketAddr,
     ) -> Result<Vec<Visa>, ServiceError> {
-        let mut visas = Vec::new();
-
-        // Start with any visas that may already be pending.
-        if let Ok(pendings) = self.get_pending_visas_for_node(node_addr).await {
-            for v in pendings {
-                let av = self.actualize_visa_for_target_node(v, node_addr).await?;
-                visas.push(av);
-            }
-        }
-
-        // The node may be reconnecting, in which case it may already have the core visas installed.
-        let vs_node_ft = make_fivetuple_tcp(
-            asm.config.get_vs_addr(),
-            node_addr.clone(),
-            0,
-            vss_addr.port(),
-        )?;
-        let has_vs_to_node_visa = self
-            .get_node_visa_by_five_tuple(node_addr, &vs_node_ft)
-            .await?
-            .is_some();
-
-        if !has_vs_to_node_visa {
-            let cres = self
-                .create_vs_to_node_vss_visa(asm.clone(), node_addr, vss_addr.port())
-                .await?;
-            let cres = self.actualize_visa_for_target_node(cres, node_addr).await?;
-            visas.push(cres);
-        } else {
-            debug!(
-                target: VISA,
-                "node {node_addr} already has VS->VSS visa installed, skipping creation"
-            );
-        }
-        Ok(visas)
+        let visa_id = crate::core_visas::issue_vss_visa(&asm, node_addr, vss_addr.port()).await?;
+        let visa = self.repo.get_visa_by_id(visa_id)?;
+        Ok(vec![
+            self.actualize_visa_for_target_node(visa, node_addr).await?,
+        ])
     }
 
     /// Mint (or reuse) one direction of the bootstrap flow that lets a not-yet-connected peer
@@ -406,16 +368,6 @@ impl VisaMgr {
         }
     }
 
-    /// Find a visa *installed* on the node matching the given five-tuple.
-    pub async fn get_node_visa_by_five_tuple(
-        &self,
-        node_addr: &IpAddr,
-        ft: &VsapiFiveTuple,
-    ) -> Result<Option<Visa>, ServiceError> {
-        self.find_node_visa_by_five_tuple(node_addr, ft, &[db::NodeVisaState::Installed], None)
-            .await
-    }
-
     /// Use a linear search of the node's visas in any of `states` to find a five-tuple match.
     ///
     /// `relay`, when given, additionally requires the visa's path to put that node next to
@@ -450,64 +402,6 @@ impl VisaMgr {
             }
         }
         Ok(None)
-    }
-
-    /// Ask policy for a visa permitting this visa service to talk to the given node VSS addr.
-    /// Creating the visa has the side effect of storing it and marking it PENDING on every
-    /// node along the path.
-    ///
-    /// `node_addr` - node ZPR address hosting the VSS.
-    ///
-    /// `node_addr` is passed as the requesting node even though the flow runs the other way:
-    /// it is the node whose reply carries the visa (see
-    /// [VisaMgr::post_register_vss_visas_for_node]), and that is all `requesting_node` still
-    /// selects -- who is excluded from the background push. Path geometry comes from the
-    /// flow's source instead, see [path_for_flow].
-    async fn create_vs_to_node_vss_visa(
-        &self,
-        asm: Arc<Assembly>,
-        node_addr: &IpAddr,
-        vss_port: u16,
-    ) -> Result<Visa, ServiceError> {
-        // TODO: We may have this visa on hand already, if so return it and do not re-generate.
-
-        let pkt_data =
-            PacketDesc::new_tcp_with_addr(asm.config.get_vs_addr(), *node_addr, 0, vss_port)?;
-
-        // TODO: This call to return a FULL visa plus Route info.
-        // then we need to do some work.
-        self.create_visa_for_packet(asm, pkt_data, node_addr).await
-    }
-
-    /// `requesting_node_addr` - The visa is created as if this node has requested it.
-    ///
-    /// The returned visa is a full visa (TODO: return route info).
-    /// The visa needs to be crunched through PATH to determine what is sent to `requesting_node_addr` node.
-    async fn create_visa_for_packet(
-        &self,
-        asm: Arc<Assembly>,
-        pkt_data: PacketDesc,
-        requesting_node_addr: &IpAddr,
-    ) -> Result<Visa, ServiceError> {
-        // This will end up calling into `create_visa` which means we get a route
-        // and state will have been updated if any visas need to be sent to nodes.
-        //
-        // When it comes time to actually deliver a visa to a node
-        // we can use the PATH to create correct visa contents. The visa stored in state
-        // by ID is the FULL visa.
-        //
-        match request_visa_wait_response(
-            &asm,
-            requesting_node_addr,
-            pkt_data,
-            config::DEFAULT_VISA_REQ_TIMEOUT,
-        )
-        .await
-        {
-            Ok(VisaDecision::Allow(visa, _route)) => Ok(visa), // TODO: do something with the route
-            Ok(VisaDecision::Deny(dcode)) => Err(ServiceError::VisaDenied(dcode.to_string())),
-            Err(e) => Err(e),
-        }
     }
 
     /// Placeholder implementation, called concurrently.
@@ -754,6 +648,44 @@ impl VisaMgr {
             .filter(|v| !quarantined.contains(&v.issuer_id))
             .collect();
         Ok(visas)
+    }
+
+    /// The visas pending on `node_addr` that may be pushed to it now: those from
+    /// [VisaMgr::get_pending_visas_for_node], minus any copy for the *ingress* of a visa's
+    /// path (its first node) while another node on the path has not yet acknowledged its
+    /// own copy.
+    ///
+    /// This is the "ingress last" rule (gate g89 q4, ZODE_LINKS.md J11). The ingress is
+    /// where a flow enters the fabric, and installing a visa there is what makes the node
+    /// use it -- for a visa superseding one with the same five-tuple, it starts the rebind.
+    /// Holding the ingress copy back until every other hop holds its copy means the rebind
+    /// never reaches a hop that cannot bind it. The VSS worker's push goes through here, so
+    /// the rule holds whichever order the acknowledgements arrive in. A visa with no path
+    /// has one node and no ordering.
+    pub async fn deliverable_visas_for_node(
+        &self,
+        node_addr: &IpAddr,
+    ) -> Result<Vec<Visa>, ServiceError> {
+        let pending = self.get_pending_visas_for_node(node_addr).await?;
+        Ok(pending
+            .into_iter()
+            .filter(|v| self.other_hops_installed_if_ingress(v.issuer_id, node_addr))
+            .collect())
+    }
+
+    /// True unless `node_addr` is the first node of the visa's path and some other node on
+    /// the path has not acknowledged its copy (is not `Installed`). See
+    /// [VisaMgr::deliverable_visas_for_node].
+    fn other_hops_installed_if_ingress(&self, visa_id: u64, node_addr: &IpAddr) -> bool {
+        let Ok(md) = self.repo.get_visa_metadata_by_id(visa_id) else {
+            return false; // gone meanwhile: nothing to deliver
+        };
+        match md.path.as_deref() {
+            Some([ingress, rest @ ..]) if ingress == node_addr => rest.iter().all(|hop| {
+                self.repo.get_node_visa_state(visa_id, hop) == Some(db::NodeVisaState::Installed)
+            }),
+            _ => true,
+        }
     }
 
     /// Whether `visa_id` may still be granted to `node_addr`: staged there as
@@ -1077,13 +1009,23 @@ impl VisaMgr {
         if actor_addrs.is_empty() {
             return Ok(());
         }
-        for id in self.get_visa_ids_for_actors(actor_addrs).await? {
+        let ids = self.get_visa_ids_for_actors(actor_addrs).await?;
+        self.revoke_visa_ids(&ids).await;
+        Ok(())
+    }
+
+    /// Revoke each of `ids` everywhere: mark every node holding it `PendingRevoke`, so VSS
+    /// housekeeping revokes it from those nodes and removes it on their acks. A visa with
+    /// no node left to revoke from is removed at once instead of waiting for its TTL.
+    /// Failures are logged and the rest carry on. The visas themselves are never changed.
+    pub async fn revoke_visa_ids(&self, ids: &[u64]) {
+        for &id in ids {
             // Log-and-continue: one failure must not strand the remaining visas.
             match self.repo.mark_visa_revoked(id).await {
                 Ok(true) => {}
                 Ok(false) => continue, // vanished/expired between query and mark
                 Err(e) => {
-                    warn!(target: VISA, "failed to mark visa {id} revoked for departed actor: {e}");
+                    warn!(target: VISA, "failed to mark visa {id} revoked: {e}");
                     continue;
                 }
             }
@@ -1094,7 +1036,6 @@ impl VisaMgr {
                 }
             }
         }
-        Ok(())
     }
 
     /// Drop expired visas from the in-memory store. Called by housekeeping.
@@ -1295,7 +1236,7 @@ mod tests {
         .unwrap();
 
         let result = mgr
-            .get_node_visa_by_five_tuple(&node_addr, &ft)
+            .find_node_visa_by_five_tuple(&node_addr, &ft, &[db::NodeVisaState::Installed], None)
             .await
             .unwrap();
 
@@ -1317,7 +1258,7 @@ mod tests {
         .unwrap();
 
         let result = mgr
-            .get_node_visa_by_five_tuple(&node_addr, &ft)
+            .find_node_visa_by_five_tuple(&node_addr, &ft, &[db::NodeVisaState::Installed], None)
             .await
             .unwrap();
 
@@ -1353,7 +1294,7 @@ mod tests {
         .unwrap();
 
         let result = mgr
-            .get_node_visa_by_five_tuple(&node_addr, &ft)
+            .find_node_visa_by_five_tuple(&node_addr, &ft, &[db::NodeVisaState::Installed], None)
             .await
             .unwrap();
 
@@ -1390,7 +1331,7 @@ mod tests {
         .unwrap();
 
         let result = mgr
-            .get_node_visa_by_five_tuple(&node_addr, &ft)
+            .find_node_visa_by_five_tuple(&node_addr, &ft, &[db::NodeVisaState::Installed], None)
             .await
             .unwrap();
 
@@ -2704,6 +2645,55 @@ mod tests {
             .store_visa(&visa, md, db::NodeVisaState::Installed)
             .await
             .unwrap();
+    }
+
+    /// Ingress last (gate g89 q4, ZODE_LINKS.md J11): on a three-node path [A, B, C] the
+    /// ingress A's pending copy is held back until B and C have both acknowledged theirs.
+    /// B and C are deliverable from the start.
+    #[tokio::test]
+    async fn test_ingress_copy_deliverable_only_after_every_other_node_installed() {
+        let mgr = make_mgr().await;
+        let a: IpAddr = "fd5a:5052::a".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::b".parse().unwrap();
+        let c: IpAddr = "fd5a:5052::c".parse().unwrap();
+        let visa = make_visa(820, Duration::from_secs(60));
+        let md = db::VisaMetadata::new(
+            a,
+            0,
+            0,
+            String::new(),
+            Direction::Forward,
+            Some(vec![a, b, c]),
+            &make_pdesc(),
+        );
+        mgr.repo
+            .store_visa(&visa, md, db::NodeVisaState::PendingInstall)
+            .await
+            .unwrap();
+        let has = |v: Vec<Visa>| v.iter().any(|v| v.issuer_id == 820);
+
+        assert!(has(mgr.deliverable_visas_for_node(&b).await.unwrap()));
+        assert!(has(mgr.deliverable_visas_for_node(&c).await.unwrap()));
+        assert!(!has(mgr.deliverable_visas_for_node(&a).await.unwrap()));
+
+        mgr.visa_installed(820, &b).await.unwrap();
+        assert!(
+            !has(mgr.deliverable_visas_for_node(&a).await.unwrap()),
+            "C has not acknowledged yet"
+        );
+
+        mgr.visa_installed(820, &c).await.unwrap();
+        assert!(has(mgr.deliverable_visas_for_node(&a).await.unwrap()));
+    }
+
+    /// A visa with no path has no ingress ordering: its one node gets it at once.
+    #[tokio::test]
+    async fn test_pathless_visa_is_deliverable_at_once() {
+        let mgr = make_mgr().await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        store_node_visa(&mgr, 821, node, db::NodeVisaState::PendingInstall).await;
+        let ready = mgr.deliverable_visas_for_node(&node).await.unwrap();
+        assert!(ready.iter().any(|v| v.issuer_id == 821));
     }
 
     /// Multihop [A, B, C] visa; intermediary B departs. The visa's other nodes go
