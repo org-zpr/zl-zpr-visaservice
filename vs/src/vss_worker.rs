@@ -130,7 +130,7 @@ pub async fn vss_worker_loop(
 
     info!(target: VSS, "now connected to VSS at {}", node_addr);
     let mut state = VssState::default();
-    do_housekeeping(&mut state, &asm, &node_addr.ip(), &vss_handle).await;
+    do_housekeeping(&mut state, &asm, &node_addr, &vss_handle).await;
 
     let ping_timeout = tokio::time::sleep(config::VSS_PING_INTERVAL);
     tokio::pin!(ping_timeout);
@@ -202,7 +202,7 @@ pub async fn vss_worker_loop(
             }
 
             _ = heartbeat.tick() => {
-                do_housekeeping(&mut state, &asm, &node_addr.ip(), &vss_handle).await;
+                do_housekeeping(&mut state, &asm, &node_addr, &vss_handle).await;
             }
 
             () = &mut ping_timeout => {
@@ -313,12 +313,15 @@ async fn vss_connect(
     }
 }
 
+/// One heartbeat of the worker for the node whose VSS listens on `vss_addr`: the initial
+/// configuration sends, J9 core-visa renewal, then the pending visa and revoke queues.
 async fn do_housekeeping(
     state: &mut VssState,
     asm: &Arc<Assembly>,
-    node_addr: &IpAddr,
+    vss_addr: &SocketAddr,
     vss_handle: &v1::v_s_s_handle::Client,
 ) {
+    let node_addr = &vss_addr.ip();
     // Currently these three items are all onoly part of intiial VSS connection.
     // Once they are sent, they are not sent again.
     if state.needs_configure() {
@@ -334,6 +337,19 @@ async fn do_housekeeping(
     // Drop any expired visas from the in-memory store before working the queues.
     if let Err(e) = asm.visa_mgr.purge_expired_visas() {
         warn!(target: VSS, "failed to purge expired visas: {e}");
+    }
+
+    // J9: renew the node's core visas before they expire. Their copies are queued
+    // pending-install, so the push just below starts delivering them (ingress last).
+    if let Err(e) = crate::core_visas::renew_core_visas(
+        asm,
+        node_addr,
+        vss_addr.port(),
+        std::time::SystemTime::now(),
+    )
+    .await
+    {
+        warn!(target: VSS, "core visa renewal for node {node_addr} failed, retrying next heartbeat: {e}");
     }
 
     send_pending_visas(asm, node_addr, vss_handle).await;

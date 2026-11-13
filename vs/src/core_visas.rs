@@ -30,6 +30,7 @@
 //! The node is the egress of that flow, so its copy goes first either way.
 
 use std::net::IpAddr;
+use std::time::SystemTime;
 
 use libeval::attribute::key;
 use tracing::{debug, info};
@@ -41,7 +42,7 @@ use crate::error::ServiceError;
 use crate::logging::targets::VISA;
 use crate::packet::make_fivetuple_tcp;
 use crate::visa_bootstrap::BOOTSTRAP_VISA_ZPL;
-use crate::visa_mgr::dock_pep_matches_five_tuple;
+use crate::visa_mgr::{VisaWithMetadata, dock_pep_matches_five_tuple};
 use crate::visa_policy::docking_node_for_addr;
 use crate::visareq_worker::{VisaDecision, request_visa_wait_response};
 
@@ -159,6 +160,75 @@ pub(crate) async fn issue_vss_visa(
     Ok(id)
 }
 
+/// J9 threshold (gate g89 q3): a core visa is renewed once this fraction of its lifetime,
+/// `(numerator, denominator)`, has passed. 2/3 leaves the last third for the push, the
+/// rebind (J11) and retries on later heartbeats, while the current visas still work.
+const RENEW_AT: (u32, u32) = (2, 3);
+
+/// Whether a visa created at `created` and expiring at `expires` has reached [RENEW_AT] of
+/// its lifetime at `now`. A visa that expires before it was created is nonsense, so due.
+fn renewal_due(created: SystemTime, expires: SystemTime, now: SystemTime) -> bool {
+    let Ok(lifetime) = expires.duration_since(created) else {
+        return true;
+    };
+    now >= created + lifetime * RENEW_AT.0 / RENEW_AT.1
+}
+
+/// J9: renew `node`'s core visas before they expire. For each of the three -- the VSAPI pair
+/// and the VSS visa on `vss_port` -- the newest one still grantable to the node is looked
+/// at, and once it has reached [RENEW_AT] of its lifetime at `now`, a NEW visa is minted for
+/// the same five-tuple and delivered in ingress-last order, like every core visa. Returns
+/// the new IDs.
+///
+/// The visa being renewed is never touched: it keeps working until the node has rebound
+/// onto the new one (J11), then expires on its own. Only the newest visa per five-tuple
+/// counts, so a renewed generation is not renewed again: right after a renewal the newest
+/// is the fresh visa.
+///
+/// Runs on the node's VSS worker heartbeat (`vss_worker::do_housekeeping`): the worker
+/// exists only while the node has a registered VSS, which is the connection the renewal is
+/// pushed over, and the heartbeat is also what retries a push that failed. That makes a
+/// per-node timer unnecessary. A failed mint is retried by the next heartbeat too, since the
+/// old visa is still due then. A node with no VS-API session (no stored node actor) gets
+/// nothing: it comes back through a rejoin (J10). A five-tuple with no core visa at all is
+/// skipped; issuing them is J5a/J5b's job.
+pub(crate) async fn renew_core_visas(
+    asm: &Assembly,
+    node: &IpAddr,
+    vss_port: u16,
+    now: SystemTime,
+) -> Result<Vec<u64>, ServiceError> {
+    // Under the issuance lock: a renewal must not interleave with a session's
+    // issue-and-supersede step (see [ISSUE_LOCK]).
+    let _issuing = ISSUE_LOCK.lock().await;
+    match asm.actor_mgr.get_actor_by_zpr_addr(node).await? {
+        Some(actor) if actor.is_node() => {}
+        _ => {
+            debug!(target: VISA, "node {node} has no VS-API session: no core-visa renewal");
+            return Ok(Vec::new());
+        }
+    }
+    let [fwd, rev] = vsapi_five_tuples(asm, node)?;
+    let mut renewed = Vec::new();
+    for ft in [fwd, rev, vss_five_tuple(asm, node, vss_port)?] {
+        let newest = core_visas_for(asm, node, &ft)
+            .await?
+            .into_iter()
+            .filter(|vwm| asm.visa_mgr.still_grantable(vwm.visa.issuer_id, node))
+            .max_by_key(|vwm| vwm.visa.issuer_id); // IDs only go up
+        let Some(current) = newest else {
+            continue;
+        };
+        if !renewal_due(current.metadata.ctime, current.visa.expires, now) {
+            continue;
+        }
+        let id = mint_core_visa(asm, packet_for(&ft)).await?;
+        info!(target: VISA, "node {node}: core visa {} renewed as {id} (J9)", current.visa.issuer_id);
+        renewed.push(id);
+    }
+    Ok(renewed)
+}
+
 /// The packet a core visa is requested for. TCP, both directions allowed: the dock PEP the
 /// pipeline derives from it keeps the wildcard port where `ft` has it.
 fn packet_for(ft: &VsapiFiveTuple) -> PacketDesc {
@@ -190,10 +260,28 @@ async fn mint_core_visa(asm: &Assembly, pkt: PacketDesc) -> Result<u64, ServiceE
     }
 }
 
-/// Revoke every visa with `node` as an endpoint whose dock PEP is one of `fts` and whose ID
-/// is below `first_new` (the lowest ID just minted; IDs only go up), except the node's
-/// bootstrap visas (left to expire, J5c). These are the core visas a newer issue has just
-/// superseded. They are revoked, never edited.
+/// `node`'s core visas for `ft`: every live visa with `node` as an endpoint whose dock PEP
+/// is `ft`, except the node's bootstrap visas, which are not core visas (J5c).
+async fn core_visas_for(
+    asm: &Assembly,
+    node: &IpAddr,
+    ft: &VsapiFiveTuple,
+) -> Result<Vec<VisaWithMetadata>, ServiceError> {
+    let mut out = Vec::new();
+    for id in asm.visa_mgr.get_visa_ids_for_actors(&[*node]).await? {
+        let Some(vwm) = asm.visa_mgr.get_visa_with_metadata_by_id(id).await? else {
+            continue; // expired meanwhile
+        };
+        if vwm.metadata.zpl != BOOTSTRAP_VISA_ZPL && dock_pep_matches_five_tuple(&vwm.visa, ft) {
+            out.push(vwm);
+        }
+    }
+    Ok(out)
+}
+
+/// Revoke `node`'s core visas for each of `fts` whose ID is below `first_new` (the lowest
+/// ID just minted; IDs only go up): the visas a newer issue has just superseded. They are
+/// revoked, never edited. Bootstrap visas are not core visas and are left to expire (J5c).
 async fn revoke_superseded(
     asm: &Assembly,
     node: &IpAddr,
@@ -201,21 +289,11 @@ async fn revoke_superseded(
     first_new: u64,
 ) -> Result<(), ServiceError> {
     let mut superseded = Vec::new();
-    for id in asm.visa_mgr.get_visa_ids_for_actors(&[*node]).await? {
-        if id >= first_new {
-            continue;
-        }
-        let Some(vwm) = asm.visa_mgr.get_visa_with_metadata_by_id(id).await? else {
-            continue; // expired meanwhile
-        };
-        if vwm.metadata.zpl == BOOTSTRAP_VISA_ZPL {
-            continue;
-        }
-        if fts
-            .iter()
-            .any(|ft| dock_pep_matches_five_tuple(&vwm.visa, ft))
-        {
-            superseded.push(id);
+    for ft in fts {
+        for vwm in core_visas_for(asm, node, ft).await? {
+            if vwm.visa.issuer_id < first_new {
+                superseded.push(vwm.visa.issuer_id);
+            }
         }
     }
     if !superseded.is_empty() {
@@ -604,5 +682,148 @@ pub(crate) mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(delivered, "after the relay's ack the Zode's copy goes out");
+    }
+
+    // ---- J9 renewal ----
+
+    /// Give the actor at `addr` a `zpr.services` attribute (the provider attribute that bounds
+    /// these visas' lifetime in this policy) expiring in `expiry`.
+    async fn set_services_expiry(asm: &Assembly, addr: &IpAddr, expiry: Duration) {
+        let mut actor = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(addr)
+            .await
+            .unwrap()
+            .unwrap();
+        let services: Vec<String> = actor
+            .get_attribute(key::SERVICES)
+            .unwrap()
+            .get_value()
+            .to_vec();
+        actor
+            .add_attribute(
+                Attribute::builder(key::SERVICES)
+                    .expires_in(expiry)
+                    .values(services.iter().map(String::as_str)),
+            )
+            .unwrap();
+        asm.actor_mgr
+            .update_actor(&actor, &Default::default())
+            .await
+            .unwrap();
+    }
+
+    /// Issue the Zode its three core visas (J5a, J5b); returns them forward VSAPI, reverse
+    /// VSAPI, VSS.
+    async fn issue_all(asm: &Arc<Assembly>, zode: &IpAddr) -> [u64; 3] {
+        let [fwd, rev] = issue_vsapi_visas(asm, zode, None).await.unwrap();
+        let vss = issue_vss_visa(asm, zode, VSS_PORT, None).await.unwrap();
+        [fwd, rev, vss]
+    }
+
+    /// The earliest instant at which every one of `ids` has reached [RENEW_AT].
+    async fn renew_point(asm: &Assembly, ids: &[u64]) -> std::time::SystemTime {
+        let mut latest = std::time::UNIX_EPOCH;
+        for id in ids {
+            let vwm = asm
+                .visa_mgr
+                .get_visa_with_metadata_by_id(*id)
+                .await
+                .unwrap()
+                .unwrap();
+            let life = vwm.visa.expires.duration_since(vwm.metadata.ctime).unwrap();
+            latest = latest.max(vwm.metadata.ctime + life * RENEW_AT.0 / RENEW_AT.1);
+        }
+        latest
+    }
+
+    #[test]
+    fn renewal_is_due_from_two_thirds_of_the_lifetime() {
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let exp = t + Duration::from_secs(3 * 3600);
+        assert!(!renewal_due(t, exp, t));
+        assert!(!renewal_due(t, exp, t + Duration::from_secs(2 * 3600 - 1)));
+        assert!(renewal_due(t, exp, t + Duration::from_secs(2 * 3600)));
+        assert!(renewal_due(t, exp, exp + Duration::from_secs(1)));
+    }
+
+    /// Nothing is renewed before RENEW_AT.
+    #[tokio::test]
+    async fn nothing_is_renewed_before_renew_at() {
+        let (asm, _relay, zode) = build_net().await;
+        let ids = issue_all(&asm, &zode).await;
+        let before = asm.visa_mgr.get_visa_ids_for_actors(&[zode]).await.unwrap();
+
+        let at = renew_point(&asm, &ids).await - Duration::from_secs(5);
+        let renewed = renew_core_visas(&asm, &zode, VSS_PORT, at).await.unwrap();
+
+        assert!(renewed.is_empty());
+        let after = asm.visa_mgr.get_visa_ids_for_actors(&[zode]).await.unwrap();
+        assert_eq!(after.len(), before.len());
+    }
+
+    /// At RENEW_AT three NEW visas appear for the identical five-tuples, and the old ones are
+    /// unchanged: same expiry, not revoked (they expire on their own, J9).
+    #[tokio::test]
+    async fn at_renew_at_three_new_visas_replace_nothing() {
+        let (asm, relay, zode) = build_net().await;
+        let old = issue_all(&asm, &zode).await;
+        let mut old_visas = Vec::new();
+        for id in old {
+            old_visas.push(stored(&asm, id).await);
+        }
+
+        let at = renew_point(&asm, &old).await;
+        let renewed = renew_core_visas(&asm, &zode, VSS_PORT, at).await.unwrap();
+
+        assert_eq!(renewed.len(), 3, "the VSAPI pair and the VSS visa");
+        for (new_id, old) in renewed.iter().zip(old_visas.iter()) {
+            assert!(!old_visas.iter().any(|o| o.issuer_id == *new_id), "new IDs");
+            assert_eq!(pep_tuple(&stored(&asm, *new_id).await), pep_tuple(old));
+            let old_now = stored(&asm, old.issuer_id).await;
+            assert_eq!(old_now.expires, old.expires, "old visa untouched");
+            assert!(not_revoked(&asm, old.issuer_id, &[relay, zode]).await);
+        }
+    }
+
+    /// A node with no VS-API session gets nothing: its rejoin (J10) brings it back.
+    #[tokio::test]
+    async fn a_disconnected_node_gets_no_renewal() {
+        let (asm, _relay, zode) = build_net().await;
+        let ids = issue_all(&asm, &zode).await;
+        let at = renew_point(&asm, &ids).await;
+        // The node disconnects: its node state and its actor record go.
+        asm.actor_mgr.remove_node(&zode).await.unwrap();
+        asm.actor_mgr.remove_actor_by_zpr_addr(&zode).await.unwrap();
+        let before = asm.visa_mgr.get_visa_ids_for_actors(&[zode]).await.unwrap();
+
+        let renewed = renew_core_visas(&asm, &zode, VSS_PORT, at).await.unwrap();
+
+        assert!(renewed.is_empty());
+        let after = asm.visa_mgr.get_visa_ids_for_actors(&[zode]).await.unwrap();
+        assert_eq!(after.len(), before.len());
+    }
+
+    /// A generation is renewed once. Here the first generation is short-lived and the second
+    /// long-lived, so at one instant the first is past RENEW_AT and the second is not: a
+    /// second check at that instant must mint nothing.
+    #[tokio::test]
+    async fn a_generation_is_renewed_only_once() {
+        let (asm, relay, zode) = build_net().await;
+        let vs_addr = asm.config.get_vs_addr();
+        for addr in [vs_addr, zode] {
+            set_services_expiry(&asm, &addr, Duration::from_secs(90)).await;
+        }
+        let first = issue_all(&asm, &zode).await;
+        for addr in [vs_addr, zode] {
+            set_services_expiry(&asm, &addr, Duration::from_secs(3600)).await;
+        }
+        let at = renew_point(&asm, &first).await;
+
+        let second = renew_core_visas(&asm, &zode, VSS_PORT, at).await.unwrap();
+        assert_eq!(second.len(), 3);
+        let again = renew_core_visas(&asm, &zode, VSS_PORT, at).await.unwrap();
+        assert!(again.is_empty(), "the first generation was already renewed");
+        let _ = relay;
     }
 }
