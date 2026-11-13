@@ -396,6 +396,20 @@ impl TopologyMgr {
         self.link_state.lock().unwrap().clear_failed_for(node)
     }
 
+    /// STUB (tests first): replaced in the next commit.
+    pub fn apply_transit_nodes(
+        &self,
+        _ops: &TopoOps<'_>,
+        _snapshot: &PolicySnapshot,
+    ) -> Vec<IpAddr> {
+        Vec::new()
+    }
+
+    /// STUB (tests first): replaced in the next commit.
+    pub fn interior_is_transit(&self, _path: &[IpAddr]) -> bool {
+        true
+    }
+
     /// Is `addr` a node in the router?
     pub fn has_node(&self, addr: &IpAddr) -> bool {
         self.router.has_node(addr)
@@ -1082,6 +1096,12 @@ mod tests {
 
     /// Serialize a policy whose topology is exactly the given peerings.
     fn policy_bytes_from_peerings(peerings: &[Peering]) -> Vec<u8> {
+        policy_bytes_from_peerings_and_transit(peerings, &[])
+    }
+
+    /// As [policy_bytes_from_peerings], with `Policy.transitNodes` = `transit` (left
+    /// unset when empty).
+    fn policy_bytes_from_peerings_and_transit(peerings: &[Peering], transit: &[IpAddr]) -> Vec<u8> {
         let mut msg = capnp::message::Builder::new_default();
         {
             let mut policy = msg.init_root::<policy_capnp::policy::Builder>();
@@ -1089,6 +1109,12 @@ mod tests {
             let mut topo = policy.reborrow().init_topology(peerings.len() as u32);
             for (i, p) in peerings.iter().enumerate() {
                 p.write_to(&mut topo.reborrow().get(i as u32));
+            }
+            if !transit.is_empty() {
+                let mut list = policy.reborrow().init_transit_nodes(transit.len() as u32);
+                for (i, addr) in transit.iter().enumerate() {
+                    list.set(i as u32, addr.to_string());
+                }
             }
         }
         let mut bytes = Vec::new();
@@ -1365,6 +1391,30 @@ mod tests {
         // test_restore_installs_link_down_until_both_ends_report).
         assert_eq!(topo.get_peers(&a), vec![b]);
         assert!(topo.router.link_between(&a, &b).is_some());
+    }
+
+    /// zl-zipline#255: restore applies the policy's transit set, so C may again be an
+    /// interior hop after a restart. (The restored links themselves stay down under R14
+    /// until both ends report, so this checks the transit set, not a route.)
+    #[tokio::test]
+    async fn test_restore_applies_the_policy_transit_set() {
+        let db = Arc::new(FakeDb::new());
+        let (a, b, c) = (ip("fd5a:5052::1"), ip("fd5a:5052::2"), ip("fd5a:5052::3"));
+        let peerings = [peering(a, c, "ac", vec![]), peering(c, b, "cb", vec![])];
+        let policy = policy_bytes_from_peerings_and_transit(&peerings, &[c]);
+        let policy_mgr = make_policy_mgr_from_bytes(db.clone(), policy).await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.link_repo.add_edge(&a, &c).await.unwrap();
+        topo.link_repo.add_edge(&c, &b).await.unwrap();
+        topo.restore_from_state(
+            &topo.ops_now(),
+            &policy_mgr.get_current_snapshot(),
+            &[a, b, c],
+        )
+        .await
+        .unwrap();
+        assert!(topo.interior_is_transit(&[a, c, b]));
+        assert!(!topo.interior_is_transit(&[c, a, b]));
     }
 
     /// add_node_if_not_exists preserves restored in-memory links and persisted edges on reconnect.

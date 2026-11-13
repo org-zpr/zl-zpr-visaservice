@@ -428,29 +428,10 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    // Capture one consistent policy snapshot for the whole restore pass so every edge is
-    // validated against the same policy/links view.
-    let ops = asm.topo_mgr.ops().await;
-    let psnap = asm.policy_mgr.get_current_snapshot();
-    let restored = asm
-        .topo_mgr
-        .restore_from_state(&ops, &psnap, &node_addrs)
-        .await;
-    let down_links = match restored {
-        Ok(down) => down,
-        Err(e) => {
-            error!(target: MAIN, "failed to restore topology state: {}", e);
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    // R14: no node has reported since the restart, so every restored link is down until
-    // both its ends report it up again. R15: revoke the persisted visas that cross a
-    // down link, under the same guard, as a link-state report would. A failed revocation
-    // write quarantines the visa and is retried (VisaMgr), so startup continues.
-    for (a, b) in down_links {
-        let _ = visa_reconciler::revoke_visas_over_link(&asm, &a, &b).await;
+    if let Err(e) = restore_topology(&asm, &node_addrs).await {
+        error!(target: MAIN, "failed to restore topology state: {}", e);
+        return std::process::ExitCode::FAILURE;
     }
-    drop(ops);
 
     js.spawn_local(signal_worker::launch(asm.clone()));
     js.spawn_local(event_mgr::launch(asm.clone(), event_rx));
@@ -734,6 +715,30 @@ async fn teardown_culled_nodes(asm: &Assembly, culled: &[crate::actor_mgr::Culle
     }
 }
 
+/// Rebuild the in-memory router from persisted state, and revoke the restored visas
+/// it can no longer carry, all in one [crate::topology_mgr::TopoOps] section.
+///
+/// One policy snapshot is captured for the whole restore, so every edge is validated
+/// against the same policy and links. Then:
+/// - R14: no node has reported since the restart, so every restored link is down
+///   until both its ends report it up again. R15: the persisted visas that cross a
+///   down link are revoked, as a link-state report would.
+///
+/// A revocation write that fails quarantines the visa and is retried per visa
+/// (VisaMgr), so it does not fail startup.
+async fn restore_topology(asm: &Arc<Assembly>, node_addrs: &[IpAddr]) -> Result<(), ServiceError> {
+    let ops = asm.topo_mgr.ops().await;
+    let psnap = asm.policy_mgr.get_current_snapshot();
+    let down_links = asm
+        .topo_mgr
+        .restore_from_state(&ops, &psnap, node_addrs)
+        .await?;
+    for (a, b) in down_links {
+        let _ = visa_reconciler::revoke_visas_over_link(asm, &a, &b).await;
+    }
+    Ok(())
+}
+
 /// zipline#184: `vs --min-compiler-version` prints the minimum policy
 /// compiler version this build accepts and exits.
 #[cfg(test)]
@@ -949,5 +954,54 @@ mod culled_node_teardown_tests {
                 .is_some(),
             "the VS's own actor record must survive a startup cull of its docking node"
         );
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+    use crate::test_helpers::{build_transit_asm, create_sweep_visa_on_route, transit_policy};
+
+    /// Review on visaservice#65 (Copilot): the service stopped after installing a policy
+    /// that took C's transit flag away and before that policy's pass revoked the visas
+    /// through C. At the next start the router is rebuilt with the new transit set, so it
+    /// reports no change; the restore itself must revoke them. A visa that does not pass
+    /// through C is kept.
+    #[tokio::test]
+    async fn test_restore_revokes_restored_visas_through_a_node_that_lost_transit() {
+        let (asm, a, b, c) = build_transit_asm().await;
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        let routes = asm.topo_mgr.get_routes(&a, &b, None);
+        let via_c = routes.iter().find(|r| r.links.len() == 2).unwrap();
+        let direct = routes.iter().find(|r| r.links.len() == 1).unwrap();
+        let through_c = create_sweep_visa_on_route(&asm, &a, 0, via_c).await;
+        let a_to_b = create_sweep_visa_on_route(&asm, &a, 0, direct).await;
+
+        // The install commits; the service stops before the pass runs.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[]))
+            .await
+            .unwrap();
+        // Restart: the router comes back empty, with no transit flags.
+        {
+            let ops = asm.topo_mgr.ops().await;
+            for n in [a, b, c] {
+                asm.topo_mgr.remove_node(&ops, &n).await;
+            }
+        }
+        asm.topo_mgr.set_transit_nodes(&[]);
+
+        restore_topology(&asm, &[a, b, c]).await.unwrap();
+
+        let revoked = asm
+            .visa_mgr
+            .get_pending_revoke_visa_ids_for_node(&a)
+            .await
+            .unwrap();
+        assert!(
+            revoked.contains(&through_c),
+            "the visa through C is revoked"
+        );
+        assert!(!revoked.contains(&a_to_b), "a visa not through C is kept");
     }
 }

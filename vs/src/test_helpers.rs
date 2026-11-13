@@ -796,6 +796,129 @@ pub async fn build_sweep_asm_on(asm: Assembly, with_link: bool) -> (Arc<Assembly
     (Arc::new(asm), node_a)
 }
 
+// ---- transit fixtures (zl-zipline#227) ----
+
+/// The third node of [build_transit_asm]: linked to both sweep nodes, so the only
+/// other way between them besides their direct link.
+pub const TRANSIT_NODE_C: &str = "fd5a:5052:3000::3";
+
+/// The sweep assembly ([build_sweep_asm], linked: A `::1` -- B `::2` over link `l`,
+/// adapters `::4000::a` on A and `::4000::b` on B) plus a connected node C
+/// ([TRANSIT_NODE_C]) linked to both, over `ac` and `cb`. Returns (asm, A, B, C).
+/// Nothing is transit-capable yet: that comes from policy ([transit_policy]).
+pub async fn build_transit_asm() -> (Arc<Assembly>, IpAddr, IpAddr, IpAddr) {
+    let (asm, a, b, c, _db) = build_transit_asm_with_db().await;
+    (asm, a, b, c)
+}
+
+/// As [build_transit_asm], but also hands back the [crate::db::FakeDb] so a test can
+/// inject state-DB faults.
+pub async fn build_transit_asm_with_db() -> (
+    Arc<Assembly>,
+    IpAddr,
+    IpAddr,
+    IpAddr,
+    Arc<crate::db::FakeDb>,
+) {
+    let (asm, node_a, db) = build_sweep_asm_with_db(true).await;
+    let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+    let node_c: IpAddr = TRANSIT_NODE_C.parse().unwrap();
+    asm.actor_mgr
+        .add_node(
+            &make_node_actor_defexp(TRANSIT_NODE_C, "nc", "10.0.0.3:3"),
+            false,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    asm.topo_mgr.add_node(node_c).unwrap();
+    asm.topo_mgr
+        .add_link(node_a, node_c, LinkId("ac".into()), vec![], 1)
+        .unwrap();
+    asm.topo_mgr
+        .add_link(node_c, node_b, LinkId("cb".into()), vec![], 1)
+        .unwrap();
+    (asm, node_a, node_b, node_c, db)
+}
+
+/// Container bytes of the policy for [build_transit_asm]: a node join policy every
+/// node satisfies (so a policy pass keeps all three connected), the three links
+/// `l`, `ac` and `cb`, and `transitNodes` = `transit`.
+pub fn transit_policy(transit: &[IpAddr]) -> Vec<u8> {
+    let a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+    let b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+    let c: IpAddr = TRANSIT_NODE_C.parse().unwrap();
+    let peerings = [
+        make_peering(a, b, "l", vec![]),
+        make_peering(a, c, "ac", vec![]),
+        make_peering(c, b, "cb", vec![]),
+    ];
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut policy = msg.init_root::<capnp_policy::policy::Builder>();
+        policy.reborrow().set_created("1970-01-01T00:00:00Z");
+        let mut topo = policy.reborrow().init_topology(peerings.len() as u32);
+        for (i, p) in peerings.iter().enumerate() {
+            p.write_to(&mut topo.reborrow().get(i as u32));
+        }
+        let mut jps = policy.reborrow().init_join_policies(1);
+        jps.reborrow()
+            .get(0)
+            .init_flags(1)
+            .set(0, capnp_policy::JoinFlag::Node);
+        if !transit.is_empty() {
+            let mut list = policy.reborrow().init_transit_nodes(transit.len() as u32);
+            for (i, addr) in transit.iter().enumerate() {
+                list.set(i as u32, addr.to_string());
+            }
+        }
+    }
+    let mut bytes = Vec::new();
+    capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+    make_container_bytes(
+        crate::config::POLICY_MIN_COMPILER_MAJOR,
+        crate::config::POLICY_MIN_COMPILER_MINOR,
+        crate::config::POLICY_MIN_COMPILER_PATCH,
+        &bytes,
+    )
+}
+
+/// Take the direct A--B link of [build_transit_asm] down the way link-state reports
+/// do. Under R14 a link is up only while both ends report it up, so every node
+/// reports: C reports A and B up, A reports only C, and B reports only C. A--B goes
+/// down; A--C and C--B are up.
+pub fn take_transit_asm_direct_link_down(asm: &Assembly) {
+    use zpr::vsapi_types::{LinkState, LinkStateReport};
+    let a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+    let b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+    let c: IpAddr = TRANSIT_NODE_C.parse().unwrap();
+    let cn_of = move |n: &IpAddr| {
+        [(a, "na"), (b, "nb"), (c, "nc")]
+            .iter()
+            .find(|(addr, _)| addr == n)
+            .map(|(_, cn)| cn.to_string())
+    };
+    let up = |cns: &[&str]| -> Vec<LinkStateReport> {
+        cns.iter()
+            .map(|cn| LinkStateReport {
+                peer_cn: cn.to_string(),
+                state: LinkState::Up,
+            })
+            .collect()
+    };
+    for (reporter, peers) in [(c, up(&["na", "nb"])), (a, up(&["nc"])), (b, up(&["nc"]))] {
+        asm.topo_mgr.record_link_states_with_cns(
+            &asm.topo_mgr.ops_now(),
+            &reporter,
+            None,
+            peers,
+            &cn_of,
+        );
+    }
+    assert!(!asm.topo_mgr.link_up(&a, &b), "the direct link is down");
+    assert!(asm.topo_mgr.link_up(&a, &c) && asm.topo_mgr.link_up(&c, &b));
+}
+
 /// Create a single-node visa held (PendingInstall) by `req` for the given
 /// five-tuple, seeded at `vinst`. Returns its id. Its path is `req` alone, so a
 /// sweep on the linked assembly sees the route move and revokes it; use

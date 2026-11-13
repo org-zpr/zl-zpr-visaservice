@@ -204,6 +204,11 @@ pub(crate) async fn revoke_visas_over_link(
     }
 }
 
+/// STUB (tests first): replaced in the next commit.
+pub(crate) async fn revoke_visas_through_non_transit(_asm: &Arc<Assembly>) -> Result<usize, usize> {
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +453,74 @@ mod tests {
             .await
             .unwrap();
         assert!(pending.contains(&local), "a visa off the link stays");
+    }
+
+    /// zl-zipline#227: a node that is not transit-capable revokes the visas whose path
+    /// passes through it, and not the visas that only start or end there.
+    #[tokio::test]
+    async fn test_revoke_visas_through_non_transit_hits_only_interior_hops() {
+        use crate::test_helpers::{build_transit_asm, create_sweep_visa_on_route};
+        let (asm, a, b, c) = build_transit_asm().await;
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        let via_c = asm.topo_mgr.get_routes(&a, &b, None);
+        let via_c = via_c
+            .iter()
+            .find(|r| r.links.len() == 2)
+            .expect("a route through C");
+        let through = create_sweep_visa_on_route(&asm, &a, 0, via_c).await;
+        let direct = asm.topo_mgr.get_best_route(&a, &b).unwrap();
+        assert_eq!(direct.links.len(), 1);
+        let direct = create_sweep_visa_on_route(&asm, &a, 0, &direct).await;
+
+        // A and B are ends of both paths, so they need no transit flag.
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        assert_eq!(revoke_visas_through_non_transit(&asm).await, Ok(0));
+        asm.topo_mgr.set_transit_nodes(&[]);
+        assert_eq!(revoke_visas_through_non_transit(&asm).await, Ok(1));
+
+        let revoked = asm
+            .visa_mgr
+            .get_pending_revoke_visa_ids_for_node(&a)
+            .await
+            .unwrap();
+        assert_eq!(revoked, vec![through]);
+        let pending = asm
+            .visa_mgr
+            .get_pending_visa_ids_for_node(&a)
+            .await
+            .unwrap();
+        assert!(pending.contains(&direct), "the direct visa stays");
+    }
+
+    /// zl-zipline#227: a visa routed through a node whose transit flag is cleared
+    /// between route selection and commit is revoked at commit.
+    #[tokio::test]
+    async fn test_visa_through_a_node_that_lost_transit_is_revoked_at_commit() {
+        use crate::test_helpers::{build_transit_asm, try_create_sweep_visa_on_route};
+        let (asm, a, b, c) = build_transit_asm().await;
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        let route = asm
+            .topo_mgr
+            .get_routes(&a, &b, None)
+            .into_iter()
+            .find(|r| r.links.len() == 2)
+            .expect("a route through C");
+
+        asm.topo_mgr.set_transit_nodes(&[]);
+        assert!(
+            try_create_sweep_visa_on_route(&asm, &a, 0, &route)
+                .await
+                .is_err(),
+            "a visa through a node that lost transit is not issued"
+        );
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&a)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// A link between two other nodes revokes nothing.

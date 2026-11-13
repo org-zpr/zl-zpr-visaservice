@@ -460,6 +460,9 @@ async fn policy_pass_locked(
     })
 }
 
+/// STUB (tests first): replaced in the next commit.
+async fn apply_policy_transit(_asm: &Arc<Assembly>, _ops: &TopoOps<'_>, _psnap: &PolicySnapshot) {}
+
 /// The ends of `links_down` the visa service can no longer reach: those with no
 /// route from the node it docks on (the relay). It reached them over a link the
 /// policy pass just took down. If the visa service is not docked, it reaches no node
@@ -1025,6 +1028,158 @@ mod tests {
             !asm.topo_mgr.has_node(&a),
             "disconnected node must stay out of the router"
         );
+    }
+
+    /// zl-zipline#227: the policy pass sets the router's transit set from the policy,
+    /// and revokes a visa through a node that lost transit -- including one committed
+    /// under the new policy before the pass ran, which the sweep's generation gate
+    /// would skip.
+    #[tokio::test]
+    async fn test_policy_pass_applies_transit_and_revokes_visas_through_lost_nodes() {
+        use crate::test_helpers::{build_transit_asm, create_sweep_visa_on_route, transit_policy};
+        let (asm, a, b, c) = build_transit_asm().await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[c]))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+        let via_c = asm
+            .topo_mgr
+            .get_routes(&a, &b, None)
+            .into_iter()
+            .find(|r| r.links.len() == 2)
+            .expect("the pass made C transit-capable");
+
+        // C loses transit. In the window between the install and its pass the router
+        // still has the old flags, so a visa through C commits under the new policy.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[]))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        let id = create_sweep_visa_on_route(&asm, &a, vinst, &via_c).await;
+        handle_policy_updated(&asm, vinst).await.unwrap();
+
+        assert!(
+            asm.topo_mgr
+                .get_routes(&a, &b, None)
+                .iter()
+                .all(|r| r.links.len() == 1),
+            "no route through C any more"
+        );
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&a)
+                .await
+                .unwrap()
+                .contains(&id),
+            "the visa through C is revoked"
+        );
+    }
+
+    /// Review r2 (Codex): the policy's transit set is applied, and the visas through a
+    /// node that lost it revoked, before any fallible step of the handler. Here the
+    /// live-node read fails (the event worker only logs that, with no retry); the
+    /// router must still stop routing through C.
+    #[tokio::test]
+    async fn test_policy_update_applies_transit_before_any_fallible_step() {
+        use crate::test_helpers::{
+            build_transit_asm_with_db, create_sweep_visa_on_route, transit_policy,
+        };
+        let (asm, a, b, c, db) = build_transit_asm_with_db().await;
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        let via_c = asm
+            .topo_mgr
+            .get_routes(&a, &b, None)
+            .into_iter()
+            .find(|r| r.links.len() == 2)
+            .unwrap();
+        let id = create_sweep_visa_on_route(&asm, &a, 0, &via_c).await;
+
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[]))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        db.set_scan_fault(crate::db::FaultMode::Reject);
+        assert!(handle_policy_updated(&asm, vinst).await.is_err());
+        db.set_scan_fault(crate::db::FaultMode::None);
+
+        assert!(
+            asm.topo_mgr
+                .get_routes(&a, &b, None)
+                .iter()
+                .all(|r| r.links.len() == 1),
+            "no route through C any more"
+        );
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&a)
+                .await
+                .unwrap()
+                .contains(&id),
+            "the visa through C is revoked"
+        );
+    }
+
+    /// Review r1 (Copilot): applying a policy's transit set and revoking the visas
+    /// through the nodes that lost transit is one step, so no later failure in the
+    /// pass (the node list read, link reconciliation) can consume the transit change
+    /// without the revocations.
+    #[tokio::test]
+    async fn test_apply_policy_transit_revokes_in_the_same_step() {
+        use crate::test_helpers::{build_transit_asm, create_sweep_visa_on_route};
+        let (asm, a, b, c) = build_transit_asm().await;
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        let via_c = asm
+            .topo_mgr
+            .get_routes(&a, &b, None)
+            .into_iter()
+            .find(|r| r.links.len() == 2)
+            .unwrap();
+        let id = create_sweep_visa_on_route(&asm, &a, 0, &via_c).await;
+
+        // The current (empty) policy lists no transit node.
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        apply_policy_transit(&asm, &asm.topo_mgr.ops().await, &psnap).await;
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&a)
+                .await
+                .unwrap()
+                .contains(&id)
+        );
+    }
+
+    /// zl-zipline#227: the pass applies the transit set even when no node is connected
+    /// (it then skips link reconciliation), so nodes that connect later route under it.
+    #[tokio::test]
+    async fn test_policy_pass_applies_transit_without_connected_nodes() {
+        use crate::test_helpers::{TRANSIT_NODE_C, transit_policy};
+        use libeval::route::LinkId;
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let c: IpAddr = TRANSIT_NODE_C.parse().unwrap();
+        for n in [a, b, c] {
+            asm.topo_mgr.add_node(n).unwrap();
+        }
+        asm.topo_mgr
+            .add_link(a, c, LinkId("ac".into()), vec![], 1)
+            .unwrap();
+        asm.topo_mgr
+            .add_link(c, b, LinkId("cb".into()), vec![], 1)
+            .unwrap();
+        assert!(asm.topo_mgr.get_best_route(&a, &b).is_none());
+
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[c]))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+        assert!(asm.topo_mgr.get_best_route(&a, &b).is_some());
     }
 
     /// A policy update reconciles the actors behind live visas before it sweeps them.
