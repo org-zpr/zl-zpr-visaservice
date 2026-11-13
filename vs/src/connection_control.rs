@@ -2407,18 +2407,25 @@ impl ConnectionControl {
         let ops = asm.topo_mgr.ops().await;
         let (vss, result) = self.disconnect_locked(&ops, &asm, zpr_addr, reason).await;
         drop(ops);
-        Self::stop_vss_worker(vss, &zpr_addr).await;
+        Self::stop_vss_worker(vss, &zpr_addr);
         result
     }
 
-    /// Stop a disconnected node's VSS worker, if it had one. Call with no
-    /// [TopoOps] held.
-    pub async fn stop_vss_worker(vss: Option<VssHandle>, zpr_addr: &IpAddr) {
-        if let Some(vss_hndl) = vss {
+    /// Stop a disconnected node's VSS worker, if it had one.
+    ///
+    /// The stop is queued from a detached task, so the caller never waits on the
+    /// worker (g101): its command queue may be full behind RPCs waiting out their
+    /// timeouts over a link that is gone, and the stop is delivered once there is room.
+    pub fn stop_vss_worker(vss: Option<VssHandle>, zpr_addr: &IpAddr) {
+        let Some(vss_hndl) = vss else {
+            return;
+        };
+        let zpr_addr = *zpr_addr;
+        tokio::spawn(async move {
             if let Err(e) = vss_hndl.stop().await {
                 error!(target: CC, "failed to stop VSS worker for disconnected node at addr {zpr_addr}: {e}");
             }
-        }
+        });
     }
 
     /// The local teardown of [Self::disconnect], under the caller's topology guard
@@ -2640,6 +2647,30 @@ fn a2a_dh_pubkey_claim(key: &PublicKey) -> Option<Attribute> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// g101: stopping a VSS worker never waits on the worker. Its command queue may
+    /// be full behind RPCs waiting out their timeouts over a dead link (a node cut off
+    /// by a policy, a rejoiner's previous session); the caller moves on at once, and
+    /// the stop is delivered once there is room.
+    #[tokio::test]
+    async fn test_stop_vss_worker_does_not_wait_on_a_full_queue() {
+        let addr: IpAddr = "fd5a:5052::3".parse().unwrap();
+        let mgr = crate::vss_mgr::VssMgr::new();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<crate::vss::VssCmd>(1);
+        mgr.insert_test_handle(addr, cmd_tx.clone());
+        // The queue is full: the worker is busy with an earlier command.
+        cmd_tx.try_send(crate::vss::VssCmd::Stop()).unwrap();
+
+        // Returns at once: it is not async, so it cannot wait for room in the queue.
+        ConnectionControl::stop_vss_worker(mgr.get_handle(&addr), &addr);
+
+        // The worker takes the earlier command; then the stop arrives.
+        assert!(cmd_rx.recv().await.is_some());
+        let stop = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+            .await
+            .expect("the stop is delivered once there is room");
+        assert!(matches!(stop, Some(crate::vss::VssCmd::Stop())));
+    }
 
     use crate::test_helpers::make_container_bytes;
     use libeval::pio;
@@ -8028,7 +8059,7 @@ mod tests {
             let vss_sockaddr = SocketAddr::new(node_addr, VSS_PORT);
             let visas = asm
                 .visa_mgr
-                .post_register_vss_visas_for_node(asm.clone(), &node_addr, &vss_sockaddr)
+                .post_register_vss_visas_for_node(asm.clone(), &node_addr, &vss_sockaddr, None)
                 .await
                 .expect(
                     "register_vss must not depend on the VS adapter's re-auth \

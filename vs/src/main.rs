@@ -24,6 +24,7 @@ mod auth;
 mod auth_sweep;
 mod config;
 mod connection_control;
+mod core_visas;
 mod counters;
 mod db;
 mod db_worker;

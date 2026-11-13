@@ -43,7 +43,6 @@ use crate::counters::CounterType;
 use crate::error::ServiceError;
 use crate::logging::targets::VREQ;
 use crate::packet::describe_five_tuple;
-use crate::visa_bootstrap;
 use crate::visa_mgr::VisaWithMetadata;
 use crate::visa_policy::{
     PolicyOutcome, evaluate_against_policy, resolve_docking_node, route_for_allow,
@@ -210,18 +209,6 @@ async fn process_visa_request_job(asm: Arc<Assembly>, job: VisaRequestJob) {
 /// Run visa request.
 async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaRequestResult {
     let (source_actor, dest_actor) = get_actors(&asm, job).await?;
-
-    // An endpoint with no actor may be a peer that has not connected yet, on either end of a
-    // VSAPI flow: the peer's own SYN, or the reply direction of it. Policy cannot answer
-    // either; the pre-minted bootstrap visa can.
-    if source_actor.is_none() || dest_actor.is_none() {
-        if let Some(decision) =
-            visa_bootstrap::visa_for_future_peer_request(&asm, job, &source_actor, &dest_actor)
-                .await
-        {
-            return Ok(decision);
-        }
-    }
 
     let (mut source_actor, mut dest_actor) =
         match resolve_actors_or_deny(&asm, job, source_actor, dest_actor).await {
