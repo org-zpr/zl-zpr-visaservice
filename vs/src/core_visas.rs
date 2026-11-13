@@ -79,10 +79,24 @@ fn vss_five_tuple(
 /// `registerVss` and renewal; switch to per-node locks if that ever becomes a hot path.
 static ISSUE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Proof that the caller holds [ISSUE_LOCK]; see [lock_issuance].
+pub(crate) type IssueGuard = tokio::sync::MutexGuard<'static, ()>;
+
+/// Take [ISSUE_LOCK] for a step outside this module that must not interleave with core-visa
+/// issuance: the rejoin teardown (`visa_bootstrap::request_bootstrap_visas`).
+///
+/// Lock order: this lock first, then the topology lock, then the node commit lock. Issuance
+/// mints through the visa-request pipeline while holding it, and the pipeline can take the
+/// topology lock (an attribute refresh commits under it), so never wait for this lock while
+/// holding the topology lock.
+pub(crate) async fn lock_issuance() -> IssueGuard {
+    ISSUE_LOCK.lock().await
+}
+
 /// Err unless `session` is `node`'s current VS-API session: the `zpr.session` of its stored
 /// node actor (two `None`s match, as in the VS-API handle's liveness check). A node with no
 /// stored node actor has no session at all.
-async fn require_current_session(
+pub(crate) async fn require_current_session(
     asm: &Assembly,
     node: &IpAddr,
     session: Option<&str>,
@@ -260,23 +274,66 @@ async fn mint_core_visa(asm: &Assembly, pkt: PacketDesc) -> Result<u64, ServiceE
     }
 }
 
-/// `node`'s core visas for `ft`: every live visa with `node` as an endpoint whose dock PEP
-/// is `ft`, except the node's bootstrap visas, which are not core visas (J5c).
-async fn core_visas_for(
+/// Every live visa with `node` as an endpoint whose dock PEP is one of `fts`.
+async fn node_visas_for(
     asm: &Assembly,
     node: &IpAddr,
-    ft: &VsapiFiveTuple,
+    fts: &[VsapiFiveTuple],
 ) -> Result<Vec<VisaWithMetadata>, ServiceError> {
     let mut out = Vec::new();
     for id in asm.visa_mgr.get_visa_ids_for_actors(&[*node]).await? {
         let Some(vwm) = asm.visa_mgr.get_visa_with_metadata_by_id(id).await? else {
             continue; // expired meanwhile
         };
-        if vwm.metadata.zpl != BOOTSTRAP_VISA_ZPL && dock_pep_matches_five_tuple(&vwm.visa, ft) {
+        if fts
+            .iter()
+            .any(|ft| dock_pep_matches_five_tuple(&vwm.visa, ft))
+        {
             out.push(vwm);
         }
     }
     Ok(out)
+}
+
+/// `node`'s core visas for `ft`: its visas for `ft` ([node_visas_for]) except its bootstrap
+/// visas, which are not core visas (J5c).
+async fn core_visas_for(
+    asm: &Assembly,
+    node: &IpAddr,
+    ft: &VsapiFiveTuple,
+) -> Result<Vec<VisaWithMetadata>, ServiceError> {
+    let mut visas = node_visas_for(asm, node, std::slice::from_ref(ft)).await?;
+    visas.retain(|vwm| vwm.metadata.zpl != BOOTSTRAP_VISA_ZPL);
+    Ok(visas)
+}
+
+/// Rejoin (J6, ZODE_LINKS.md "Settled after the builder check"): revoke every visa that
+/// carried `node`'s previous join -- its bootstrap pair, its VSAPI pair and, when it has a VSS
+/// registered on `vss_port`, its VSS visa. The new join starts from fresh bootstrap visas.
+/// The visas are revoked through the normal revoke path, never edited.
+///
+/// The caller holds the issuance lock (`_issuing`), so no issuance for the session being
+/// ended can mint a core visa after this has run (see [ISSUE_LOCK]).
+pub(crate) async fn revoke_previous_join(
+    asm: &Assembly,
+    _issuing: &IssueGuard,
+    node: &IpAddr,
+    vss_port: Option<u16>,
+) -> Result<(), ServiceError> {
+    let mut fts = vsapi_five_tuples(asm, node)?.to_vec();
+    if let Some(port) = vss_port {
+        fts.push(vss_five_tuple(asm, node, port)?);
+    }
+    let ids: Vec<u64> = node_visas_for(asm, node, &fts)
+        .await?
+        .iter()
+        .map(|vwm| vwm.visa.issuer_id)
+        .collect();
+    if !ids.is_empty() {
+        info!(target: VISA, "node {node}: rejoin revokes the visas of its previous join {ids:?}");
+        asm.visa_mgr.revoke_visa_ids(&ids).await;
+    }
+    Ok(())
 }
 
 /// Revoke `node`'s core visas for each of `fts` whose ID is below `first_new` (the lowest
@@ -323,11 +380,11 @@ pub(crate) mod tests {
     use crate::vss::VssCmd;
 
     /// The node the visa service docks on.
-    const RELAY: &str = "fd5a:5052:3000::1";
+    pub(crate) const RELAY: &str = "fd5a:5052:3000::1";
     /// A Zode joined to the relay over its initial link.
     pub(crate) const ZODE: &str = "fd5a:5052:3000::7";
     /// The port the nodes' VSS listens on.
-    const VSS_PORT: u16 = 8183;
+    pub(crate) const VSS_PORT: u16 = 8183;
 
     /// A relay that docks the visa service and a Zode linked to it, both connected, under a
     /// policy standing in for the compiler's two built-in rules: nodes may reach the visa
@@ -335,6 +392,15 @@ pub(crate) mod tests {
     /// service may reach a node's VSS port (service `vss`, provided by each node). A
     /// visa-request arena runs, so core visas mint through the real pipeline.
     pub(crate) async fn build_net() -> (Arc<Assembly>, IpAddr, IpAddr) {
+        build_net_with_policy(make_allow_policy_for_tcp_services(&[
+            ("vsapi", config::VSAPI_PORT),
+            ("vss", VSS_PORT),
+        ]))
+        .await
+    }
+
+    /// As [build_net], under `policy` (container bytes) instead of the two built-in rules.
+    pub(crate) async fn build_net_with_policy(policy: Vec<u8>) -> (Arc<Assembly>, IpAddr, IpAddr) {
         use crate::db::PolicyRepo;
         use crate::policy_mgr::PolicyMgr;
         use crate::test_helpers::FakeResolver;
@@ -344,7 +410,7 @@ pub(crate) mod tests {
         let (vreq_tx, vreq_rx) = mpsc::channel(8);
         let mut asm = new_assembly_for_tests(Some(vreq_tx)).await;
         asm.policy_mgr = PolicyMgr::new_with_initial_policy(
-            make_allow_policy_for_tcp_services(&[("vsapi", config::VSAPI_PORT), ("vss", VSS_PORT)]),
+            policy,
             PolicyRepo::new(asm.state_db.clone()),
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
@@ -395,14 +461,14 @@ pub(crate) mod tests {
         (asm, relay, zode)
     }
 
-    /// Mint the Zode's bootstrap pair the way the relay join does today, forward first.
+    /// Mint the Zode's bootstrap pair the way the relay join does, forward first.
     async fn mint_bootstrap_pair(asm: &Arc<Assembly>, relay: &IpAddr, zode: &IpAddr) -> [Visa; 2] {
         let policy = asm.policy_mgr.get_current();
         let mut out = Vec::new();
         for direction in [Direction::Forward, Direction::Reverse] {
             out.push(
                 asm.visa_mgr
-                    .vsapi_bootstrap_visa_for_future_peer(asm, &policy, zode, relay, direction)
+                    .mint_bootstrap_visa(asm, &policy, zode, relay, direction)
                     .await
                     .unwrap(),
             );

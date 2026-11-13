@@ -536,18 +536,7 @@ pub fn make_allow_policy_for_tcp_services(services: &[(&str, u16)]) -> Vec<u8> {
         policy_bldr.set_created("2024-01-01T00:00:00Z");
         policy_bldr.set_version(1);
         policy_bldr.set_metadata("");
-        let mut coms = policy_bldr
-            .reborrow()
-            .init_com_policies(services.len() as u32);
-        for (i, (service_id, port)) in services.iter().enumerate() {
-            let mut com = coms.reborrow().get(i as u32);
-            com.set_allow(true);
-            com.set_service_id(service_id);
-            let mut scopes = com.reborrow().init_scope(1);
-            let mut scope = scopes.reborrow().get(0);
-            scope.set_protocol(6); // TCP
-            scope.init_port().set_port_num(*port);
-        }
+        init_allow_tcp_com_policies(&mut policy_bldr, services);
     }
     let mut bytes = Vec::new();
     capnp::serialize::write_message(&mut bytes, &msg).unwrap();
@@ -557,6 +546,29 @@ pub fn make_allow_policy_for_tcp_services(services: &[(&str, u16)]) -> Vec<u8> {
         crate::config::POLICY_MIN_COMPILER_PATCH,
         &bytes,
     )
+}
+
+/// Write one unconditional ALLOW communication policy per `(service_id, port)` (TCP) into
+/// `policy_bldr`. Writes nothing for an empty `services`.
+fn init_allow_tcp_com_policies(
+    policy_bldr: &mut capnp_policy::policy::Builder<'_>,
+    services: &[(&str, u16)],
+) {
+    if services.is_empty() {
+        return;
+    }
+    let mut coms = policy_bldr
+        .reborrow()
+        .init_com_policies(services.len() as u32);
+    for (i, (service_id, port)) in services.iter().enumerate() {
+        let mut com = coms.reborrow().get(i as u32);
+        com.set_allow(true);
+        com.set_service_id(service_id);
+        let mut scopes = com.reborrow().init_scope(1);
+        let mut scope = scopes.reborrow().get(0);
+        scope.set_protocol(6); // TCP
+        scope.init_port().set_port_num(*port);
+    }
 }
 
 /// Build a policy container in which `service_id` (TCP `port`) is hosted by any
@@ -646,10 +658,21 @@ pub fn policy_with_peerings_and_node_cns(
     peerings: &[Peering],
     node_cns: &[(IpAddr, &str)],
 ) -> Vec<u8> {
+    policy_with_peerings_cns_and_tcp_services(peerings, node_cns, &[])
+}
+
+/// As [policy_with_peerings_and_node_cns], plus one unconditional ALLOW communication policy
+/// per `(service_id, port)`, as in [make_allow_policy_for_tcp_services].
+pub fn policy_with_peerings_cns_and_tcp_services(
+    peerings: &[Peering],
+    node_cns: &[(IpAddr, &str)],
+    services: &[(&str, u16)],
+) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
     {
         let mut policy = msg.init_root::<capnp_policy::policy::Builder>();
         policy.reborrow().set_created("1970-01-01T00:00:00Z");
+        init_allow_tcp_com_policies(&mut policy, services);
         if !peerings.is_empty() {
             let mut topo = policy.reborrow().init_topology(peerings.len() as u32);
             for (i, p) in peerings.iter().enumerate() {

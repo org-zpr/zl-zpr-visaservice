@@ -36,8 +36,8 @@ pub enum VssCmd {
     ), // (version, services-descriptor-list, channel)
     Configure(Vec<Param>, oneshot::Sender<VssConfigureResponse>),
     /// The resolved peers plus the policy snapshot they were computed from. The snapshot
-    /// rides along so the worker can build the wire-level `Link` structs (including
-    /// bootstrap-visa minting) against the same view that produced the peers.
+    /// rides along so the worker can build the wire-level `Link` structs against the same
+    /// view that produced the peers.
     SetTopology(
         Vec<ResolvedPeer>,
         Arc<Policy>,

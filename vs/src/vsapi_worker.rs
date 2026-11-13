@@ -222,34 +222,35 @@ impl VSGateImpl {
     }
 }
 
+/// Mint a fresh session id and stamp it on `actor` (zipline#123, PR #41
+/// review). The authenticate and reconnect paths call this BEFORE
+/// persisting the actor and before building its handle: the persisted
+/// session is the current generation, the handle captures it, and every
+/// handle bound to an earlier generation fails [VSHandleImpl::node_is_live].
+/// A rejoin (`visa_bootstrap::end_previous_join`) stamps one to end a session
+/// nobody holds a handle for yet.
+///
+/// The id is `"<generation>-<uuid>"`. The generation comes from a process-wide
+/// counter that only goes up, so link-state reports can tell a newer session from
+/// an older one (zl-zipline#224, `link_state::session_generation`); the uuid keeps
+/// ids unpredictable. Session checks elsewhere compare the whole string.
+pub(crate) fn stamp_new_session(actor: &mut Actor) {
+    static SESSION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let generation = SESSION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    actor
+        .add_attribute(
+            Attribute::builder(key::SESSION)
+                .value(format!("{generation}-{}", uuid::Uuid::new_v4())),
+        )
+        .expect("session attribute is unvalidated and cannot fail");
+}
+
 impl VSHandleImpl {
     fn new(asm: Arc<Assembly>, node: Actor) -> Self {
         let session = node
             .get_attribute(key::SESSION)
             .and_then(|a| a.get_single_value().ok().map(str::to_string));
         VSHandleImpl { asm, node, session }
-    }
-
-    /// Mint a fresh session id and stamp it on `actor` (zipline#123, PR #41
-    /// review). The authenticate and reconnect paths call this BEFORE
-    /// persisting the actor and before building its handle: the persisted
-    /// session is the current generation, the handle captures it, and every
-    /// handle bound to an earlier generation fails [Self::node_is_live].
-    ///
-    /// The id is `"<generation>-<uuid>"`. The generation comes from a process-wide
-    /// counter that only goes up, so link-state reports can tell a newer session from
-    /// an older one (zl-zipline#224, `link_state::session_generation`); the uuid keeps
-    /// ids unpredictable. Session checks elsewhere compare the whole string.
-    fn stamp_new_session(actor: &mut Actor) {
-        static SESSION_GENERATION: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let generation = SESSION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        actor
-            .add_attribute(
-                Attribute::builder(key::SESSION)
-                    .value(format!("{generation}-{}", uuid::Uuid::new_v4())),
-            )
-            .expect("session attribute is unvalidated and cannot fail");
     }
 
     /// Admission checks `authorize_connect` makes under the caller's [TopoOps],
@@ -464,7 +465,7 @@ async fn resume_node_actor_for_open(
     // handle from before this open fails the liveness gate — an old
     // revoked capability cannot ride the reconnect back to life. One write
     // carries both the substrate update and the new session.
-    VSHandleImpl::stamp_new_session(&mut existing_actor);
+    stamp_new_session(&mut existing_actor);
     if let Err(e) = asm
         .actor_mgr
         .update_actor(&existing_actor, &asm.policy_service_names())
@@ -1314,7 +1315,7 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         // before the actor is persisted, so any handle from a previous
         // session at this address fails the liveness gate from here on. Stamped
         // under the guard, so generations are persisted in the order minted.
-        VSHandleImpl::stamp_new_session(&mut node_actor);
+        stamp_new_session(&mut node_actor);
 
         // A Reset's teardown of the node's old state runs inside
         // add_node_serialized, under the topology guard held here and the node
@@ -2338,6 +2339,86 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         Ok(())
     }
 
+    /// The relay asks for a joining Zode's bootstrap visas when that Zode's initial link
+    /// comes up (ZODE_LINKS.md J2, J3, J6); see
+    /// [crate::visa_bootstrap::request_bootstrap_visas] for the rule and what a request does
+    /// to the joiner's previous join. A trust boundary: only the node the visa service
+    /// docks on may ask, and only for a CN in its own topology.
+    ///
+    /// Errors (vs.capnp): `authRequired` on a dead handle; `invalidOperation` when the
+    /// caller is not the relay; `notFound` when `peerCn` names no peer in the caller's
+    /// topology (or is not valid UTF-8); `internal` when the visas could not be minted.
+    async fn request_bootstrap_visas(
+        self: Rc<Self>,
+        params: vsapi::v_s_handle::RequestBootstrapVisasParams,
+        mut results: vsapi::v_s_handle::RequestBootstrapVisasResults,
+    ) -> Result<(), capnp::Error> {
+        debug!(target: API, "request_bootstrap_visas from {:?}", self.node.get_cn());
+        let refuse = |results: &mut vsapi::v_s_handle::RequestBootstrapVisasResults,
+                      code: vsapi::ErrorCode,
+                      message: &str| {
+            write_error(&mut results.get().init_res().init_error(), code, message);
+        };
+        let (true, Some(relay)) = (self.node_is_live().await, self.node.get_zpr_addr().copied())
+        else {
+            warn!(target: API, "request_bootstrap_visas from disconnected node {:?}: refused", self.node.get_cn());
+            refuse(
+                &mut results,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        };
+        self.update_last_seen_time(&relay).await;
+        // An unreadable CN names no peer.
+        let Ok(peer_cn) = params.get()?.get_peer_cn()?.to_str() else {
+            warn!(target: API, "request_bootstrap_visas from {relay}: peerCn is not valid UTF-8: refused");
+            refuse(
+                &mut results,
+                vsapi::ErrorCode::NotFound,
+                "peerCn names no peer",
+            );
+            return Ok(());
+        };
+
+        let refusal = match crate::visa_bootstrap::request_bootstrap_visas(
+            &self.asm,
+            &relay,
+            self.session.as_deref(),
+            peer_cn,
+        )
+        .await
+        {
+            Ok(visas) => {
+                visas.write_to(&mut results.get().init_res().init_ok());
+                return Ok(());
+            }
+            Err(refusal) => refusal,
+        };
+        use crate::visa_bootstrap::Refusal;
+        let (code, message) = match refusal {
+            Refusal::StaleSession => (
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            ),
+            Refusal::NotRelay => (
+                vsapi::ErrorCode::InvalidOperation,
+                "only the relay may request bootstrap visas",
+            ),
+            Refusal::UnknownPeer => (
+                vsapi::ErrorCode::NotFound,
+                "peerCn is not a peer in the caller's topology",
+            ),
+            Refusal::Failed(e) => {
+                error!(target: API, "request_bootstrap_visas from {relay} for {peer_cn:?}: {e}");
+                (vsapi::ErrorCode::Internal, "failed to mint bootstrap visas")
+            }
+        };
+        warn!(target: API, "request_bootstrap_visas from {relay} for {peer_cn:?}: refused ({code:?})");
+        refuse(&mut results, code, message);
+        Ok(())
+    }
+
     async fn visa_ids_request(
         self: Rc<Self>,
         _req: vsapi::v_s_handle::VisaIdsRequestParams,
@@ -3292,7 +3373,7 @@ mod tests {
             let node_addr: std::net::IpAddr = NODE.parse().unwrap();
 
             let mut node_a = make_node_actor_defexp(NODE, "node-a", "[fd5a:5052:3000::101]:1234");
-            VSHandleImpl::stamp_new_session(&mut node_a);
+            stamp_new_session(&mut node_a);
             asm.actor_mgr
                 .add_node(&node_a, false, &Default::default())
                 .await
@@ -3310,7 +3391,7 @@ mod tests {
             // A different node authenticates at the reused address (fresh
             // session stamped, as the authenticate path does).
             let mut node_b = make_node_actor_defexp(NODE, "node-b", "[fd5a:5052:3000::102]:1234");
-            VSHandleImpl::stamp_new_session(&mut node_b);
+            stamp_new_session(&mut node_b);
             asm.actor_mgr
                 .add_node(&node_b, false, &Default::default())
                 .await
@@ -3336,7 +3417,7 @@ mod tests {
             let asm = Arc::new(new_assembly_for_tests(None).await);
 
             let mut node = make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
-            VSHandleImpl::stamp_new_session(&mut node);
+            stamp_new_session(&mut node);
             asm.actor_mgr
                 .add_node(&node, false, &Default::default())
                 .await
@@ -3347,7 +3428,7 @@ mod tests {
             // The node reconnects at its pinned address: same CN, fresh
             // session stamped and persisted (what authenticate/open do).
             let mut renewed = make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
-            VSHandleImpl::stamp_new_session(&mut renewed);
+            stamp_new_session(&mut renewed);
             asm.actor_mgr
                 .add_node(&renewed, true, &Default::default())
                 .await
@@ -3373,7 +3454,7 @@ mod tests {
         async fn test_admission_under_guard_rejects_a_superseded_handle() {
             let asm = Arc::new(new_assembly_for_tests(None).await);
             let mut node = make_node_actor_defexp(NODE, "node-k3", "[fd5a:5052:3000::101]:1234");
-            VSHandleImpl::stamp_new_session(&mut node);
+            stamp_new_session(&mut node);
             asm.actor_mgr
                 .add_node(&node, false, &Default::default())
                 .await
@@ -3388,7 +3469,7 @@ mod tests {
                 .unwrap();
 
             let mut renewed = make_node_actor_defexp(NODE, "node-k3", "[fd5a:5052:3000::101]:1234");
-            VSHandleImpl::stamp_new_session(&mut renewed);
+            stamp_new_session(&mut renewed);
             asm.actor_mgr
                 .add_node(&renewed, true, &Default::default())
                 .await
@@ -3484,7 +3565,7 @@ mod tests {
                     let node_addr: std::net::IpAddr = NODE_A.parse().unwrap();
                     let mut node_a =
                         make_node_actor_defexp(NODE_A, "node-a", "[fd5a:5052:3000::101]:1234");
-                    VSHandleImpl::stamp_new_session(&mut node_a);
+                    stamp_new_session(&mut node_a);
                     asm.actor_mgr
                         .add_node(&node_a, false, &Default::default())
                         .await
@@ -3512,7 +3593,7 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     let mut renewed =
                         make_node_actor_defexp(NODE_A, "node-a", "[fd5a:5052:3000::101]:1234");
-                    VSHandleImpl::stamp_new_session(&mut renewed);
+                    stamp_new_session(&mut renewed);
                     asm.actor_mgr
                         .add_node(&renewed, true, &Default::default())
                         .await
@@ -3537,7 +3618,7 @@ mod tests {
                     let node_addr: std::net::IpAddr = NODE_A.parse().unwrap();
                     let mut node_a =
                         make_node_actor_defexp(NODE_A, "node-a", "[fd5a:5052:3000::101]:1234");
-                    VSHandleImpl::stamp_new_session(&mut node_a);
+                    stamp_new_session(&mut node_a);
                     asm.actor_mgr
                         .add_node(&node_a, false, &Default::default())
                         .await
@@ -3554,7 +3635,7 @@ mod tests {
                     // The node reconnects meanwhile: a new session is persisted.
                     let mut renewed =
                         make_node_actor_defexp(NODE_A, "node-a", "[fd5a:5052:3000::101]:1234");
-                    VSHandleImpl::stamp_new_session(&mut renewed);
+                    stamp_new_session(&mut renewed);
                     asm.actor_mgr
                         .add_node(&renewed, true, &Default::default())
                         .await
@@ -4342,7 +4423,7 @@ mod tests {
         /// Persist a live node with a fresh session and return its handle.
         async fn live_node(asm: &Arc<Assembly>) -> vsapi::v_s_handle::Client {
             let mut node = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
-            VSHandleImpl::stamp_new_session(&mut node);
+            stamp_new_session(&mut node);
             asm.actor_mgr
                 .add_node(&node, false, &Default::default())
                 .await
@@ -4442,7 +4523,7 @@ mod tests {
         async fn test_node_persist_waits_for_self_renewal_lock() {
             let asm = Arc::new(new_assembly_for_tests(None).await);
             let mut node = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
-            VSHandleImpl::stamp_new_session(&mut node);
+            stamp_new_session(&mut node);
             let guard = asm.policy_mgr.node_commit_lock.lock().await;
             let task = tokio::spawn({
                 let asm = asm.clone();
@@ -4469,7 +4550,7 @@ mod tests {
         async fn test_stale_handle_mint_refused_and_keeps_new_nonces() {
             let asm = Arc::new(new_assembly_for_tests(None).await);
             let mut node = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
-            VSHandleImpl::stamp_new_session(&mut node);
+            stamp_new_session(&mut node);
             asm.actor_mgr
                 .add_node(&node, false, &Default::default())
                 .await
@@ -4505,7 +4586,7 @@ mod tests {
         async fn test_node_persist_refused_when_policy_moved() {
             let asm = Arc::new(new_assembly_for_tests(None).await);
             let mut node = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
-            VSHandleImpl::stamp_new_session(&mut node);
+            stamp_new_session(&mut node);
             let stale = asm.policy_mgr.get_current_snapshot().vinst() + 1;
             node.add_attribute(Attribute::builder(key::VINST).value(stale.to_string()))
                 .unwrap();
@@ -4601,7 +4682,7 @@ mod tests {
             };
 
             let mut fresh = make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234");
-            VSHandleImpl::stamp_new_session(&mut fresh);
+            stamp_new_session(&mut fresh);
             let stale = asm.policy_mgr.get_current_snapshot().vinst() + 1;
             fresh
                 .add_attribute(Attribute::builder(key::VINST).value(stale.to_string()))
@@ -4644,6 +4725,444 @@ mod tests {
                         get_nonce(&handle).await,
                         Err(vsapi::ErrorCode::AuthRequired)
                     );
+                })
+                .await;
+        }
+    }
+
+    /// `requestBootstrapVisas` (ZODE_LINKS.md J2, J3, J6), driven through a real capnp
+    /// client. The relay docks the visa service; the joiner is its policy peer.
+    mod bootstrap_visas {
+        use super::*;
+        use crate::core_visas::tests::{RELAY, VSS_PORT, ZODE, build_net_with_policy};
+        use crate::test_helpers::{
+            make_adapter_actor_defexp, make_peering, policy_with_peerings_cns_and_tcp_services,
+        };
+        use crate::visa_bootstrap::BOOTSTRAP_VISA_LIFETIME;
+        use crate::vss::VssCmd;
+        use std::sync::Arc;
+        use zpr::vsapi_types::{BootstrapVisas, DockPepType, LinkState, Visa};
+
+        /// A node policy names but that is no peer of the relay.
+        const OTHER: &str = "fd5a:5052:3000::9";
+
+        /// The relay and the joiner (`ZODE`), linked in policy as `link-rz`, with CNs
+        /// `relay.zpr` and `zode.zpr`, plus `other.zpr` for [OTHER], which policy names but
+        /// does not peer with the relay. Both nodes are connected, and the built-in VSAPI and
+        /// VSS rules hold (see `core_visas::tests::build_net`). Returns (asm, relay, joiner).
+        async fn join_net() -> (Arc<Assembly>, IpAddr, IpAddr) {
+            let relay: IpAddr = RELAY.parse().unwrap();
+            let zode: IpAddr = ZODE.parse().unwrap();
+            let other: IpAddr = OTHER.parse().unwrap();
+            build_net_with_policy(policy_with_peerings_cns_and_tcp_services(
+                &[make_peering(relay, zode, "link-rz", vec![])],
+                &[
+                    (relay, "relay.zpr"),
+                    (zode, "zode.zpr"),
+                    (other, "other.zpr"),
+                ],
+                &[("vsapi", config::VSAPI_PORT), ("vss", VSS_PORT)],
+            ))
+            .await
+        }
+
+        /// As [join_net], with the joiner not connected: it has no actor, as before its
+        /// first join.
+        async fn join_net_unconnected_joiner() -> (Arc<Assembly>, IpAddr, IpAddr) {
+            let (asm, relay, zode) = join_net().await;
+            asm.actor_mgr.remove_node(&zode).await.unwrap();
+            asm.actor_mgr.remove_actor_by_zpr_addr(&zode).await.unwrap();
+            (asm, relay, zode)
+        }
+
+        /// A capnp handle for the node stored at `addr`, bound to its current session.
+        async fn handle_for(asm: &Arc<Assembly>, addr: &IpAddr) -> vsapi::v_s_handle::Client {
+            let actor = asm.actor_mgr.get_actor_by_zpr_addr(addr).await.unwrap();
+            capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), actor.unwrap()))
+        }
+
+        /// One `requestBootstrapVisas(peer_cn)` call: the decoded answer or the error code.
+        async fn request(
+            handle: &vsapi::v_s_handle::Client,
+            peer_cn: &str,
+        ) -> Result<BootstrapVisas, vsapi::ErrorCode> {
+            let mut req = handle.request_bootstrap_visas_request();
+            req.get().set_peer_cn(peer_cn);
+            let resp = req.send().promise.await.unwrap();
+            let res = resp.get().unwrap().get_res().unwrap();
+            match res.which().unwrap() {
+                vsapi::result::Which::Ok(ok) => Ok(BootstrapVisas::try_from(ok.unwrap()).unwrap()),
+                vsapi::result::Which::Error(err) => Err(err.unwrap().get_code().unwrap()),
+            }
+        }
+
+        /// `(source, source port, dest, dest port)` of a visa's TCP dock PEP.
+        fn pep_tuple(visa: &Visa) -> (IpAddr, u16, IpAddr, u16) {
+            let pep = visa.dock_pep.as_ref().expect("full visa");
+            let DockPepType::TCP(tpep) = &pep.pep else {
+                panic!("expected a TCP dock PEP, got {:?}", pep.pep)
+            };
+            (
+                pep.source_addr,
+                tpep.source_port,
+                pep.dest_addr,
+                tpep.dest_port,
+            )
+        }
+
+        /// IDs of a list of visas, in order.
+        fn ids(visas: &[Visa]) -> Vec<u64> {
+            visas.iter().map(|v| v.issuer_id).collect()
+        }
+
+        /// True if `id` is marked `PendingRevoke` on `node`: it has been revoked.
+        async fn revoked_on(asm: &Assembly, id: u64, node: &IpAddr) -> bool {
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(node)
+                .await
+                .unwrap()
+                .contains(&id)
+        }
+
+        /// The relay gets 2+2 visas: the joiner's copies and its own, of the same two
+        /// visas, forward (`joiner:0 -> vs:VSAPI`) then reverse. Each path is stitched from
+        /// the peering, `[joiner, relay]`, never routed, even though the joiner is connected
+        /// here and the router knows its link (a routed path could revisit the joiner). Both
+        /// copies are recorded installed, never pending: the relay delivers them.
+        #[tokio::test]
+        async fn relay_gets_both_directions_for_its_peer() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, zode) = join_net().await;
+                    let vs = asm.config.get_vs_addr();
+                    let vsapi_port = config::VSAPI_PORT;
+
+                    let bv = request(&handle_for(&asm, &relay).await, "zode.zpr")
+                        .await
+                        .expect("the relay may ask for its peer");
+
+                    assert_eq!(
+                        ids(&bv.peer),
+                        ids(&bv.relay),
+                        "two copies of the same visas"
+                    );
+                    let [fwd, rev] = [bv.peer[0].issuer_id, bv.peer[1].issuer_id];
+                    assert_ne!(fwd, rev);
+                    for copies in [&bv.peer, &bv.relay] {
+                        assert_eq!(pep_tuple(&copies[0]), (zode, 0, vs, vsapi_port));
+                        assert_eq!(pep_tuple(&copies[1]), (vs, vsapi_port, zode, 0));
+                    }
+                    // The joiner is the forward visa's ingress and forwards to the relay; the
+                    // relay is the reverse visa's ingress and forwards to the joiner.
+                    assert_eq!(bv.peer[0].fwd_pep.as_ref().unwrap().next_hop, relay);
+                    assert!(bv.relay[0].fwd_pep.is_none());
+                    assert_eq!(bv.relay[0].prev_hop, Some(zode));
+                    assert_eq!(bv.relay[1].fwd_pep.as_ref().unwrap().next_hop, zode);
+                    assert!(bv.peer[1].fwd_pep.is_none());
+                    assert_eq!(bv.peer[1].prev_hop, Some(relay));
+
+                    for (id, path) in [(fwd, vec![zode, relay]), (rev, vec![relay, zode])] {
+                        let md = asm
+                            .visa_mgr
+                            .get_visa_metadata_by_id(id)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(md.path, Some(path), "visa {id}: stitched path");
+                        assert_eq!(md.zpl, crate::visa_bootstrap::BOOTSTRAP_VISA_ZPL);
+                        for node in [relay, zode] {
+                            let installed = asm
+                                .visa_mgr
+                                .get_installed_visa_ids_for_node(&node)
+                                .await
+                                .unwrap();
+                            assert!(installed.contains(&id), "visa {id} installed on {node}");
+                        }
+                    }
+                })
+                .await;
+        }
+
+        /// The bootstrap visas are short-lived (gate g89 q3): they expire
+        /// [BOOTSTRAP_VISA_LIFETIME] after they were minted.
+        #[tokio::test]
+        async fn bootstrap_visas_expire_at_the_short_lifetime() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, _zode) = join_net_unconnected_joiner().await;
+                    let before = std::time::SystemTime::now();
+                    let bv = request(&handle_for(&asm, &relay).await, "zode.zpr")
+                        .await
+                        .unwrap();
+                    let after = std::time::SystemTime::now();
+                    for visa in bv.peer.iter().chain(&bv.relay) {
+                        // The wire carries whole milliseconds, so allow one below `before`.
+                        let earliest = before + BOOTSTRAP_VISA_LIFETIME - Duration::from_millis(1);
+                        assert!(
+                            visa.expires >= earliest
+                                && visa.expires <= after + BOOTSTRAP_VISA_LIFETIME,
+                            "visa {} expires outside the bootstrap lifetime",
+                            visa.issuer_id
+                        );
+                    }
+                })
+                .await;
+        }
+
+        /// J3: only the node the visa service docks on may ask. A connected node that is
+        /// not the relay, asking for its own policy peer (the relay), is refused, and
+        /// nothing is minted.
+        #[tokio::test]
+        async fn a_caller_that_is_not_the_relay_is_invalid_operation() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, zode) = join_net().await;
+                    assert_eq!(
+                        request(&handle_for(&asm, &zode).await, "relay.zpr")
+                            .await
+                            .unwrap_err(),
+                        vsapi::ErrorCode::InvalidOperation
+                    );
+                    assert!(
+                        asm.visa_mgr
+                            .get_visa_ids_for_actors(&[relay, zode])
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                })
+                .await;
+        }
+
+        /// J3: the CN must name a peer in the relay's topology. An unknown CN, a node policy
+        /// names that is no peer of the relay, the relay's own CN, and a peer whose link was
+        /// reported failed (left out of topology, R13a) are all refused, and nothing is
+        /// minted.
+        #[tokio::test]
+        async fn a_cn_not_in_the_callers_topology_is_not_found() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, zode) = join_net_unconnected_joiner().await;
+                    let handle = handle_for(&asm, &relay).await;
+                    for cn in ["nobody.zpr", "other.zpr", "relay.zpr", ""] {
+                        assert_eq!(
+                            request(&handle, cn).await.unwrap_err(),
+                            vsapi::ErrorCode::NotFound,
+                            "CN {cn:?}"
+                        );
+                    }
+                    asm.topo_mgr.record_link_states(
+                        &asm.topo_mgr.ops().await,
+                        &relay,
+                        None,
+                        vec![LinkStateReport {
+                            peer_cn: "zode.zpr".to_string(),
+                            state: LinkState::Failed,
+                        }],
+                        &|| asm.policy_mgr.get_current_snapshot(),
+                    );
+                    assert_eq!(
+                        request(&handle, "zode.zpr").await.unwrap_err(),
+                        vsapi::ErrorCode::NotFound,
+                        "a failed pair is not in the relay's topology"
+                    );
+                    assert!(
+                        asm.visa_mgr
+                            .get_visa_ids_for_actors(&[relay, zode])
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                })
+                .await;
+        }
+
+        /// A handle whose session is no longer current gets `authRequired`.
+        #[tokio::test]
+        async fn a_dead_session_is_auth_required() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, zode) = join_net_unconnected_joiner().await;
+                    let handle = handle_for(&asm, &relay).await;
+                    // The relay re-authenticates: a new session, so the old handle is dead.
+                    let mut actor = asm
+                        .actor_mgr
+                        .get_actor_by_zpr_addr(&relay)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    stamp_new_session(&mut actor);
+                    asm.actor_mgr
+                        .update_actor(&actor, &Default::default())
+                        .await
+                        .unwrap();
+
+                    assert_eq!(
+                        request(&handle, "zode.zpr").await.unwrap_err(),
+                        vsapi::ErrorCode::AuthRequired
+                    );
+                    assert!(
+                        asm.visa_mgr
+                            .get_visa_ids_for_actors(&[zode])
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                })
+                .await;
+        }
+
+        /// J6: every request is a new join. Two requests mint distinct visas, and the
+        /// second revokes the first pair: the relay's new request is the proof that the
+        /// link those were for is gone (R5).
+        #[tokio::test]
+        async fn every_request_mints_new_visas_and_revokes_the_previous_pair() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, _zode) = join_net_unconnected_joiner().await;
+                    let handle = handle_for(&asm, &relay).await;
+                    let first = request(&handle, "zode.zpr").await.unwrap();
+                    let second = request(&handle, "zode.zpr").await.unwrap();
+
+                    for id in ids(&first.peer) {
+                        assert!(!ids(&second.peer).contains(&id), "new visas every time");
+                        assert!(
+                            revoked_on(&asm, id, &relay).await,
+                            "previous visa {id} revoked"
+                        );
+                    }
+                    for id in ids(&second.peer) {
+                        assert!(!revoked_on(&asm, id, &relay).await);
+                    }
+                })
+                .await;
+        }
+
+        /// The rejoin rule. A request while the joiner still has a live VS-API session ends
+        /// that session (its handle goes dead and its VSS worker is stopped), revokes its
+        /// core visas, and marks every other visa installed on it pending, so it is pushed
+        /// again after a reconnect. The node actor and its adapters stay, so the joiner may
+        /// still `reconnect`. No visa is edited.
+        #[tokio::test]
+        async fn a_request_for_a_live_peer_ends_its_session_and_keeps_its_actor() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, zode) = join_net().await;
+                    // The joiner's live session: a session id, an adapter, a registered VSS,
+                    // its three core visas, and one other visa (to the relay's VSS port),
+                    // all installed on it.
+                    let mut actor = asm
+                        .actor_mgr
+                        .get_actor_by_zpr_addr(&zode)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    stamp_new_session(&mut actor);
+                    asm.actor_mgr
+                        .update_actor(&actor, &Default::default())
+                        .await
+                        .unwrap();
+                    let session = actor
+                        .get_attribute(key::SESSION)
+                        .and_then(|a| a.get_single_value().ok())
+                        .map(str::to_string);
+                    let old_handle = VSHandleImpl::new(asm.clone(), actor.clone());
+                    let adapter: IpAddr = "fd5a:5052:3000::70".parse().unwrap();
+                    asm.actor_mgr
+                        .add_adapter_via_node(
+                            &make_adapter_actor_defexp(&adapter.to_string(), "laptop"),
+                            &zode,
+                            &Default::default(),
+                        )
+                        .await
+                        .unwrap();
+                    asm.actor_mgr
+                        .set_node_vss(&zode, &SocketAddr::new(zode, VSS_PORT))
+                        .await
+                        .unwrap();
+                    let [fwd, rev] =
+                        crate::core_visas::issue_vsapi_visas(&asm, &zode, session.as_deref())
+                            .await
+                            .unwrap();
+                    let vss = crate::core_visas::issue_vss_visa(
+                        &asm,
+                        &zode,
+                        VSS_PORT,
+                        session.as_deref(),
+                    )
+                    .await
+                    .unwrap();
+                    let other = match request_visa_wait_response(
+                        &asm,
+                        &zode,
+                        PacketDesc::new_tcp(&zode.to_string(), &relay.to_string(), 40000, VSS_PORT)
+                            .unwrap(),
+                        config::DEFAULT_VISA_REQ_TIMEOUT,
+                    )
+                    .await
+                    .unwrap()
+                    {
+                        VisaDecision::Allow(visa, _) => visa.issuer_id,
+                        VisaDecision::Deny(code) => panic!("other visa denied: {code:?}"),
+                    };
+                    for id in [fwd, rev, vss, other] {
+                        asm.visa_mgr.visa_installed(id, &zode).await.unwrap();
+                    }
+                    let (vss_tx, mut vss_rx) = tokio::sync::mpsc::channel(8);
+                    asm.vss_mgr.insert_test_handle(zode, vss_tx);
+
+                    let bv = request(&handle_for(&asm, &relay).await, "zode.zpr")
+                        .await
+                        .expect("a live peer's rejoin is granted");
+
+                    assert!(
+                        !old_handle.node_is_live().await,
+                        "the old session's handle is dead"
+                    );
+                    let stored = asm.actor_mgr.get_actor_by_zpr_addr(&zode).await.unwrap();
+                    assert!(stored.is_some_and(|a| a.is_node()), "the node actor stays");
+                    assert_eq!(
+                        asm.actor_mgr
+                            .get_adapters_connected_to_node(&zode)
+                            .await
+                            .unwrap(),
+                        vec![adapter],
+                        "its adapters stay"
+                    );
+                    for id in [fwd, rev, vss] {
+                        assert!(revoked_on(&asm, id, &zode).await, "core visa {id} revoked");
+                    }
+                    assert!(!revoked_on(&asm, other, &zode).await);
+                    assert!(
+                        asm.visa_mgr
+                            .get_pending_visa_ids_for_node(&zode)
+                            .await
+                            .unwrap()
+                            .contains(&other),
+                        "the other visa is pending re-push"
+                    );
+                    let installed = asm
+                        .visa_mgr
+                        .get_installed_visa_ids_for_node(&zode)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        {
+                            let mut v = installed;
+                            v.sort();
+                            v
+                        },
+                        ids(&bv.peer),
+                        "only the new bootstrap visas are installed on the joiner"
+                    );
+                    let stopped = loop {
+                        match tokio::time::timeout(Duration::from_secs(2), vss_rx.recv()).await {
+                            Ok(Some(VssCmd::Stop())) => break true,
+                            Ok(Some(_)) => continue,
+                            _ => break false,
+                        }
+                    };
+                    assert!(stopped, "the old session's VSS worker is stopped");
                 })
                 .await;
         }

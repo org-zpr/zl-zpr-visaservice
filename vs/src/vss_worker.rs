@@ -27,7 +27,6 @@ use crate::error::VssSyncError;
 use crate::logging::targets::VSS;
 use crate::net_mgr;
 use crate::policy_mgr::ResolvedPeer;
-use crate::visa_bootstrap;
 use crate::vss::VssCmd;
 
 /// Default timeout for a single Cap'n Proto RPC call.
@@ -512,7 +511,7 @@ async fn send_topology(
     node_addr: &IpAddr,
     vss_handle: &v1::v_s_s_handle::Client,
 ) {
-    // One snapshot for both the resolved peers and the bootstrap-visa peer lookup inside.
+    // One snapshot for both the resolved peers and the peer lookup inside.
     let psnap = asm.policy_mgr.get_current_snapshot();
     let peers = psnap.resolved_peers_for_node(node_addr);
 
@@ -806,7 +805,7 @@ async fn vss_do_configure(
 ///
 /// This is the one place the wire-level vsapi `Link` structs are built: `peers` carries
 /// only what the policy manager computed (link id + resolved substrate address), and the
-/// full `Link` — role, peer address, bootstrap visas — is materialized here, just before
+/// full `Link` — role, peer address, peer ZPR address and CN — is materialized here, just before
 /// it goes on the wire.
 ///
 /// `node_addr` is the ZPR address of the node on the other end of `vss_handle`; the links are
@@ -821,11 +820,10 @@ async fn vss_do_set_topology(
     policy: Arc<Policy>,
     peers: Vec<ResolvedPeer>,
 ) -> Result<(), VssSyncError> {
-    // Each link names its peer's ZPR address and CN and, on the relay only, carries the
-    // joining peer's bootstrap visas: one for the peer's own SYN to VSAPI, one for the visa
-    // service's reply. They belong to the peer, not to `node_addr`, which holds them and hands
-    // them off when the peer connects. See [crate::visa_bootstrap] for the rules.
-    let links = topology_links(&asm, &policy, node_addr, peers).await?;
+    // Each link names its peer's ZPR address and CN. It carries no visas (J8): a relay asks
+    // for a joining peer's bootstrap visas when that peer's link comes up
+    // (`requestBootstrapVisas`, see [crate::visa_bootstrap]).
+    let links = topology_links(&asm, &policy, node_addr, peers);
 
     let mut req = vss_handle.set_topology_request();
     let req_builder = req.get();
@@ -842,25 +840,23 @@ async fn vss_do_set_topology(
 }
 
 /// The `Link`s of `node_addr`'s topology message: one per resolved peer, each naming the
-/// peer's ZPR address and CN, and carrying the peer's bootstrap visas when it may need them
-/// (see [visa_bootstrap::visas_for_link]). A link whose owner reported it `failed` is left
-/// out until the pair is cleared (R13a, `TopologyMgr::is_failed_pair`).
+/// peer's ZPR address and CN. No link carries visas (J8). A link whose owner reported it
+/// `failed` is left out until the pair is cleared (R13a, `TopologyMgr::is_failed_pair`).
 ///
 /// `policy` must be the snapshot `peers` was computed from, as for [vss_do_set_topology].
-pub(crate) async fn topology_links(
-    asm: &Arc<Assembly>,
-    policy: &Arc<Policy>,
+pub(crate) fn topology_links(
+    asm: &Assembly,
+    policy: &Policy,
     node_addr: &IpAddr,
     peers: Vec<ResolvedPeer>,
-) -> Result<Vec<Link>, VssSyncError> {
+) -> Vec<Link> {
     // Both ends of an edge share a link_id, and each end's `remote_zpr_addr` is only
     // meaningful under its own node key -- so resolve the link within `node_addr`'s peers.
     let node_peers = policy.get_peers_for_node(node_addr).unwrap_or_default();
     let mut links: Vec<Link> = Vec::with_capacity(peers.len());
     for (link_id, sock_addr) in peers {
         // `zpr_addr` is required on the wire (the reader rejects a link without it), so a
-        // link with no peer entry cannot be sent at all anymore: skip it instead of the old
-        // "send without bootstrap visas" fallback.
+        // link with no peer entry cannot be sent at all: skip it.
         let Some(peer) = node_peers.iter().find(|p| p.link_id == link_id) else {
             warn!(target: VSS, "no peer entry for link {link_id} under node {node_addr}; skipping it (zprAddr unknown)");
             continue;
@@ -877,41 +873,23 @@ pub(crate) async fn topology_links(
         }
         // The CN the peer's link certificate must carry (zl-zipline#221). A peer policy does
         // not name is left out (operator, pd g44 q2): its node would refuse an unnamed peer
-        // (zl-zipline#220), and its bootstrap visas would have no CN to be bound to.
+        // (zl-zipline#220), and a relay could not ask for its bootstrap visas by CN (J2).
         let Some(peer_cn) = policy.node_cn_for_addr(&peer.remote_zpr_addr) else {
             warn!(target: VSS, "no CN in policy for peer {} of node {node_addr} (link {link_id}); skipping the link", peer.remote_zpr_addr);
             continue;
         };
-        let mut link = Link {
+        links.push(Link {
             link_id,
             role: LinkRole::Active, // only "active" support at the moment.
             peer: SockAddr {
                 addr: sock_addr.ip(),
                 port: sock_addr.port(),
             },
-            visas: Vec::new(),
             zpr_addr: peer.remote_zpr_addr,
             peer_cn: peer_cn.to_string(),
-        };
-        // The link is between `node_addr` and `peer.remote_zpr_addr`. Fail the whole call rather
-        // than sending the link bare: without the visas the peer cannot reach VSAPI, so the link
-        // is useless, and returning Ok would let `send_topology` mark topology synced and stop
-        // housekeeping from ever retrying. Minting is idempotent, so the retry is free.
-        //
-        // An already-connected peer is the exception and yields no visas -- it has a VSAPI
-        // session of its own and asks for what it needs.
-        let visas = visa_bootstrap::visas_for_link(asm, policy, &peer.remote_zpr_addr, node_addr)
-            .await
-            .map_err(|e| {
-                VssSyncError::Internal(format!(
-                    "failed to create bootstrap visas for future peer {}: {e}",
-                    peer.remote_zpr_addr
-                ))
-            })?;
-        link.visas.extend(visas);
-        links.push(link);
+        });
     }
-    Ok(links)
+    links
 }
 
 #[cfg(test)]

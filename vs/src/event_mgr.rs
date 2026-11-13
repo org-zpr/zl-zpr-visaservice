@@ -121,8 +121,7 @@ async fn handle_actor_leaves(
 pub(crate) async fn send_topology_to(asm: &Assembly, psnap: &PolicySnapshot, nodes: &[IpAddr]) {
     let futs = nodes.iter().filter_map(|naddr| {
         let peers = psnap.resolved_peers_for_node(naddr);
-        // Same snapshot the peers came from: the worker builds the wire Links and
-        // mints bootstrap visas off it.
+        // Same snapshot the peers came from: the worker builds the wire Links off it.
         let policy = psnap.policy_arc();
         asm.vss_mgr.get_handle(naddr).map(|vss_handle| async move {
             if let Err(e) = vss_handle.set_topology(peers, policy).await {

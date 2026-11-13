@@ -371,9 +371,9 @@ impl TopologyMgr {
     /// of each cleared pair; the caller sends those nodes `setTopology` once it has
     /// dropped the guard (see `vsapi_worker::repropose_failed_pairs`).
     ///
-    /// This is the one entry point for "the pair changed". In #250 the only such event
-    /// is a (re)connect of the node's VS-API session; #227's `updateSubstrateAddr` and
-    /// v2's ZBOLT/rendezvous step are meant to call it too.
+    /// This is the one entry point for "the pair changed". Today the only such event is a
+    /// (re)connect of the node's VS-API session; v2's ZBOLT/rendezvous step is meant to
+    /// call it too.
     pub fn clear_failed_pairs_for(&self, _ops: &TopoOps<'_>, node: &IpAddr) -> Vec<IpAddr> {
         self.link_state.lock().unwrap().clear_failed_for(node)
     }
