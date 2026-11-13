@@ -243,6 +243,10 @@ impl VisaMgr {
     /// that is still connected a routed path could run back through the peer itself. In v1
     /// the relay is the node the visa service docks on (J3), so the path ends there.
     ///
+    /// The visa carries no session keys. The peer's DH public key may still be stored from
+    /// its previous join, but it may have restarted with a new one, and nothing it holds now
+    /// has been authenticated: it authenticates over these visas.
+    ///
     /// Every call mints a NEW visa, valid for [BOOTSTRAP_VISA_LIFETIME] (J6). It is recorded
     /// installed on both nodes at once, never pending: the relay hands both copies over
     /// itself (installing its own, passing the peer's on in ZDP message 146), so nothing may
@@ -280,7 +284,8 @@ impl VisaMgr {
         };
         let vwm = self
             .create_visa_with_path(
-                asm,
+                // No session keys (see above).
+                KeySet::new(&[], &[]),
                 relay,
                 db::NodeVisaState::Installed,
                 &pkt_data,
@@ -350,7 +355,7 @@ impl VisaMgr {
         let path = path_for_flow(asm, &pdesc.five_tuple.source_addr, route).await?;
         let vwmd = self
             .create_visa_with_path(
-                asm,
+                session_key_for(asm, pdesc).await?,
                 requesting_node,
                 db::NodeVisaState::PendingInstall,
                 pdesc,
@@ -444,7 +449,7 @@ impl VisaMgr {
     /// [VisaMgr::mint_bootstrap_visa].
     async fn create_visa_with_path(
         &self,
-        asm: &Assembly,
+        session_key: KeySet,
         requesting_node: &IpAddr,
         requester_state: db::NodeVisaState,
         pdesc: &PacketDesc,
@@ -519,19 +524,11 @@ impl VisaMgr {
             metadata.signal_msgs.push(sig.message.clone());
         }
 
-        let mut ingress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.source_addr).await?;
-        let mut egress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.dest_addr).await?;
-
-        if ingress_key.is_empty() || egress_key.is_empty() {
-            ingress_key.clear();
-            egress_key.clear();
-        }
-
         let pep = DockPep {
             pep,
             source_addr: pdesc.five_tuple.source_addr.clone(),
             dest_addr: pdesc.five_tuple.dest_addr.clone(),
-            session_key: KeySet::new(&ingress_key, &egress_key),
+            session_key,
         };
 
         let visa = Visa {
@@ -1027,6 +1024,18 @@ impl VisaMgr {
             Err(e) => Err(ServiceError::from(e)),
         }
     }
+}
+
+/// The session key for a visa on `pdesc`: the source actor's A2A DH public key as the ingress
+/// key and the destination actor's as the egress key, or no keys at all unless both actors
+/// sent one.
+async fn session_key_for(asm: &Assembly, pdesc: &PacketDesc) -> Result<KeySet, ServiceError> {
+    let ingress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.source_addr).await?;
+    let egress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.dest_addr).await?;
+    if ingress_key.is_empty() || egress_key.is_empty() {
+        return Ok(KeySet::new(&[], &[]));
+    }
+    Ok(KeySet::new(&ingress_key, &egress_key))
 }
 
 /// Gets public key as bytes.

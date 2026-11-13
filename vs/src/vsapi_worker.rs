@@ -4909,6 +4909,48 @@ mod tests {
                 .await;
         }
 
+        /// A bootstrap visa carries no session keys, even for a joiner whose actor (and DH
+        /// public key) is still stored from its previous join: the joiner may have restarted
+        /// with a new key, and nothing it holds now has been authenticated yet.
+        #[tokio::test]
+        async fn bootstrap_visas_carry_no_session_keys() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    use libeval::pubkey::encode_public_key;
+                    let (asm, relay, zode) = join_net().await;
+                    for addr in [zode, asm.config.get_vs_addr()] {
+                        let mut actor = asm
+                            .actor_mgr
+                            .get_actor_by_zpr_addr(&addr)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        actor
+                            .add_attribute(
+                                Attribute::builder(key::A2A_DH_PUBKEY)
+                                    .value(encode_public_key(&PublicKey::new(&[7u8; 32]))),
+                            )
+                            .unwrap();
+                        asm.actor_mgr
+                            .update_actor(&actor, &Default::default())
+                            .await
+                            .unwrap();
+                    }
+                    let bv = request(&handle_for(&asm, &relay).await, "zode.zpr")
+                        .await
+                        .unwrap();
+                    for visa in bv.peer.iter().chain(&bv.relay) {
+                        let keys = &visa.dock_pep.as_ref().unwrap().session_key;
+                        assert!(
+                            keys.ingress_key.is_empty() && keys.egress_key.is_empty(),
+                            "visa {} carries a stored DH key",
+                            visa.issuer_id
+                        );
+                    }
+                })
+                .await;
+        }
+
         /// J3: only the node the visa service docks on may ask. A connected node that is
         /// not the relay, asking for its own policy peer (the relay), is refused, and
         /// nothing is minted.
