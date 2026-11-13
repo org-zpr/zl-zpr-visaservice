@@ -105,6 +105,10 @@ fn topology_peer_addr(
 /// down ([end_previous_join]) and both directions of its VS-API flow are minted, and the
 /// answer holds the joiner's copies (`peer`) and the relay's (`relay`), forward first.
 ///
+/// `peer_cn` is the raw bytes off the wire, decoded only once the session and relay checks
+/// have passed (g94 q3): a caller that may not ask is refused the same way whatever it
+/// sent, and bytes that are not UTF-8 name no peer.
+///
 /// The checks, the teardown and the mint run as one step under the issuance lock and the
 /// topology lock, so they are atomic against connect, disconnect, core-visa issuance and
 /// policy passes, and the visas record the policy generation the peering was read from.
@@ -114,7 +118,7 @@ pub(crate) async fn request_bootstrap_visas(
     asm: &Arc<Assembly>,
     relay: &IpAddr,
     relay_session: Option<&str>,
-    peer_cn: &str,
+    peer_cn: &[u8],
 ) -> Result<BootstrapVisas, Refusal> {
     // Lock order: issuance lock, then topology lock (see core_visas::lock_issuance).
     let issuing = core_visas::lock_issuance().await;
@@ -126,6 +130,9 @@ pub(crate) async fn request_bootstrap_visas(
     if !is_relay(asm, relay) {
         return Err(Refusal::NotRelay);
     }
+    let Ok(peer_cn) = std::str::from_utf8(peer_cn) else {
+        return Err(Refusal::UnknownPeer);
+    };
     // Policy installs commit under the topology lock, so this snapshot stays current until
     // the guard is dropped.
     let psnap = asm.policy_mgr.get_current_snapshot();

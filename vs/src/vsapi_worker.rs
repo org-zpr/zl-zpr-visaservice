@@ -2374,8 +2374,9 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
     /// docks on may ask, and only for a CN in its own topology.
     ///
     /// Errors (vs.capnp): `authRequired` on a dead handle; `invalidOperation` when the
-    /// caller is not the relay; `notFound` when `peerCn` names no peer in the caller's
-    /// topology (or is not valid UTF-8); `internal` when the visas could not be minted.
+    /// caller is not the relay, whatever its `peerCn`; `notFound` when `peerCn` names no
+    /// peer in the caller's topology (or is not valid UTF-8); `internal` when the visas
+    /// could not be minted.
     async fn request_bootstrap_visas(
         self: Rc<Self>,
         params: vsapi::v_s_handle::RequestBootstrapVisasParams,
@@ -2398,16 +2399,11 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             return Ok(());
         };
         self.update_last_seen_time(&relay).await;
-        // An unreadable CN names no peer.
-        let Ok(peer_cn) = params.get()?.get_peer_cn()?.to_str() else {
-            warn!(target: API, "request_bootstrap_visas from {relay}: peerCn is not valid UTF-8: refused");
-            refuse(
-                &mut results,
-                vsapi::ErrorCode::NotFound,
-                "peerCn names no peer",
-            );
-            return Ok(());
-        };
+        // Handed over undecoded: it is decoded only after the relay check (g94 q3), so a
+        // caller that may not ask gets `invalidOperation` whatever bytes it sent.
+        let peer_cn = params.get()?.get_peer_cn()?.as_bytes();
+        // For logging only: the decoded CN is never used for a decision here.
+        let peer_cn_for_log = String::from_utf8_lossy(peer_cn);
 
         let refusal = match crate::visa_bootstrap::request_bootstrap_visas(
             &self.asm,
@@ -2438,11 +2434,11 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
                 "peerCn is not a peer in the caller's topology",
             ),
             Refusal::Failed(e) => {
-                error!(target: API, "request_bootstrap_visas from {relay} for {peer_cn:?}: {e}");
+                error!(target: API, "request_bootstrap_visas from {relay} for {peer_cn_for_log:?}: {e}");
                 (vsapi::ErrorCode::Internal, "failed to mint bootstrap visas")
             }
         };
-        warn!(target: API, "request_bootstrap_visas from {relay} for {peer_cn:?}: refused ({code:?})");
+        warn!(target: API, "request_bootstrap_visas from {relay} for {peer_cn_for_log:?}: refused ({code:?})");
         refuse(&mut results, code, message);
         Ok(())
     }
@@ -4814,8 +4810,16 @@ mod tests {
             handle: &vsapi::v_s_handle::Client,
             peer_cn: &str,
         ) -> Result<BootstrapVisas, vsapi::ErrorCode> {
+            request_raw(handle, peer_cn.as_bytes()).await
+        }
+
+        /// As [request], with `peer_cn` sent as raw bytes, which need not be valid UTF-8.
+        async fn request_raw(
+            handle: &vsapi::v_s_handle::Client,
+            peer_cn: &[u8],
+        ) -> Result<BootstrapVisas, vsapi::ErrorCode> {
             let mut req = handle.request_bootstrap_visas_request();
-            req.get().set_peer_cn(peer_cn);
+            req.get().set_peer_cn(capnp::text::Reader::from(peer_cn));
             let resp = req.send().promise.await.unwrap();
             let res = resp.get().unwrap().get_res().unwrap();
             match res.which().unwrap() {
@@ -5076,6 +5080,34 @@ mod tests {
                             .await
                             .unwrap()
                             .is_empty()
+                    );
+                })
+                .await;
+        }
+
+        /// J3: the relay check comes before `peerCn` is even decoded. A caller that is not
+        /// the relay gets `invalidOperation` whatever its `peerCn` bytes are -- even bytes
+        /// that are not valid UTF-8, which the relay itself gets `notFound` for -- so how
+        /// its CN parses tells it nothing (g94 q3).
+        #[tokio::test]
+        async fn a_caller_that_is_not_the_relay_is_invalid_operation_whatever_its_peer_cn() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, zode) = join_net().await;
+                    let not_utf8: &[u8] = &[0xff, 0xfe, b'z'];
+                    assert_eq!(
+                        request_raw(&handle_for(&asm, &zode).await, not_utf8)
+                            .await
+                            .unwrap_err(),
+                        vsapi::ErrorCode::InvalidOperation,
+                        "a non-relay caller is refused before its CN is read"
+                    );
+                    assert_eq!(
+                        request_raw(&handle_for(&asm, &relay).await, not_utf8)
+                            .await
+                            .unwrap_err(),
+                        vsapi::ErrorCode::NotFound,
+                        "the relay's unreadable CN names no peer"
                     );
                 })
                 .await;
