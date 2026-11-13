@@ -37,6 +37,7 @@ use zpr::vsapi_types::BootstrapVisas;
 use crate::assembly::Assembly;
 use crate::connection_control::ConnectionControl;
 use crate::core_visas::{self, IssueGuard};
+use crate::db::VisaMetadata;
 use crate::error::ServiceError;
 use crate::logging::targets::API;
 use crate::policy_mgr::PolicySnapshot;
@@ -95,6 +96,41 @@ fn topology_peer_addr(
     .into_iter()
     .find(|link| link.peer_cn == peer_cn)
     .map(|link| link.zpr_addr)
+}
+
+/// Whether policy still authorises the bootstrap visa `metadata` describes (g94 q1): the node
+/// it was issued to is still the relay, and that relay's topology under `psnap` still names
+/// the joiner, by the CN policy gives the joiner's address. These are the checks
+/// [request_bootstrap_visas] mints on ([is_relay], [topology_peer_addr]), and nothing else.
+///
+/// A policy or attribute sweep rechecks a bootstrap visa with this instead of evaluating it
+/// as ordinary traffic (`VisaMgr::recheck_visa_allowed`): the visa was minted from the
+/// peering, not from policy evaluation, so the route and the joiner's link state play no
+/// part. They cannot: a live peer's rejoin forgets the joiner's link reports
+/// ([end_previous_join]), so the joiner has no route until it reports again, and a routed
+/// recheck would revoke the very pair that rejoin needs.
+///
+/// ponytail: the visa does not record the CN it was minted for, so the joiner's CN is read
+/// from `psnap`, and a policy that only renames the joiner keeps the pair. It carries only
+/// the joiner's unauthenticated VS-API flow and expires within [BOOTSTRAP_VISA_LIFETIME];
+/// record the CN on the visa if that ever matters.
+pub(crate) fn bootstrap_visa_authorized(
+    asm: &Assembly,
+    psnap: &PolicySnapshot,
+    metadata: &VisaMetadata,
+) -> bool {
+    // A bootstrap visa is issued to the relay (`VisaMgr::mint_bootstrap_visa`).
+    let relay = metadata.requesting_node;
+    // The joiner is the client of its VS-API flow: the source of the forward visa and the
+    // destination of the reverse one.
+    let joiner = match metadata.direction {
+        Direction::Forward => metadata.five_tuple.source_addr,
+        Direction::Reverse => metadata.five_tuple.dest_addr,
+    };
+    let Some(joiner_cn) = psnap.policy().node_cn_for_addr(&joiner) else {
+        return false;
+    };
+    is_relay(asm, &relay) && topology_peer_addr(asm, psnap, &relay, joiner_cn) == Some(joiner)
 }
 
 /// `requestBootstrapVisas` (J2, J3, J6): `relay`, whose VS-API session is `relay_session`,

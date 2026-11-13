@@ -804,6 +804,10 @@ impl VisaMgr {
     /// TODO: Possibly needs more thought for how to deal with cases where an auth service
     /// is removed by policy.
     ///
+    /// A bootstrap visa ([BOOTSTRAP_VISA_ZPL]) is not evaluated either: it was minted from
+    /// the relay's policy peering with the joiner, so it is rechecked against that alone
+    /// (`visa_bootstrap::bootstrap_visa_authorized`), whatever the route or link state.
+    ///
     /// ### returns
     /// - `SkipUnresolvedActor` = an actor could not be resolved (skip, don't bump)
     /// - `AllowSameRoute` = still allowed on the same route
@@ -820,6 +824,17 @@ impl VisaMgr {
         metadata: &VisaMetadata,
         psnap: &PolicySnapshot,
     ) -> Result<VisaRecheck, ServiceError> {
+        if metadata.zpl == BOOTSTRAP_VISA_ZPL {
+            // Its path is stitched from the peering and never moves, so "same route" holds
+            // for as long as the peering does.
+            return Ok(
+                if crate::visa_bootstrap::bootstrap_visa_authorized(asm, psnap, metadata) {
+                    VisaRecheck::AllowSameRoute
+                } else {
+                    VisaRecheck::Revoke
+                },
+            );
+        }
         // TODO: comm_flags is not persisted; for now default to BiDirectional.
         let pkt = PacketDesc {
             five_tuple: metadata.five_tuple.clone(),

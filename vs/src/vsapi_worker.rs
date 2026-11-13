@@ -5368,5 +5368,74 @@ mod tests {
                 })
                 .await;
         }
+
+        /// A policy or attribute sweep rechecks a bootstrap visa against what authorised it
+        /// -- the relay's policy peering with the joiner, and the joiner's CN -- never
+        /// against the route (g94 q1). A live peer's rejoin forgets its link reports, so the
+        /// joiner has no route until it reports again: a sweep in that window must keep the
+        /// new pair. Once policy drops the peering, or the joiner's CN, the next sweep
+        /// revokes the pair.
+        #[tokio::test]
+        async fn a_sweep_keeps_a_bootstrap_pair_while_its_peering_holds() {
+            use crate::visa_reconciler::{SweepReason, revalidate_visas};
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let relay: IpAddr = RELAY.parse().unwrap();
+                    let zode: IpAddr = ZODE.parse().unwrap();
+                    let other: IpAddr = OTHER.parse().unwrap();
+                    let cns = [
+                        (relay, "relay.zpr"),
+                        (zode, "zode.zpr"),
+                        (other, "other.zpr"),
+                    ];
+                    let services = [("vsapi", config::VSAPI_PORT), ("vss", VSS_PORT)];
+                    let peering = [make_peering(relay, zode, "link-rz", vec![])];
+                    // The two ways policy can withdraw what authorised the pair.
+                    let without_peering =
+                        policy_with_peerings_cns_and_tcp_services(&[], &cns, &services);
+                    let without_joiner_cn = policy_with_peerings_cns_and_tcp_services(
+                        &peering,
+                        &[cns[0], cns[2]],
+                        &services,
+                    );
+                    for withdrawn in [without_peering, without_joiner_cn] {
+                        // The joiner is connected (a node actor), so this is a live peer's
+                        // rejoin: its link reports are forgotten and it has no route.
+                        let (asm, relay, zode) = join_net().await;
+                        let bv = request(&handle_for(&asm, &relay).await, "zode.zpr")
+                            .await
+                            .expect("a live peer's rejoin is granted");
+                        assert!(!asm.topo_mgr.link_up(&relay, &zode));
+
+                        let psnap = asm.policy_mgr.get_current_snapshot();
+                        for reason in [SweepReason::AttributeChange, SweepReason::PolicyUpdate] {
+                            assert_eq!(revalidate_visas(&asm, &psnap, reason).await, 0);
+                            for id in ids(&bv.peer) {
+                                assert!(
+                                    !revoked_on(&asm, id, &relay).await,
+                                    "{reason:?} sweep kept bootstrap visa {id}: its peering holds"
+                                );
+                            }
+                        }
+
+                        asm.policy_mgr
+                            .update_policy_from_container_bytes(withdrawn)
+                            .await
+                            .unwrap();
+                        let psnap = asm.policy_mgr.get_current_snapshot();
+                        assert_eq!(
+                            revalidate_visas(&asm, &psnap, SweepReason::PolicyUpdate).await,
+                            0
+                        );
+                        for id in ids(&bv.peer) {
+                            assert!(
+                                revoked_on(&asm, id, &relay).await,
+                                "bootstrap visa {id} revoked once policy withdrew it"
+                            );
+                        }
+                    }
+                })
+                .await;
+        }
     }
 }
