@@ -439,6 +439,30 @@ impl Router {
         true
     }
 
+    /// Replace the set of transit-capable nodes: the only nodes a route may pass
+    /// through (`Policy.transitNodes`, zl-zipline#227). Any node may still start or end
+    /// a route. Starts empty (fail closed).
+    ///
+    /// If the set changed, best routes are recomputed and the route cache is flushed
+    /// under the same write lock. Returns the nodes that lost transit, sorted, so the
+    /// caller can revoke the visas that pass through them.
+    // Until TopologyMgr sets it from policy (next task of zl-zipline#227), only tests call it.
+    #[allow(dead_code)]
+    pub fn set_transit_nodes(&self, transit: HashSet<IpAddr>) -> Vec<IpAddr> {
+        let mut inner = self.inner.write().unwrap();
+        let transit: HashSet<NodeId> = transit.iter().map(NodeId::from).collect();
+        if transit == inner.topology.transit {
+            return Vec::new();
+        }
+        let lost = inner.topology.set_transit(transit);
+        // Transit changes which routes exist between arbitrary pairs, so flush the
+        // whole cache, as add_link does.
+        inner.route_cache.clear();
+        inner.link_to_cache_keys.clear();
+        inner.topo_generation += 1;
+        lost
+    }
+
     /// True if every link in `ids` exists and is up. An empty list (a route that
     /// stays on one node) is trivially up. Used to check, when a visa is committed,
     /// that its route has not lost a link since it was chosen.
@@ -696,6 +720,10 @@ struct Graph {
     nodes: HashMap<NodeId, Node>,
     edges: HashMap<LinkId, Link>,
     best_routes: HashMap<(NodeId, NodeId), (Vec<LinkId>, u32)>,
+    /// Nodes that may be an interior hop of a route (`Policy.transitNodes`,
+    /// zl-zipline#227). Every other node may only start or end one. Empty by default:
+    /// fail closed, so a router nobody has told about transit routes only over one link.
+    transit: HashSet<NodeId>,
 }
 
 impl Graph {
@@ -924,6 +952,26 @@ impl Graph {
         result
     }
 
+    /// Whether a route may pass *through* `node_id` (enter it on one link and leave on
+    /// another). Any node may be a route's first or last node.
+    fn is_transit(&self, node_id: &NodeId) -> bool {
+        self.transit.contains(node_id)
+    }
+
+    /// Replace the transit set and recompute best routes if it changed. Returns the
+    /// nodes that were transit-capable before and are not now, sorted.
+    #[allow(dead_code)] // see Router::set_transit_nodes
+    fn set_transit(&mut self, transit: HashSet<NodeId>) -> Vec<IpAddr> {
+        if transit == self.transit {
+            return Vec::new();
+        }
+        let mut lost: Vec<IpAddr> = self.transit.difference(&transit).map(|nid| nid.0).collect();
+        lost.sort();
+        self.transit = transit;
+        self.recompute();
+        lost
+    }
+
     /// Get the lowest cost path from a to b, with ties broken as in `dijkstra_from`.
     fn get_low_cost_path(&self, a: &NodeId, b: &NodeId) -> Option<(Vec<LinkId>, u32)> {
         self.best_routes.get(&(a.clone(), b.clone())).cloned()
@@ -1126,7 +1174,16 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// Three nodes, no links, every node transit-capable: the tests written before
+    /// transit existed (zl-zipline#227) route through any node.
     fn make_router_abc() -> (Router, IpAddr, IpAddr, IpAddr) {
+        let (r, a, b, c) = make_router_abc_no_transit();
+        all_transit(&r, &[a, b, c]);
+        (r, a, b, c)
+    }
+
+    /// Three nodes, no links, and the router's default transit set: empty.
+    fn make_router_abc_no_transit() -> (Router, IpAddr, IpAddr, IpAddr) {
         let a = ip("10.0.0.1");
         let b = ip("10.0.0.2");
         let c = ip("10.0.0.3");
@@ -1135,6 +1192,17 @@ mod tests {
         r.add_node(b).unwrap();
         r.add_node(c).unwrap();
         (r, a, b, c)
+    }
+
+    /// Mark every node in `nodes` transit-capable.
+    fn all_transit(r: &Router, nodes: &[IpAddr]) {
+        r.set_transit_nodes(nodes.iter().copied().collect());
+    }
+
+    /// Graph-level equivalent of [all_transit].
+    fn graph_all_transit(g: &mut Graph) {
+        let all = g.nodes.keys().cloned().collect();
+        g.set_transit(all);
     }
 
     fn no_hint() -> RouteHint {
@@ -1337,6 +1405,7 @@ mod tests {
         r.add_node(a).unwrap();
         r.add_node(b).unwrap();
         r.add_node(c).unwrap();
+        all_transit(&r, &[a, b, c]);
         r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
         r.add_link(b, c, LinkId("bc".into()), vec![], 1).unwrap();
         let hint = no_hint();
@@ -1418,6 +1487,7 @@ mod tests {
         r.add_node(y).unwrap();
         r.add_node(a).unwrap();
         r.add_node(b).unwrap();
+        all_transit(&r, &[x, y, a, b]);
         // Direct x-y link and dormant legs x-a and b-y; no a-b yet.
         r.add_link(x, y, LinkId("xy".into()), vec![], 10).unwrap();
         r.add_link(x, a, LinkId("xa".into()), vec![], 1).unwrap();
@@ -1641,11 +1711,13 @@ mod tests {
         LinkId(s.into())
     }
 
+    /// Three nodes, all transit-capable (see [make_router_abc]).
     fn make_graph_abc() -> Graph {
         let mut g = Graph::default();
         g.add_node(ip("10.0.0.1")).unwrap();
         g.add_node(ip("10.0.0.2")).unwrap();
         g.add_node(ip("10.0.0.3")).unwrap();
+        graph_all_transit(&mut g);
         g
     }
 
@@ -1948,6 +2020,7 @@ mod tests {
         g.add_node(ip("10.0.0.2")).unwrap();
         g.add_node(ip("10.0.0.3")).unwrap();
         g.add_node(ip("10.0.0.4")).unwrap();
+        graph_all_transit(&mut g);
         g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
             .unwrap();
         g.add_link(ip("10.0.0.1"), ip("10.0.0.3"), lid("ac"), vec![], 1)
@@ -1974,6 +2047,7 @@ mod tests {
         g.add_node(ip("10.0.0.2")).unwrap();
         g.add_node(ip("10.0.0.3")).unwrap();
         g.add_node(ip("10.0.0.4")).unwrap();
+        graph_all_transit(&mut g);
         g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
             .unwrap();
         g.add_link(ip("10.0.0.2"), ip("10.0.0.3"), lid("bc"), vec![], 1)
@@ -2109,6 +2183,7 @@ mod tests {
         for n in [a, b, c, d, e] {
             r.add_node(n).unwrap();
         }
+        all_transit(&r, &[a, b, c, d, e]);
         r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
         r.add_link(b, d, LinkId("bd".into()), vec![], 1).unwrap();
         r.add_link(d, c, LinkId("dc".into()), vec![], 1).unwrap();
@@ -2132,6 +2207,7 @@ mod tests {
             for n in [a, b, x, y] {
                 r.add_node(n).unwrap();
             }
+            all_transit(&r, &[a, b, x, y]);
             r.add_link(a, x, LinkId("ax".into()), vec![], 1).unwrap();
             r.add_link(x, b, LinkId("xb".into()), vec![], 1).unwrap();
             r.add_link(a, y, LinkId("ay".into()), vec![], 1).unwrap();
@@ -2256,5 +2332,119 @@ mod tests {
         r.set_link_up(&LinkId("bc".into()), false);
         assert!(!r.route_matches(&[ab.clone(), LinkId("bc".into())], &[a, b, c]));
         assert!(!r.route_matches(&[ab], &[a, b, c]));
+    }
+
+    // --- Non-transit nodes (zl-zipline#227) ---
+
+    /// The issue's case at router level: A and B have a direct link that is down, and
+    /// the only other way between them is through C, which policy does not mark
+    /// transit-capable. There is no route: neither the best route nor any route.
+    #[test]
+    fn test_no_route_through_a_non_transit_node() {
+        let (r, a, b, c) = make_router_abc_no_transit();
+        let ab = LinkId("ab".into());
+        r.add_link(a, b, ab.clone(), vec![], 1).unwrap();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        r.add_link(c, b, LinkId("cb".into()), vec![], 1).unwrap();
+        r.set_link_up(&ab, false);
+        assert!(r.get_best_route(&a, &b).is_none());
+        assert!(r.get_routes(&a, &b, None).is_empty());
+    }
+
+    /// The same graph with C transit-capable routes through C.
+    #[test]
+    fn test_route_through_a_transit_node() {
+        let (r, a, b, c) = make_router_abc_no_transit();
+        let ab = LinkId("ab".into());
+        r.add_link(a, b, ab.clone(), vec![], 1).unwrap();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        r.add_link(c, b, LinkId("cb".into()), vec![], 1).unwrap();
+        r.set_link_up(&ab, false);
+        r.set_transit_nodes([c].into_iter().collect());
+        let best = r.get_best_route(&a, &b).unwrap();
+        assert_eq!(best.links, vec![LinkId("ac".into()), LinkId("cb".into())]);
+        assert_eq!(r.get_routes(&a, &b, None).len(), 1);
+    }
+
+    /// A cheaper path through a non-transit node loses to a costlier path through a
+    /// transit-capable one.
+    #[test]
+    fn test_costlier_transit_path_beats_cheaper_non_transit_path() {
+        let a = ip("10.0.0.1");
+        let b = ip("10.0.0.2");
+        let endpoint = ip("10.0.0.3");
+        let relay = ip("10.0.0.4");
+        let r = Router::new();
+        for n in [a, b, endpoint, relay] {
+            r.add_node(n).unwrap();
+        }
+        r.add_link(a, endpoint, LinkId("a-e".into()), vec![], 1)
+            .unwrap();
+        r.add_link(endpoint, b, LinkId("e-b".into()), vec![], 1)
+            .unwrap();
+        r.add_link(a, relay, LinkId("a-r".into()), vec![], 10)
+            .unwrap();
+        r.add_link(relay, b, LinkId("r-b".into()), vec![], 10)
+            .unwrap();
+        r.set_transit_nodes([relay].into_iter().collect());
+
+        let best = r.get_best_route(&a, &b).unwrap();
+        assert_eq!(best.links, vec![LinkId("a-r".into()), LinkId("r-b".into())]);
+        let all = r.get_routes(&a, &b, None);
+        assert_eq!(
+            all.len(),
+            1,
+            "the path through the endpoint must not be offered"
+        );
+        assert_eq!(all[0].links, best.links);
+    }
+
+    /// A node that is not transit-capable is still reachable as either end of a route.
+    #[test]
+    fn test_non_transit_node_is_reachable_as_an_end() {
+        let (r, a, b, c) = make_router_abc_no_transit();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        r.add_link(c, b, LinkId("cb".into()), vec![], 1).unwrap();
+        // A -> C and C -> B are one hop each; C is an end, not an interior hop.
+        assert!(r.get_best_route(&a, &c).is_some());
+        assert!(r.get_best_route(&c, &b).is_some());
+        assert_eq!(r.get_routes(&c, &a, None).len(), 1);
+        // A -> B would need C as an interior hop.
+        assert!(r.get_best_route(&a, &b).is_none());
+    }
+
+    /// Changing the transit set invalidates cached routes, and reports the nodes that
+    /// lost transit; setting the same set again changes nothing.
+    #[test]
+    fn test_transit_change_invalidates_cache_and_reports_lost_nodes() {
+        let (r, a, b, c) = make_router_abc_no_transit();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        r.add_link(c, b, LinkId("cb".into()), vec![], 1).unwrap();
+        assert!(r.set_transit_nodes([c].into_iter().collect()).is_empty());
+        assert_eq!(r.get_routes(&a, &b, None).len(), 1); // cached now
+        assert!(r.set_transit_nodes([c].into_iter().collect()).is_empty());
+
+        let lost = r.set_transit_nodes(HashSet::new());
+        assert_eq!(lost, vec![c]);
+        assert!(
+            r.get_routes(&a, &b, None).is_empty(),
+            "stale cached route served"
+        );
+        assert!(r.get_best_route(&a, &b).is_none());
+    }
+
+    /// A recorded path whose interior node has lost transit no longer matches.
+    #[test]
+    fn test_route_matches_fails_when_an_interior_node_lost_transit() {
+        let (r, a, b, c) = make_router_abc_no_transit();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        r.add_link(c, b, LinkId("cb".into()), vec![], 1).unwrap();
+        r.set_transit_nodes([c].into_iter().collect());
+        let ids = [LinkId("ac".into()), LinkId("cb".into())];
+        assert!(r.route_matches(&ids, &[a, c, b]));
+        r.set_transit_nodes(HashSet::new());
+        assert!(!r.route_matches(&ids, &[a, c, b]));
+        // A one-hop path has no interior node.
+        assert!(r.route_matches(&[LinkId("ac".into())], &[a, c]));
     }
 }

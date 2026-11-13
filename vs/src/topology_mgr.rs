@@ -971,6 +971,14 @@ impl TopologyMgr {
             .add_link(zpr_addr_a, zpr_addr_b, id, attributes, cost)
     }
 
+    /// Test helper: replace the router's transit set ([Router::set_transit_nodes]),
+    /// outside any operation. Production code sets it from policy.
+    #[cfg(test)]
+    pub fn set_transit_nodes(&self, transit: &[IpAddr]) -> Vec<IpAddr> {
+        self.router
+            .set_transit_nodes(transit.iter().copied().collect())
+    }
+
     /// Remove a node and all its incident links from the router, and best-effort
     /// delete the corresponding persisted edges.
     ///
