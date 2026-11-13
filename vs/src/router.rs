@@ -474,7 +474,8 @@ impl Router {
 
     /// True if a stored visa's route is still exactly what it was chosen as: every link
     /// in `ids` exists, is up, and joins two adjacent nodes of `path` (the visa's
-    /// recorded node path), one link per hop, in either direction. Checking ids alone
+    /// recorded node path), one link per hop, in either direction; and every interior
+    /// node of `path` is still transit-capable ([Router::set_transit_nodes]). Checking ids alone
     /// is not enough: policy reconciliation can move a link id to another edge.
     pub fn route_matches(&self, ids: &[LinkId], path: &[IpAddr]) -> bool {
         let hops: HashSet<(IpAddr, IpAddr)> = path
@@ -491,6 +492,15 @@ impl Router {
             return false;
         }
         let inner = self.inner.read().unwrap();
+        // Every interior node must still be transit-capable (zl-zipline#227): policy can
+        // take a node's transit flag away after the route was chosen.
+        let interior = path.get(1..path.len().saturating_sub(1)).unwrap_or(&[]);
+        if !interior
+            .iter()
+            .all(|n| inner.topology.is_transit(&NodeId::from(n)))
+        {
+            return false;
+        }
         ids.iter().all(|id| {
             inner.topology.edges.get(id).is_some_and(|l| {
                 let (a, b) = (l.a.0, l.b.0);
@@ -1058,6 +1068,12 @@ impl Graph {
                 continue;
             }
 
+            // Only a transit-capable node may be passed through (zl-zipline#227); any
+            // other node is a dead end unless it is the destination, handled above.
+            if !self.is_transit(neighbor) {
+                continue;
+            }
+
             // Descend: mark neighbor visited, extend path, push a new frame.
             let neighbor = neighbor.clone();
             if let Some(nb_node) = self.nodes.get(&neighbor) {
@@ -1090,7 +1106,8 @@ impl Graph {
     }
 
     /// Run Dijkstra from `start` and return, for each reachable destination, the
-    /// ordered sequence of link ids on the shortest path and its total cost.
+    /// ordered sequence of link ids on the shortest path and its total cost. Only
+    /// transit-capable nodes are passed through ([Graph::is_transit]).
     ///
     /// Ties are broken deterministically (zl-zipline#224), in this order:
     /// 1. lower total cost;
@@ -1110,6 +1127,13 @@ impl Graph {
 
         while let Some(Reverse((cost, hops, node))) = heap.pop() {
             if (cost, hops) > *dist.get(&node).unwrap_or(&(u64::MAX, u32::MAX)) {
+                continue;
+            }
+
+            // A node that is not transit-capable is reached (it may be a destination)
+            // but never expanded: no route leaves it again unless it is the start
+            // (zl-zipline#227).
+            if &node != start && !self.is_transit(&node) {
                 continue;
             }
 
