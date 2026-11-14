@@ -387,7 +387,7 @@ impl TopologyMgr {
     /// Clear every failed pair `node` is part of (R13a): something about those pairs
     /// changed, so the visa service proposes their links again. Returns the other end
     /// of each cleared pair; the caller sends those nodes `setTopology` once it has
-    /// dropped the guard (see `vsapi_worker::repropose_failed_pairs`).
+    /// dropped the guard (see `vsapi_worker::repropose_links_to_peers`).
     ///
     /// This is the one entry point for "the pair changed". Today the only such event is a
     /// (re)connect of the node's VS-API session; v2's ZBOLT/rendezvous step is meant to
