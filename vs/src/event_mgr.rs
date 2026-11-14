@@ -1744,19 +1744,24 @@ mod tests {
         );
     }
 
-    /// Local review (Codex P2) of visaservice#68 r3: a policy that removes the relay's
-    /// link to a Zode while making C transit-capable, with relay-C and C-Zode up, does
-    /// not cut the Zode off: the grant is applied before the pass asks which nodes the
-    /// removed links cut off, so the Zode is still reached through C.
-    #[tokio::test]
-    async fn test_a_transit_grant_counts_before_the_cut_off_check() {
+    /// A relay (docking the visa service), a Zode `zb` and a node `zc`, all connected,
+    /// with the links `relay_links` (pairs of indices into [relay, zb, zc]) in the
+    /// router, reported up by both ends (R14). The Zode's VSS is captured. Returns
+    /// (asm, [relay, zb, zc], the Zode's command receiver).
+    async fn relay_zb_zc_asm(
+        relay_links: &[(usize, usize)],
+    ) -> (
+        Arc<Assembly>,
+        [IpAddr; 3],
+        mpsc::Receiver<crate::vss::VssCmd>,
+    ) {
         use libeval::route::LinkId;
+        use zpr::vsapi_types::{LinkState, LinkStateReport};
         let asm = Arc::new(new_assembly_for_tests(None).await);
-        let relay: IpAddr = "fd5a:5052::2".parse().unwrap();
-        let zode: IpAddr = "fd5a:5052::3".parse().unwrap();
-        let c: IpAddr = "fd5a:5052::4".parse().unwrap();
-        let cns = [(relay, "relay"), (zode, "zb"), (c, "zc")];
-        for (addr, cn) in cns {
+        let nodes: [IpAddr; 3] =
+            ["fd5a:5052::2", "fd5a:5052::3", "fd5a:5052::4"].map(|n| n.parse().unwrap());
+        let cns = ["relay", "zb", "zc"];
+        for (addr, cn) in nodes.iter().zip(cns) {
             asm.actor_mgr
                 .add_node(
                     &make_node_actor_defexp(&addr.to_string(), cn, "10.0.0.1:1"),
@@ -1765,64 +1770,95 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            asm.topo_mgr.add_node(addr).unwrap();
+            asm.topo_mgr.add_node(*addr).unwrap();
         }
         asm.actor_mgr
-            .hack_set_vs_docking_node(&relay)
+            .hack_set_vs_docking_node(&nodes[0])
             .await
             .unwrap();
-        for (a, b, id) in [
-            (relay, zode, "relay-zb"),
-            (relay, c, "relay-zc"),
-            (c, zode, "zc-zb"),
-        ] {
+        for &(i, j) in relay_links {
+            let id = format!("{}-{}", cns[i], cns[j]);
             asm.topo_mgr
-                .add_link(a, b, LinkId(id.into()), vec![], 1)
+                .add_link(nodes[i], nodes[j], LinkId(id), vec![], 1)
                 .unwrap();
         }
-        // Under R14 a link is up while both ends report it up: every pair reports.
+        // Under R14 a link is up while both ends report it up.
         let cn_of = move |n: &IpAddr| {
-            cns.iter()
-                .find(|(addr, _)| addr == n)
-                .map(|(_, cn)| cn.to_string())
+            nodes
+                .iter()
+                .position(|a| a == n)
+                .map(|i| cns[i].to_string())
         };
-        for (reporter, peers) in [
-            (relay, ["zb", "zc"]),
-            (zode, ["relay", "zc"]),
-            (c, ["relay", "zb"]),
-        ] {
+        for (i, reporter) in nodes.iter().enumerate() {
+            let peers = relay_links
+                .iter()
+                .filter_map(|&(a, b)| match (a == i, b == i) {
+                    (true, _) => Some(b),
+                    (_, true) => Some(a),
+                    _ => None,
+                })
+                .map(|k| LinkStateReport {
+                    peer_cn: cns[k].to_string(),
+                    state: LinkState::Up,
+                })
+                .collect();
             asm.topo_mgr.record_link_states_with_cns(
                 &asm.topo_mgr.ops_now(),
-                &reporter,
+                reporter,
                 None,
-                peers
-                    .iter()
-                    .map(|cn| zpr::vsapi_types::LinkStateReport {
-                        peer_cn: cn.to_string(),
-                        state: zpr::vsapi_types::LinkState::Up,
-                    })
-                    .collect(),
+                peers,
                 &cn_of,
             );
         }
+        let (zode_tx, zode_rx) = mpsc::channel::<crate::vss::VssCmd>(16);
+        asm.vss_mgr.insert_test_handle(nodes[1], zode_tx);
+        (asm, nodes, zode_rx)
+    }
+
+    /// The policy for [relay_zb_zc_asm]: the peerings `links` (index pairs, link ids as
+    /// there), a CN per node, and `transitNodes` = `transit`.
+    fn relay_zb_zc_policy(
+        nodes: [IpAddr; 3],
+        links: &[(usize, usize)],
+        transit: &[IpAddr],
+    ) -> Vec<u8> {
+        let cns = ["relay", "zb", "zc"];
+        let peerings: Vec<_> = links
+            .iter()
+            .map(|&(i, j)| {
+                crate::test_helpers::make_peering(
+                    nodes[i],
+                    nodes[j],
+                    &format!("{}-{}", cns[i], cns[j]),
+                    vec![],
+                )
+            })
+            .collect();
+        let node_cns: Vec<(IpAddr, &str)> = nodes.iter().copied().zip(cns).collect();
+        crate::test_helpers::policy_with_peerings_cns_services_and_transit(
+            &peerings,
+            &node_cns,
+            &[],
+            transit,
+        )
+    }
+
+    /// Local review (Codex P2) of visaservice#68 r3: a policy that removes the relay's
+    /// link to a Zode while making C transit-capable, with relay-C and C-Zode up, does
+    /// not cut the Zode off: the grant is applied before the pass asks which nodes the
+    /// removed links cut off, so the Zode is still reached through C.
+    #[tokio::test]
+    async fn test_a_transit_grant_counts_before_the_cut_off_check() {
+        let (asm, nodes, mut zode_rx) = relay_zb_zc_asm(&[(0, 1), (0, 2), (2, 1)]).await;
         // The new policy drops relay-zb, keeps the other two, and makes C transit.
         asm.policy_mgr
-            .update_policy_from_container_bytes(
-                crate::test_helpers::policy_with_peerings_cns_services_and_transit(
-                    &[
-                        crate::test_helpers::make_peering(relay, c, "relay-zc", vec![]),
-                        crate::test_helpers::make_peering(c, zode, "zc-zb", vec![]),
-                    ],
-                    &cns,
-                    &[],
-                    &[c],
-                ),
-            )
+            .update_policy_from_container_bytes(relay_zb_zc_policy(
+                nodes,
+                &[(0, 2), (2, 1)],
+                &[nodes[2]],
+            ))
             .await
             .unwrap();
-        let (zode_tx, mut zode_rx) = mpsc::channel::<crate::vss::VssCmd>(16);
-        asm.vss_mgr.insert_test_handle(zode, zode_tx);
-
         let vinst = asm.policy_mgr.get_current_snapshot().vinst();
         handle_policy_updated(&asm, vinst).await.unwrap();
 
@@ -1832,6 +1868,35 @@ mod tests {
                 Some(crate::vss::VssCmd::SetTopology(..))
             ),
             "the Zode is still reached through C: it gets its topology, not a Stop"
+        );
+    }
+
+    /// Local review (Codex P2): a policy that takes transit away from C, with the Zode
+    /// reached only through C and no link changed, cuts the Zode off as surely as a
+    /// removed link: its VSS worker is stopped and it is sent nothing more.
+    #[tokio::test]
+    async fn test_a_transit_withdrawal_can_cut_a_node_off() {
+        let links = [(0, 2), (2, 1)];
+        let (asm, nodes, mut zode_rx) = relay_zb_zc_asm(&links).await;
+        asm.topo_mgr.set_transit_nodes(&[nodes[2]]);
+        assert!(asm.topo_mgr.get_best_route(&nodes[0], &nodes[1]).is_some());
+        asm.policy_mgr
+            .update_policy_from_container_bytes(relay_zb_zc_policy(nodes, &links, &[]))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+
+        assert!(
+            matches!(
+                next_cmd(&mut zode_rx).await,
+                Some(crate::vss::VssCmd::Stop())
+            ),
+            "the cut-off Zode's VSS worker is stopped"
+        );
+        assert!(
+            next_cmd(&mut zode_rx).await.is_none(),
+            "and nothing is pushed to it"
         );
     }
 
