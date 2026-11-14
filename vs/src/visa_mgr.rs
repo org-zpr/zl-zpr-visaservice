@@ -619,7 +619,7 @@ impl VisaMgr {
             self.repo.get_node_visa_state(visa_id, node_addr),
             Some(db::NodeVisaState::PendingInstall | db::NodeVisaState::Installed)
         );
-        staged && !self.quarantine.lock().unwrap().contains(&visa_id)
+        staged && !self.is_quarantined(visa_id)
     }
 
     /// The visas among `ids` that `node_addr` may fetch by ID (`visaRequestById`), each
@@ -662,17 +662,27 @@ impl VisaMgr {
         Ok(visas)
     }
 
-    /// Whether `node_addr` may fetch its copy of `visa_id` by ID: the copy is still
-    /// grantable ([VisaMgr::still_grantable]: `PendingInstall` or `Installed`, not
-    /// quarantined) and, if it is still `PendingInstall`, the VSS push would deliver it
-    /// now, which holds back only the ingress copy until every other hop has acknowledged
-    /// its own ([VisaMgr::deliverable_visas_for_node]). An `Installed` copy has already
-    /// been delivered, so the ingress-last check does not apply to it.
+    /// Whether `node_addr` may fetch its copy of `visa_id` by ID: the copy is
+    /// `Installed` (already delivered), or `PendingInstall` and the VSS push would deliver
+    /// it now -- the push holds back only the ingress copy, until every other hop has
+    /// acknowledged its own ([VisaMgr::deliverable_visas_for_node]). A quarantined copy is
+    /// never fetchable. These are [VisaMgr::still_grantable]'s states, but the node state
+    /// is read once here: a copy turned `PendingRevoke` by a concurrent sweep or link-down
+    /// between two reads must not pass as delivered.
     fn fetchable_by_node(&self, visa_id: u64, node_addr: &IpAddr) -> bool {
-        self.still_grantable(visa_id, node_addr)
-            && (self.repo.get_node_visa_state(visa_id, node_addr)
-                != Some(db::NodeVisaState::PendingInstall)
-                || self.other_hops_installed_if_ingress(visa_id, node_addr))
+        let deliverable = match self.repo.get_node_visa_state(visa_id, node_addr) {
+            Some(db::NodeVisaState::Installed) => true,
+            Some(db::NodeVisaState::PendingInstall) => {
+                self.other_hops_installed_if_ingress(visa_id, node_addr)
+            }
+            _ => false,
+        };
+        deliverable && !self.is_quarantined(visa_id)
+    }
+
+    /// Whether `visa_id` is quarantined (see [VisaMgr::quarantine]).
+    fn is_quarantined(&self, visa_id: u64) -> bool {
+        self.quarantine.lock().unwrap().contains(&visa_id)
     }
 
     /// Quarantine a visa whose revocation write failed: it is never handed out by
