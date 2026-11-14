@@ -154,13 +154,49 @@ pub(crate) async fn revalidate_visas(
 /// direction), because link-state reports say that link is down (zl-zipline#224).
 ///
 /// A visa crosses the link when `a` and `b` are adjacent in its recorded node path
-/// (`VisaMetadata.path`). Each such visa is marked `PendingRevoke` on all its nodes
-/// through the ungated [VisaMgr::mark_visa_revoked] -- the same path the attribute
-/// sweep uses -- so VSS housekeeping revokes it and the flow re-requests, getting a
-/// route that avoids the link. A visa with no path (both actors on one node) never
-/// crosses a link.
+/// (`VisaMetadata.path`). A visa with no path (both actors on one node) never crosses a
+/// link. See [revoke_visas_on_paths] for how each visa is revoked and what is returned.
+pub(crate) async fn revoke_visas_over_link(
+    asm: &Arc<Assembly>,
+    a: &std::net::IpAddr,
+    b: &std::net::IpAddr,
+) -> Result<usize, usize> {
+    revoke_visas_on_paths(asm, &format!("link {a} <-> {b} down"), |path| {
+        path.windows(2)
+            .any(|hop| (hop[0] == *a && hop[1] == *b) || (hop[0] == *b && hop[1] == *a))
+    })
+    .await
+}
+
+/// Revoke every live visa whose recorded path has an interior node the router does not
+/// hold transit-capable ([crate::topology_mgr::TopologyMgr::interior_is_transit];
+/// zl-zipline#255).
 ///
-/// Every crossing visa is attempted even if some writes fail. A visa whose write fails
+/// A visa that only starts or ends at such a node is kept. The check is against the
+/// transit set as it is now, not against a change, so it finds every visa a lost
+/// transit flag left behind however that loss was missed: the policy pass runs it after
+/// applying the policy's transit set, and startup runs it after the topology restore --
+/// the visas come back from the store, but if the service stopped between a policy
+/// install and its pass, the restored router already has the new transit set and
+/// reports no change. The caller holds [crate::topology_mgr::TopoOps], so the transit
+/// set cannot change while the paths are checked. See [revoke_visas_on_paths] for how
+/// each visa is revoked and what is returned.
+pub(crate) async fn revoke_visas_through_non_transit(asm: &Arc<Assembly>) -> Result<usize, usize> {
+    revoke_visas_on_paths(asm, "route through a non-transit node", |path| {
+        !asm.topo_mgr.interior_is_transit(path)
+    })
+    .await
+}
+
+/// Revoke every live visa whose recorded node path (`VisaMetadata.path`) satisfies
+/// `affected`. `why` names the cause in the logs.
+///
+/// Each such visa is marked `PendingRevoke` on all its nodes through the ungated
+/// [VisaMgr::mark_visa_revoked] -- the same path the attribute sweep uses -- so VSS
+/// housekeeping revokes it and the flow re-requests, getting a route that avoids the
+/// cause. A visa with no recorded path is never affected.
+///
+/// Every affected visa is attempted even if some writes fail. A visa whose write fails
 /// is quarantined ([VisaMgr::quarantine]): withheld from distribution and retried on
 /// every pending-visa read. Returns `Ok(marked)` when every write succeeded, or
 /// `Err(failed)` with the number quarantined.
@@ -168,10 +204,10 @@ pub(crate) async fn revalidate_visas(
 /// [VisaMgr::quarantine]: crate::visa_mgr::VisaMgr::quarantine
 ///
 /// [VisaMgr::mark_visa_revoked]: crate::visa_mgr::VisaMgr::mark_visa_revoked
-pub(crate) async fn revoke_visas_over_link(
+async fn revoke_visas_on_paths(
     asm: &Arc<Assembly>,
-    a: &std::net::IpAddr,
-    b: &std::net::IpAddr,
+    why: &str,
+    affected: impl Fn(&[std::net::IpAddr]) -> bool,
 ) -> Result<usize, usize> {
     let mut revoked = 0;
     let mut failed = 0;
@@ -179,10 +215,7 @@ pub(crate) async fn revoke_visas_over_link(
         let Some(path) = &metadata.path else {
             continue;
         };
-        let crosses = path
-            .windows(2)
-            .any(|hop| (hop[0] == *a && hop[1] == *b) || (hop[0] == *b && hop[1] == *a));
-        if !crosses {
+        if !affected(path) {
             continue;
         }
         match asm.visa_mgr.mark_visa_revoked(visa_id).await {
@@ -190,13 +223,13 @@ pub(crate) async fn revoke_visas_over_link(
             Ok(false) => {} // already being revoked
             Err(e) => {
                 failed += 1;
-                // Retried per visa from now on, independent of the link or reports.
+                // Retried per visa from now on, independent of what caused it.
                 asm.visa_mgr.quarantine(visa_id);
-                warn!(target: VISA, "link {a} <-> {b} down: failed to revoke visa {visa_id}, quarantined for retry: {e}")
+                warn!(target: VISA, "{why}: failed to revoke visa {visa_id}, quarantined for retry: {e}")
             }
         }
     }
-    info!(target: VISA, "link {a} <-> {b} down: revoked {revoked} visa(s) crossing it, {failed} failed");
+    info!(target: VISA, "{why}: revoked {revoked} visa(s) on it, {failed} failed");
     if failed == 0 {
         Ok(revoked)
     } else {
@@ -448,6 +481,74 @@ mod tests {
             .await
             .unwrap();
         assert!(pending.contains(&local), "a visa off the link stays");
+    }
+
+    /// zl-zipline#255: a node that is not transit-capable revokes the visas whose path
+    /// passes through it, and not the visas that only start or end there.
+    #[tokio::test]
+    async fn test_revoke_visas_through_non_transit_hits_only_interior_hops() {
+        use crate::test_helpers::{build_transit_asm, create_sweep_visa_on_route};
+        let (asm, a, b, c) = build_transit_asm().await;
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        let via_c = asm.topo_mgr.get_routes(&a, &b, None);
+        let via_c = via_c
+            .iter()
+            .find(|r| r.links.len() == 2)
+            .expect("a route through C");
+        let through = create_sweep_visa_on_route(&asm, &a, 0, via_c).await;
+        let direct = asm.topo_mgr.get_best_route(&a, &b).unwrap();
+        assert_eq!(direct.links.len(), 1);
+        let direct = create_sweep_visa_on_route(&asm, &a, 0, &direct).await;
+
+        // A and B are ends of both paths, so they need no transit flag.
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        assert_eq!(revoke_visas_through_non_transit(&asm).await, Ok(0));
+        asm.topo_mgr.set_transit_nodes(&[]);
+        assert_eq!(revoke_visas_through_non_transit(&asm).await, Ok(1));
+
+        let revoked = asm
+            .visa_mgr
+            .get_pending_revoke_visa_ids_for_node(&a)
+            .await
+            .unwrap();
+        assert_eq!(revoked, vec![through]);
+        let pending = asm
+            .visa_mgr
+            .get_pending_visa_ids_for_node(&a)
+            .await
+            .unwrap();
+        assert!(pending.contains(&direct), "the direct visa stays");
+    }
+
+    /// zl-zipline#255: a visa routed through a node whose transit flag is cleared
+    /// between route selection and commit is revoked at commit.
+    #[tokio::test]
+    async fn test_visa_through_a_node_that_lost_transit_is_revoked_at_commit() {
+        use crate::test_helpers::{build_transit_asm, try_create_sweep_visa_on_route};
+        let (asm, a, b, c) = build_transit_asm().await;
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        let route = asm
+            .topo_mgr
+            .get_routes(&a, &b, None)
+            .into_iter()
+            .find(|r| r.links.len() == 2)
+            .expect("a route through C");
+
+        asm.topo_mgr.set_transit_nodes(&[]);
+        assert!(
+            try_create_sweep_visa_on_route(&asm, &a, 0, &route)
+                .await
+                .is_err(),
+            "a visa through a node that lost transit is not issued"
+        );
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&a)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// A link between two other nodes revokes nothing.

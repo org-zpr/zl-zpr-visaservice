@@ -387,13 +387,66 @@ impl TopologyMgr {
     /// Clear every failed pair `node` is part of (R13a): something about those pairs
     /// changed, so the visa service proposes their links again. Returns the other end
     /// of each cleared pair; the caller sends those nodes `setTopology` once it has
-    /// dropped the guard (see `vsapi_worker::repropose_failed_pairs`).
+    /// dropped the guard (see `vsapi_worker::repropose_links_to_peers`).
     ///
     /// This is the one entry point for "the pair changed". Today the only such event is a
     /// (re)connect of the node's VS-API session; v2's ZBOLT/rendezvous step is meant to
     /// call it too.
     pub fn clear_failed_pairs_for(&self, _ops: &TopoOps<'_>, node: &IpAddr) -> Vec<IpAddr> {
         self.link_state.lock().unwrap().clear_failed_for(node)
+    }
+
+    /// Make the router's transit set the one `snapshot`'s policy declares
+    /// (`Policy.transitNodes`, zl-zipline#255): only those nodes may be an interior hop
+    /// of a route. Takes the caller's [TopoOps] because it is a topology write.
+    ///
+    /// Returns the nodes that lost transit, for the log and tests. The caller revokes
+    /// the visas through every non-transit node afterwards
+    /// (`visa_reconciler::revoke_visas_through_non_transit`). The flag is cleared before
+    /// that lists visas, so a visa committed concurrently is either listed by it or
+    /// fails the commit-time route check ([Self::route_still_valid]), as for a link
+    /// going down.
+    pub fn apply_transit_nodes(
+        &self,
+        _ops: &TopoOps<'_>,
+        snapshot: &PolicySnapshot,
+    ) -> Vec<IpAddr> {
+        let lost = self
+            .router
+            .set_transit_nodes(snapshot.policy().transit_nodes().clone());
+        if !lost.is_empty() {
+            info!(target: TOPO, "policy vinst {}: nodes no longer transit-capable: {:?}", snapshot.vinst(), lost);
+        }
+        lost
+    }
+
+    /// Take transit away from every node that `snapshot`'s policy does not list, and
+    /// grant none: the router's transit set becomes its current set intersected with
+    /// the policy's. A policy pass does this before its links are reconciled; it grants
+    /// with [Self::apply_transit_nodes] after. Returns the nodes that lost transit.
+    pub fn withdraw_transit_nodes(
+        &self,
+        _ops: &TopoOps<'_>,
+        snapshot: &PolicySnapshot,
+    ) -> Vec<IpAddr> {
+        let policy_transit = snapshot.policy().transit_nodes();
+        let kept = self
+            .router
+            .transit_nodes()
+            .into_iter()
+            .filter(|node| policy_transit.contains(node))
+            .collect();
+        let lost = self.router.set_transit_nodes(kept);
+        if !lost.is_empty() {
+            info!(target: TOPO, "policy vinst {}: nodes no longer transit-capable: {:?}", snapshot.vinst(), lost);
+        }
+        lost
+    }
+
+    /// True if every interior node of a visa's recorded node `path` is transit-capable
+    /// ([Router::interior_is_transit]).
+    pub fn interior_is_transit(&self, path: &[IpAddr]) -> bool {
+        self.router.interior_is_transit(path)
     }
 
     /// Is `addr` a node in the router?
@@ -614,6 +667,13 @@ impl TopologyMgr {
         snapshot: &PolicySnapshot,
         node_addrs: &[IpAddr],
     ) -> Result<Vec<(IpAddr, IpAddr)>, ServiceError> {
+        // Which nodes may pass traffic through comes from policy (zl-zipline#255). The
+        // router is empty here, so this reports no loss even when the policy took a
+        // node's flag away before a restart: the caller revokes the restored visas that
+        // pass through a node that is not transit-capable
+        // (`revoke_visas_through_non_transit`).
+        self.apply_transit_nodes(_ops, snapshot);
+
         // In this code path there should be no cases for errors from add_node.
         for addr in node_addrs {
             self.router.add_node(addr.clone())?;
@@ -971,6 +1031,14 @@ impl TopologyMgr {
             .add_link(zpr_addr_a, zpr_addr_b, id, attributes, cost)
     }
 
+    /// Test helper: replace the router's transit set ([Router::set_transit_nodes]),
+    /// outside any operation. Production code sets it from policy.
+    #[cfg(test)]
+    pub fn set_transit_nodes(&self, transit: &[IpAddr]) -> Vec<IpAddr> {
+        self.router
+            .set_transit_nodes(transit.iter().copied().collect())
+    }
+
     /// Remove a node and all its incident links from the router, and best-effort
     /// delete the corresponding persisted edges.
     ///
@@ -1074,6 +1142,12 @@ mod tests {
 
     /// Serialize a policy whose topology is exactly the given peerings.
     fn policy_bytes_from_peerings(peerings: &[Peering]) -> Vec<u8> {
+        policy_bytes_from_peerings_and_transit(peerings, &[])
+    }
+
+    /// As [policy_bytes_from_peerings], with `Policy.transitNodes` = `transit` (left
+    /// unset when empty).
+    fn policy_bytes_from_peerings_and_transit(peerings: &[Peering], transit: &[IpAddr]) -> Vec<u8> {
         let mut msg = capnp::message::Builder::new_default();
         {
             let mut policy = msg.init_root::<policy_capnp::policy::Builder>();
@@ -1081,6 +1155,12 @@ mod tests {
             let mut topo = policy.reborrow().init_topology(peerings.len() as u32);
             for (i, p) in peerings.iter().enumerate() {
                 p.write_to(&mut topo.reborrow().get(i as u32));
+            }
+            if !transit.is_empty() {
+                let mut list = policy.reborrow().init_transit_nodes(transit.len() as u32);
+                for (i, addr) in transit.iter().enumerate() {
+                    list.set(i as u32, addr.to_string());
+                }
             }
         }
         let mut bytes = Vec::new();
@@ -1357,6 +1437,30 @@ mod tests {
         // test_restore_installs_link_down_until_both_ends_report).
         assert_eq!(topo.get_peers(&a), vec![b]);
         assert!(topo.router.link_between(&a, &b).is_some());
+    }
+
+    /// zl-zipline#255: restore applies the policy's transit set, so C may again be an
+    /// interior hop after a restart. (The restored links themselves stay down under R14
+    /// until both ends report, so this checks the transit set, not a route.)
+    #[tokio::test]
+    async fn test_restore_applies_the_policy_transit_set() {
+        let db = Arc::new(FakeDb::new());
+        let (a, b, c) = (ip("fd5a:5052::1"), ip("fd5a:5052::2"), ip("fd5a:5052::3"));
+        let peerings = [peering(a, c, "ac", vec![]), peering(c, b, "cb", vec![])];
+        let policy = policy_bytes_from_peerings_and_transit(&peerings, &[c]);
+        let policy_mgr = make_policy_mgr_from_bytes(db.clone(), policy).await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.link_repo.add_edge(&a, &c).await.unwrap();
+        topo.link_repo.add_edge(&c, &b).await.unwrap();
+        topo.restore_from_state(
+            &topo.ops_now(),
+            &policy_mgr.get_current_snapshot(),
+            &[a, b, c],
+        )
+        .await
+        .unwrap();
+        assert!(topo.interior_is_transit(&[a, c, b]));
+        assert!(!topo.interior_is_transit(&[c, a, b]));
     }
 
     /// add_node_if_not_exists preserves restored in-memory links and persisted edges on reconnect.

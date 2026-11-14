@@ -69,7 +69,7 @@ pub(crate) enum Refusal {
 
 /// Whether `node` is the relay: the node the visa service docks on, the only node that may
 /// ask for a joining peer's bootstrap visas (see the module rules).
-fn is_relay(asm: &Assembly, node: &IpAddr) -> bool {
+pub(crate) fn is_relay(asm: &Assembly, node: &IpAddr) -> bool {
     asm.actor_mgr
         .get_docking_node_for_adapter(&asm.config.get_vs_addr())
         .is_some_and(|dock| dock == *node)
@@ -79,8 +79,9 @@ fn is_relay(asm: &Assembly, node: &IpAddr) -> bool {
 /// topology names that CN.
 ///
 /// This is exactly the topology the visa service sends the relay
-/// ([crate::vss_worker::topology_links] over `psnap`): the CN-to-address mapping comes from
-/// policy, and a peer that topology leaves out (no CN, a failed pair) is not found.
+/// ([crate::vss_worker::topology_links] over `psnap`; every one of those is a relay link,
+/// which `proposed_links` always sends): the CN-to-address mapping comes from policy, and
+/// a peer that topology leaves out (no CN, a failed pair) is not found.
 fn topology_peer_addr(
     asm: &Assembly,
     psnap: &PolicySnapshot,

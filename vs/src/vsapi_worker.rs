@@ -433,18 +433,15 @@ async fn resume_node_actor_for_open(
         ));
     }
 
-    // If policy topology declares a substrate for this node it must agree with the
-    // reported one; with no topology entry the reported value stands.
-    if let Some(sa) = crate::connection_control::substrate_addr_from_topology(asm, &node_zpr_addr)
-        && sa != reported_substrate
-    {
-        return Err((
-            vsapi::ErrorCode::ParamError,
-            format!(
-                "substrate address mismatch: policy declares {sa}, node reported {reported_substrate}"
-            ),
-        ));
-    }
+    // The same substrate rule as `connect`: an unusable report is refused, and
+    // policy's address wins if it declares one (the report must match), else the
+    // reported one stands (zl-zipline#255).
+    let reported_substrate = crate::connection_control::accept_reported_substrate(
+        asm,
+        &node_zpr_addr,
+        reported_substrate,
+    )
+    .map_err(|e| (vsapi::ErrorCode::ParamError, e.to_string()))?;
 
     // A soft reconnect may carry a changed dock address; keep the stored claim current.
     let stored = existing_actor
@@ -541,25 +538,44 @@ async fn add_node_serialized(
         .await
 }
 
-/// R13a (ZODE_LINKS.md): `node` has just (re)connected its VS-API session, which counts as
-/// "something about the pair changed" for every failed pair it is part of. Clear those
-/// marks ([TopologyMgr::clear_failed_pairs_for]) and send `setTopology` to the other end
-/// of each, so its topology names the link again and the owner tries once more (R13).
-/// `node` itself gets its topology through its normal connect sync.
+/// A VS-API session of `node` has just started (`authenticate`, or `open` for a
+/// reconnect), so its peers may now be able to make a link to it they could not before:
+/// a direct link is proposed only when both ends' addresses are known, and the node's
+/// reported address has just become known, or changed (ZODE_LINKS.md rule 13b,
+/// zl-zipline#255). `cleared` are the other ends of the failed pairs the session start
+/// cleared under the topology guard (R13a: it counts as "something about the pair
+/// changed"; [TopologyMgr::clear_failed_pairs_for]).
 ///
-/// Called under the topology guard, so the clear is ordered with reports and policy
-/// passes. The sends wait on node RPCs, so they run in a spawned task and never under the
-/// guard ([TopoOps] rules); they read the marks after the clear, whenever they run.
-fn repropose_failed_pairs(asm: &Arc<Assembly>, ops: &TopoOps<'_>, node: &IpAddr) {
-    let others = asm.topo_mgr.clear_failed_pairs_for(ops, node);
-    if others.is_empty() {
-        return;
-    }
-    info!(target: API, "node {node} reconnected: proposing its failed links to {others:?} again");
+/// Sends `setTopology` to every policy peer of `node` with a live VSS worker, and to
+/// every node in `cleared`. `node` itself gets its topology through its normal connect
+/// sync. Nothing is sent when a session ends: the next topology built for any reason
+/// simply leaves out what can no longer work.
+///
+/// Call it only once the session is committed -- after the last step that can fail and
+/// roll it back -- and never under the topology guard: the sends wait on node RPCs
+/// ([TopoOps] rules), so they run in a spawned task. A session that is rolled back must
+/// not have told its peers its address (visaservice#68 review).
+fn repropose_links_to_peers(asm: &Arc<Assembly>, node: &IpAddr, cleared: Vec<IpAddr>) {
     let asm = asm.clone();
-    tokio::task::spawn_local(async move {
+    let node = *node;
+    tokio::spawn(async move {
         let psnap = asm.policy_mgr.get_current_snapshot();
-        crate::event_mgr::send_topology_to(&asm, &psnap, &others).await;
+        let mut peers: Vec<IpAddr> = psnap
+            .policy()
+            .get_peers_for_node(&node)
+            .unwrap_or_default()
+            .iter()
+            .map(|peer| peer.remote_zpr_addr)
+            .chain(cleared)
+            .filter(|peer| asm.vss_mgr.has_live_worker(peer))
+            .collect();
+        peers.sort();
+        peers.dedup();
+        if peers.is_empty() {
+            return;
+        }
+        info!(target: API, "node {node} started a VS-API session: proposing links to its peers {peers:?} again");
+        crate::event_mgr::send_topology_to(&asm, &psnap, &peers).await;
     });
 }
 
@@ -774,12 +790,9 @@ fn parse_substrate_addr_str(s: &str) -> Result<SocketAddr, ServiceError> {
             pname::SUBSTRATE_ADDR
         ))
     })?;
-    if sa.ip().is_unspecified() || sa.port() == 0 {
-        return Err(ServiceError::Param(format!(
-            "param {} must be a specific address with a non-zero port, got '{sa}'",
-            pname::SUBSTRATE_ADDR
-        )));
-    }
+    // Refused here, at the wire, before any work; accept_reported_substrate applies
+    // the same check again where the address is recorded.
+    crate::connection_control::require_dialable_substrate(sa)?;
     Ok(sa)
 }
 
@@ -1098,10 +1111,16 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         if matches!(vs_connect_request.ctype, ConnectType::Reset) {
             warn!(target: API, "{} requests RESET: not yet implemented", vs_connect_request.cn);
         }
-        // A session reconnect: the node's failed pairs are proposed again (R13a).
-        repropose_failed_pairs(&self.asm, &ops, &node_zpr_addr);
+        // A session reconnect: the node's failed pairs are cleared (R13a), under the guard.
+        let cleared_pairs = self
+            .asm
+            .topo_mgr
+            .clear_failed_pairs_for(&ops, &node_zpr_addr);
 
         drop(ops);
+
+        // The session is committed: tell the node's peers.
+        repropose_links_to_peers(&self.asm, &node_zpr_addr, cleared_pairs);
 
         start_session_core_visas(&self.asm, &existing_actor).await;
 
@@ -1410,9 +1429,12 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         // Install the node's policy-declared links to already-connected peers. Must happen
         // before ActorJoins: that event drives the topology fan-out, which reads the router.
         install_policy_links_for_node(&self.asm, &ops, &node_actor, &node_zpr_addr).await;
-        // A new connect, reconnect or reset: the node's failed pairs are proposed again
-        // (R13a).
-        repropose_failed_pairs(&self.asm, &ops, &node_zpr_addr);
+        // A new connect, reconnect or reset: the node's failed pairs are cleared (R13a),
+        // under the guard. The peers are told once the session is committed, below.
+        let cleared_pairs = self
+            .asm
+            .topo_mgr
+            .clear_failed_pairs_for(&ops, &node_zpr_addr);
         drop(ops);
 
         let evt = VsEvent::ActorJoins(node_zpr_addr);
@@ -1444,6 +1466,9 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                 "authentication failed: not authorized",
             );
         }
+
+        // The session is committed (nothing below rolls it back): tell the node's peers.
+        repropose_links_to_peers(&self.asm, &node_zpr_addr, cleared_pairs);
 
         start_session_core_visas(&self.asm, &node_actor).await;
 
@@ -4404,8 +4429,9 @@ mod tests {
             }
         }
 
-        /// A reconnect of a node outside the pair leaves the mark alone and sends no
-        /// topology to the pair's ends.
+        /// A reconnect of a node outside the pair leaves the mark alone. Of the pair's
+        /// ends only A, which is C's policy peer, is sent topology (the session-start
+        /// re-proposal, zl-zipline#255); B, which is not, gets nothing.
         #[tokio::test]
         async fn reconnect_of_an_unrelated_node_keeps_the_mark() {
             tokio::task::LocalSet::new()
@@ -4427,8 +4453,86 @@ mod tests {
                         asm.topo_mgr
                             .is_failed_pair(&NODE_A.parse().unwrap(), &NODE_B.parse().unwrap())
                     );
-                    assert!(gets_nothing(&mut a_vss).await);
+                    assert!(gets_topology(&mut a_vss).await, "A is C's policy peer");
                     assert!(gets_nothing(&mut b_vss).await);
+                })
+                .await;
+        }
+
+        // --- Session start re-proposes links to the node's peers (zl-zipline#255) ---
+
+        /// `open` sends `setTopology` to every policy peer of the node that has a VSS,
+        /// with no failed pair involved: B's peer A is told, C (not B's peer) is not,
+        /// and B itself gets its topology from its own sync.
+        #[tokio::test]
+        async fn open_re_proposes_links_to_the_nodes_policy_peers() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, _handle) = build_with(true, R13A_PORT).await;
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+                    let mut c_vss = capture_vss(&asm, NODE_C);
+                    reopen(&asm, NODE_B, "node-b").await;
+                    assert!(gets_topology(&mut a_vss).await, "A is B's policy peer");
+                    assert!(gets_nothing(&mut c_vss).await, "C is not B's peer");
+                    assert!(gets_nothing(&mut b_vss).await);
+                })
+                .await;
+        }
+
+        /// The re-proposal carries what the peer needs to propose the link: here a
+        /// policy that declares no address for A or B, so the A-B link is direct and
+        /// needs both reported addresses. After B opens with a new address, the
+        /// topology sent to A names the link to B at that address.
+        #[tokio::test]
+        async fn a_peer_is_re_proposed_the_link_at_the_new_address_on_open() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, _handle) = build_with(true, R13A_PORT).await;
+                    let (a, b): (IpAddr, IpAddr) =
+                        (NODE_A.parse().unwrap(), NODE_B.parse().unwrap());
+                    let mut peering = make_peering(a, b, "link-ab", vec![]);
+                    peering.substrate_a = None;
+                    peering.substrate_b = None;
+                    asm.policy_mgr
+                        .update_policy_from_container_bytes(policy_with_peerings_and_node_cns(
+                            &[peering],
+                            &[(a, "node-a"), (b, "node-b")],
+                        ))
+                        .await
+                        .unwrap();
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    reopen(&asm, NODE_B, "node-b").await;
+                    let Ok(Some(crate::vss::VssCmd::SetTopology(psnap, _))) =
+                        tokio::time::timeout(Duration::from_secs(1), a_vss.recv()).await
+                    else {
+                        panic!("A is sent topology");
+                    };
+                    let links = crate::vss_worker::proposed_links(&asm, &psnap, &a)
+                        .await
+                        .unwrap();
+                    assert_eq!(links.len(), 1, "{links:?}");
+                    assert_eq!(links[0].zpr_addr, b);
+                    assert_eq!(
+                        links[0].peer.clone().map(SocketAddr::from),
+                        Some(SocketAddr::new(b, R13A_PORT)),
+                        "B's address as it reported it on open"
+                    );
+                })
+                .await;
+        }
+
+        /// A peer whose VSS worker has exited is skipped; the other peers are still told.
+        #[tokio::test]
+        async fn a_peer_without_a_live_vss_is_skipped() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, _handle) = build_with(true, R13A_PORT).await;
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+                    drop(capture_vss(&asm, NODE_C)); // C's worker has exited
+                    reopen(&asm, NODE_A, "node-a").await;
+                    assert!(gets_topology(&mut b_vss).await);
+                    assert!(!asm.vss_mgr.has_live_worker(&NODE_C.parse().unwrap()));
                 })
                 .await;
         }
@@ -4672,6 +4776,99 @@ mod tests {
             task.await
                 .unwrap()
                 .expect("open's state update completes once the lock is free");
+        }
+
+        /// `open` applies the same substrate rule as `connect` (zl-zipline#255): with a
+        /// policy that declares links for the node but no address for it, a changed
+        /// reported address is accepted and stored; where policy declares one, a
+        /// different report is a `paramError`.
+        #[tokio::test]
+        async fn test_open_applies_the_reported_substrate_rule() {
+            let (asm, node, relay) = open_substrate_asm().await;
+            let moved: std::net::SocketAddr = "192.0.2.10:7000".parse().unwrap();
+            let actor = resume_node_actor_for_open(&asm, node, moved, "zode")
+                .await
+                .map_err(|(code, msg)| format!("{code:?}: {msg}"))
+                .expect("a reported address stands when policy declares none");
+            assert_eq!(
+                actor
+                    .get_attribute(key::SUBSTRATE_ADDR)
+                    .unwrap()
+                    .get_value()[0],
+                moved.to_string()
+            );
+
+            // The relay's address is declared ([relay]:7001): another report is refused.
+            let err = resume_node_actor_for_open(&asm, relay, moved, "relay")
+                .await
+                .expect_err("a report that contradicts policy is refused");
+            assert!(matches!(err.0, vsapi::ErrorCode::ParamError), "{err:?}");
+        }
+
+        /// zl-zipline#255: `open` refuses a reported substrate address that names no
+        /// place to dial (an unspecified IP or port 0) with `paramError`, and leaves
+        /// the stored claim as it was.
+        #[tokio::test]
+        async fn test_open_rejects_an_unusable_reported_substrate() {
+            let (asm, node, _relay) = open_substrate_asm().await;
+            for reported in [
+                "0.0.0.0:7000",
+                "[::]:7000",
+                "[::ffff:0.0.0.0]:7000",
+                "192.0.2.10:0",
+            ] {
+                let reported: std::net::SocketAddr = reported.parse().unwrap();
+                let err = resume_node_actor_for_open(&asm, node, reported, "zode")
+                    .await
+                    .expect_err("an unusable report is refused");
+                assert!(
+                    matches!(err.0, vsapi::ErrorCode::ParamError),
+                    "{reported}: {err:?}"
+                );
+            }
+            let stored = asm
+                .actor_mgr
+                .get_actor_by_zpr_addr(&node)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored
+                    .get_attribute(key::SUBSTRATE_ADDR)
+                    .unwrap()
+                    .get_value()[0],
+                "[fd5a:5052:3000::101]:1234"
+            );
+        }
+
+        /// An assembly for the `open` substrate tests: policy links a relay
+        /// (`::9`, declared substrate `[::9]:7001`) to NODE, with no address declared
+        /// for NODE. Both are stored node actors. Returns (asm, NODE, relay).
+        async fn open_substrate_asm() -> (Arc<Assembly>, std::net::IpAddr, std::net::IpAddr) {
+            use crate::test_helpers::{make_peering, policy_with_peerings};
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let node: std::net::IpAddr = NODE.parse().unwrap();
+            let relay: std::net::IpAddr = "fd5a:5052:3000::9".parse().unwrap();
+            let mut peering = make_peering(relay, node, "link-relay-zode", vec![]);
+            peering.substrate_a = Some(zpr::policy_types::NetAddr::new_for_ip_or_host(
+                &relay.to_string(),
+                7001,
+            ));
+            peering.substrate_b = None;
+            asm.policy_mgr
+                .update_policy_from_container_bytes(policy_with_peerings(&[peering]))
+                .await
+                .unwrap();
+            for actor in [
+                make_node_actor_defexp(NODE, "zode", "[fd5a:5052:3000::101]:1234"),
+                make_node_actor_defexp("fd5a:5052:3000::9", "relay", "[fd5a:5052:3000::9]:7001"),
+            ] {
+                asm.actor_mgr
+                    .add_node(&actor, false, &Default::default())
+                    .await
+                    .unwrap();
+            }
+            (asm, node, relay)
         }
 
         /// #63 review (Codex P1): a Reset authentication tears the node's old

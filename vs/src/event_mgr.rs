@@ -118,11 +118,8 @@ async fn handle_actor_leaves(
 /// Failures are logged. Never call this under a [TopoOps]: it waits on node RPCs.
 pub(crate) async fn send_topology_to(asm: &Assembly, psnap: &PolicySnapshot, nodes: &[IpAddr]) {
     let futs = nodes.iter().filter_map(|naddr| {
-        let peers = psnap.resolved_peers_for_node(naddr);
-        // Same snapshot the peers came from: the worker builds the wire Links off it.
-        let policy = psnap.policy_arc();
         asm.vss_mgr.get_handle(naddr).map(|vss_handle| async move {
-            if let Err(e) = vss_handle.set_topology(peers, policy).await {
+            if let Err(e) = vss_handle.set_topology(psnap.clone()).await {
                 error!(target: EVENT, "failed to set topology for node {}: {}", naddr, e);
             }
         })
@@ -166,13 +163,11 @@ async fn push_policy_to_nodes(
         let Some(vss) = asm.vss_mgr.get_handle(&naddr) else {
             continue;
         };
-        // Same snapshot the peers come from: the worker builds the wire Links off it.
-        let peers = psnap.resolved_peers_for_node(&naddr);
-        let policy = psnap.policy_arc();
+        let psnap = psnap.clone();
         let services = services.clone();
         let asm = asm.clone();
         tokio::spawn(async move {
-            if let Err(e) = vss.set_topology(peers, policy).await {
+            if let Err(e) = vss.set_topology(psnap).await {
                 error!(target: EVENT, "failed to set topology for node {naddr}: {e}");
             }
             if let Some(services) = services {
@@ -209,6 +204,19 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
           - But that won't detect if a service has altered its provider.
           - TO BE SAFE: expire auth from all services - force re-auth of all existing services (after removing non-existing ones)
      */
+
+    // Which nodes may pass traffic through comes from the current policy
+    // (zl-zipline#255). Transit the policy takes away is withdrawn first, under its own
+    // short topology guard, before anything fallible or slow: an error below ends this
+    // event with no retry, the actor refresh can take long, and until this runs the
+    // router would keep routing through a node the policy no longer lets carry
+    // traffic. Transit the policy grants waits for the link reconciliation in
+    // `policy_pass_locked`. A newer policy's own pass applies its set again, so a
+    // superseded pass does no harm here.
+    {
+        let ops = asm.topo_mgr.ops().await;
+        withdraw_policy_transit(asm, &ops, &asm.policy_mgr.get_current_snapshot()).await;
+    }
 
     // The snapshot for the attribute and hostname reconciliation below. The
     // topology part of the pass re-reads it under the topology operation lock, and
@@ -425,6 +433,12 @@ async fn policy_pass_locked(
                     report.orphaned_nodes.len()
                 );
 
+                // The links now match the policy, so its full transit set is applied,
+                // granting what the early step withheld -- before the cut-off check
+                // below, so a node reached through a newly transit-capable node is not
+                // taken for cut off.
+                apply_policy_transit(asm, ops, &psnap).await;
+
                 // Links the reconciliation took down or removed: revoke the visas
                 // crossing them through the ungated link path (zl-zipline#224). The
                 // policy sweep would skip a visa committed under this policy before the
@@ -438,7 +452,7 @@ async fn policy_pass_locked(
                 // over them (g101): every call would wait out its RPC timeout. Its VSS
                 // worker is stopped instead. Its VS-API session ran over the same
                 // link, so it rejoins (J10), and the rejoin starts a new worker.
-                let cut_off = nodes_cut_off(asm, &report.links_down);
+                let cut_off = nodes_cut_off(asm, &psnap, &report.links_down, &valid_node_addrs);
                 valid_node_addrs.retain(|naddr| {
                     if !cut_off.contains(naddr) {
                         return true;
@@ -448,8 +462,17 @@ async fn policy_pass_locked(
                     false
                 });
             }
-            Err(e) => reconciled = Err(e),
+            Err(e) => {
+                // Fail closed: the grant is withheld until a later pass (or a restart)
+                // reconciles the links.
+                warn!(target: EVENT, "policy updated vinst={vinst}: link reconciliation failed; transit the policy grants is not applied");
+                reconciled = Err(e);
+            }
         }
+    } else {
+        // No node is connected, so there are no links to reconcile: apply the policy's
+        // full transit set for the nodes that connect later.
+        apply_policy_transit(asm, ops, &psnap).await;
     }
 
     Ok(LockedPass::Applied {
@@ -460,21 +483,68 @@ async fn policy_pass_locked(
     })
 }
 
-/// The ends of `links_down` the visa service can no longer reach: those with no
-/// route from the node it docks on (the relay). It reached them over a link the
-/// policy pass just took down. If the visa service is not docked, it reaches no node
-/// and none is set apart.
-fn nodes_cut_off(asm: &Assembly, links_down: &[(IpAddr, IpAddr)]) -> HashSet<IpAddr> {
+/// The early transit step of a policy pass: take transit away from every node `psnap`'s
+/// policy no longer lists, and revoke the visas through a node that is not
+/// transit-capable, under the caller's [TopoOps]. A node the policy newly lists is
+/// **not** made transit-capable here: the router still has the old links, and the new
+/// policy may remove or change one of that node's links, so a route through it could
+/// use a link the policy no longer has. [policy_pass_locked] grants it, through
+/// [apply_policy_transit], once the links are reconciled (visaservice#68 review r3).
+async fn withdraw_policy_transit(asm: &Arc<Assembly>, ops: &TopoOps<'_>, psnap: &PolicySnapshot) {
+    asm.topo_mgr.withdraw_transit_nodes(ops, psnap);
+    let _ = crate::visa_reconciler::revoke_visas_through_non_transit(asm).await;
+}
+
+/// Make the router's transit set `psnap`'s (`Policy.transitNodes`, zl-zipline#255) and
+/// revoke every live visa whose path passes through a node that is not
+/// transit-capable, under the caller's [TopoOps]. Applied whether or not any node is
+/// connected, so nodes that connect later route under it.
+///
+/// The revocation checks every visa against the transit set as it now is, not against
+/// what this call changed, so it does not depend on the change being seen once: a
+/// pass that stopped early, or a restart, leaves nothing a later call cannot find.
+/// The revocations go through the ungated path, like `links_down`: the policy sweep
+/// skips a visa committed under this policy before the pass ran. The flag is cleared
+/// before the visas are listed, so a visa committed concurrently is either listed or
+/// fails its commit-time route check. Failed revocations are quarantined and retried
+/// per visa.
+async fn apply_policy_transit(asm: &Arc<Assembly>, ops: &TopoOps<'_>, psnap: &PolicySnapshot) {
+    asm.topo_mgr.apply_transit_nodes(ops, psnap);
+    let _ = crate::visa_reconciler::revoke_visas_through_non_transit(asm).await;
+}
+
+/// The connected nodes the visa service can no longer reach: those with no route from
+/// the node it docks on (the relay). Candidates are the ends of `links_down`, which the
+/// policy pass just took down, and every node of `connected` with a link up: a transit
+/// withdrawal (zl-zipline#255) cuts a node off without taking any link down. A node
+/// with no link up is not a candidate unless a link of it just went down: it is still
+/// joining, or restored and not yet reported (R14), and is not reached over links yet.
+/// If the visa service is not docked, it reaches no node and none is set apart.
+fn nodes_cut_off(
+    asm: &Assembly,
+    psnap: &PolicySnapshot,
+    links_down: &[(IpAddr, IpAddr)],
+    connected: &[IpAddr],
+) -> HashSet<IpAddr> {
     let Some(dock) = asm
         .actor_mgr
         .get_docking_node_for_adapter(&asm.config.get_vs_addr())
     else {
         return HashSet::new();
     };
+    let has_link_up = |naddr: &IpAddr| {
+        psnap
+            .policy()
+            .get_peers_for_node(naddr)
+            .unwrap_or_default()
+            .iter()
+            .any(|peer| asm.topo_mgr.link_up(naddr, &peer.remote_zpr_addr))
+    };
     links_down
         .iter()
         .flat_map(|&(a, b)| [a, b])
-        .filter(|naddr| asm.topo_mgr.get_best_route(&dock, naddr).is_none())
+        .chain(connected.iter().copied().filter(has_link_up))
+        .filter(|naddr| *naddr != dock && asm.topo_mgr.get_best_route(&dock, naddr).is_none())
         .collect()
 }
 
@@ -1027,6 +1097,199 @@ mod tests {
         );
     }
 
+    /// zl-zipline#255: the policy pass sets the router's transit set from the policy,
+    /// and revokes a visa through a node that lost transit -- including one committed
+    /// under the new policy before the pass ran, which the sweep's generation gate
+    /// would skip.
+    #[tokio::test]
+    async fn test_policy_pass_applies_transit_and_revokes_visas_through_lost_nodes() {
+        use crate::test_helpers::{
+            build_transit_asm, create_sweep_visa_on_route, report_transit_asm_links, transit_policy,
+        };
+        let (asm, a, b, c) = build_transit_asm().await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[c]))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+        // Under R14 the links are up once both ends report them.
+        report_transit_asm_links(&asm, true);
+        let via_c = asm
+            .topo_mgr
+            .get_routes(&a, &b, None)
+            .into_iter()
+            .find(|r| r.links.len() == 2)
+            .expect("the pass made C transit-capable");
+
+        // C loses transit. In the window between the install and its pass the router
+        // still has the old flags, so a visa through C commits under the new policy.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[]))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        let id = create_sweep_visa_on_route(&asm, &a, vinst, &via_c).await;
+        handle_policy_updated(&asm, vinst).await.unwrap();
+
+        assert!(
+            asm.topo_mgr
+                .get_routes(&a, &b, None)
+                .iter()
+                .all(|r| r.links.len() == 1),
+            "no route through C any more"
+        );
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&a)
+                .await
+                .unwrap()
+                .contains(&id),
+            "the visa through C is revoked"
+        );
+    }
+
+    /// visaservice#68 review r3 (Codex P1): the early transit step of a policy pass only
+    /// takes transit away. A node the new policy makes transit-capable becomes so only
+    /// once the pass has reconciled the links, so no route is built through it over a
+    /// link the new policy may have removed.
+    #[tokio::test]
+    async fn test_the_early_transit_step_withdraws_but_never_grants() {
+        use crate::test_helpers::{build_transit_asm, transit_policy};
+        let (asm, a, b, c) = build_transit_asm().await;
+
+        // C is not transit-capable; the new policy grants it: not yet.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[c]))
+            .await
+            .unwrap();
+        withdraw_policy_transit(
+            &asm,
+            &asm.topo_mgr.ops().await,
+            &asm.policy_mgr.get_current_snapshot(),
+        )
+        .await;
+        assert!(!asm.topo_mgr.interior_is_transit(&[a, c, b]), "no grant");
+
+        // C is transit-capable; the new policy takes it away: at once.
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[]))
+            .await
+            .unwrap();
+        withdraw_policy_transit(
+            &asm,
+            &asm.topo_mgr.ops().await,
+            &asm.policy_mgr.get_current_snapshot(),
+        )
+        .await;
+        assert!(!asm.topo_mgr.interior_is_transit(&[a, c, b]), "withdrawn");
+    }
+
+    /// Review r2 (Codex): the policy's transit set is applied, and the visas through a
+    /// node that lost it revoked, before any fallible step of the handler. Here the
+    /// live-node read fails (the event worker only logs that, with no retry); the
+    /// router must still stop routing through C.
+    #[tokio::test]
+    async fn test_policy_update_applies_transit_before_any_fallible_step() {
+        use crate::test_helpers::{
+            build_transit_asm_with_db, create_sweep_visa_on_route, transit_policy,
+        };
+        let (asm, a, b, c, db) = build_transit_asm_with_db().await;
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        let via_c = asm
+            .topo_mgr
+            .get_routes(&a, &b, None)
+            .into_iter()
+            .find(|r| r.links.len() == 2)
+            .unwrap();
+        let id = create_sweep_visa_on_route(&asm, &a, 0, &via_c).await;
+
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[]))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        db.set_scan_fault(crate::db::FaultMode::Reject);
+        assert!(handle_policy_updated(&asm, vinst).await.is_err());
+        db.set_scan_fault(crate::db::FaultMode::None);
+
+        assert!(
+            asm.topo_mgr
+                .get_routes(&a, &b, None)
+                .iter()
+                .all(|r| r.links.len() == 1),
+            "no route through C any more"
+        );
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&a)
+                .await
+                .unwrap()
+                .contains(&id),
+            "the visa through C is revoked"
+        );
+    }
+
+    /// Review r1 (Copilot): applying a policy's transit set and revoking the visas
+    /// through the nodes that lost transit is one step, so no later failure in the
+    /// pass (the node list read, link reconciliation) can consume the transit change
+    /// without the revocations.
+    #[tokio::test]
+    async fn test_apply_policy_transit_revokes_in_the_same_step() {
+        use crate::test_helpers::{build_transit_asm, create_sweep_visa_on_route};
+        let (asm, a, b, c) = build_transit_asm().await;
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        let via_c = asm
+            .topo_mgr
+            .get_routes(&a, &b, None)
+            .into_iter()
+            .find(|r| r.links.len() == 2)
+            .unwrap();
+        let id = create_sweep_visa_on_route(&asm, &a, 0, &via_c).await;
+
+        // The current (empty) policy lists no transit node.
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        apply_policy_transit(&asm, &asm.topo_mgr.ops().await, &psnap).await;
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&a)
+                .await
+                .unwrap()
+                .contains(&id)
+        );
+    }
+
+    /// zl-zipline#255: the pass applies the transit set even when no node is connected
+    /// (it then skips link reconciliation), so nodes that connect later route under it.
+    #[tokio::test]
+    async fn test_policy_pass_applies_transit_without_connected_nodes() {
+        use crate::test_helpers::{TRANSIT_NODE_C, transit_policy};
+        use libeval::route::LinkId;
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let c: IpAddr = TRANSIT_NODE_C.parse().unwrap();
+        for n in [a, b, c] {
+            asm.topo_mgr.add_node(n).unwrap();
+        }
+        asm.topo_mgr
+            .add_link(a, c, LinkId("ac".into()), vec![], 1)
+            .unwrap();
+        asm.topo_mgr
+            .add_link(c, b, LinkId("cb".into()), vec![], 1)
+            .unwrap();
+        assert!(asm.topo_mgr.get_best_route(&a, &b).is_none());
+
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[c]))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+        assert!(asm.topo_mgr.get_best_route(&a, &b).is_some());
+    }
+
     /// A policy update reconciles the actors behind live visas before it sweeps them.
     /// The actor here is revision-stale against the registered store (it has no recorded
     /// revision for it); the sweep re-reads actors from the store, and would otherwise
@@ -1495,6 +1758,162 @@ mod tests {
                 Some(crate::vss::VssCmd::SetTopology(..))
             ),
             "the relay, still reachable, gets its topology"
+        );
+    }
+
+    /// A relay (docking the visa service), a Zode `zb` and a node `zc`, all connected,
+    /// with the links `relay_links` (pairs of indices into [relay, zb, zc]) in the
+    /// router, reported up by both ends (R14). The Zode's VSS is captured. Returns
+    /// (asm, [relay, zb, zc], the Zode's command receiver).
+    async fn relay_zb_zc_asm(
+        relay_links: &[(usize, usize)],
+    ) -> (
+        Arc<Assembly>,
+        [IpAddr; 3],
+        mpsc::Receiver<crate::vss::VssCmd>,
+    ) {
+        use libeval::route::LinkId;
+        use zpr::vsapi_types::{LinkState, LinkStateReport};
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let nodes: [IpAddr; 3] =
+            ["fd5a:5052::2", "fd5a:5052::3", "fd5a:5052::4"].map(|n| n.parse().unwrap());
+        let cns = ["relay", "zb", "zc"];
+        for (addr, cn) in nodes.iter().zip(cns) {
+            asm.actor_mgr
+                .add_node(
+                    &make_node_actor_defexp(&addr.to_string(), cn, "10.0.0.1:1"),
+                    false,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            asm.topo_mgr.add_node(*addr).unwrap();
+        }
+        asm.actor_mgr
+            .hack_set_vs_docking_node(&nodes[0])
+            .await
+            .unwrap();
+        for &(i, j) in relay_links {
+            let id = format!("{}-{}", cns[i], cns[j]);
+            asm.topo_mgr
+                .add_link(nodes[i], nodes[j], LinkId(id), vec![], 1)
+                .unwrap();
+        }
+        // Under R14 a link is up while both ends report it up.
+        let cn_of = move |n: &IpAddr| {
+            nodes
+                .iter()
+                .position(|a| a == n)
+                .map(|i| cns[i].to_string())
+        };
+        for (i, reporter) in nodes.iter().enumerate() {
+            let peers = relay_links
+                .iter()
+                .filter_map(|&(a, b)| match (a == i, b == i) {
+                    (true, _) => Some(b),
+                    (_, true) => Some(a),
+                    _ => None,
+                })
+                .map(|k| LinkStateReport {
+                    peer_cn: cns[k].to_string(),
+                    state: LinkState::Up,
+                })
+                .collect();
+            asm.topo_mgr.record_link_states_with_cns(
+                &asm.topo_mgr.ops_now(),
+                reporter,
+                None,
+                peers,
+                &cn_of,
+            );
+        }
+        let (zode_tx, zode_rx) = mpsc::channel::<crate::vss::VssCmd>(16);
+        asm.vss_mgr.insert_test_handle(nodes[1], zode_tx);
+        (asm, nodes, zode_rx)
+    }
+
+    /// The policy for [relay_zb_zc_asm]: the peerings `links` (index pairs, link ids as
+    /// there), a CN per node, and `transitNodes` = `transit`.
+    fn relay_zb_zc_policy(
+        nodes: [IpAddr; 3],
+        links: &[(usize, usize)],
+        transit: &[IpAddr],
+    ) -> Vec<u8> {
+        let cns = ["relay", "zb", "zc"];
+        let peerings: Vec<_> = links
+            .iter()
+            .map(|&(i, j)| {
+                crate::test_helpers::make_peering(
+                    nodes[i],
+                    nodes[j],
+                    &format!("{}-{}", cns[i], cns[j]),
+                    vec![],
+                )
+            })
+            .collect();
+        let node_cns: Vec<(IpAddr, &str)> = nodes.iter().copied().zip(cns).collect();
+        crate::test_helpers::policy_with_peerings_cns_services_and_transit(
+            &peerings,
+            &node_cns,
+            &[],
+            transit,
+        )
+    }
+
+    /// Local review (Codex P2) of visaservice#68 r3: a policy that removes the relay's
+    /// link to a Zode while making C transit-capable, with relay-C and C-Zode up, does
+    /// not cut the Zode off: the grant is applied before the pass asks which nodes the
+    /// removed links cut off, so the Zode is still reached through C.
+    #[tokio::test]
+    async fn test_a_transit_grant_counts_before_the_cut_off_check() {
+        let (asm, nodes, mut zode_rx) = relay_zb_zc_asm(&[(0, 1), (0, 2), (2, 1)]).await;
+        // The new policy drops relay-zb, keeps the other two, and makes C transit.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(relay_zb_zc_policy(
+                nodes,
+                &[(0, 2), (2, 1)],
+                &[nodes[2]],
+            ))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+
+        assert!(
+            matches!(
+                next_cmd(&mut zode_rx).await,
+                Some(crate::vss::VssCmd::SetTopology(..))
+            ),
+            "the Zode is still reached through C: it gets its topology, not a Stop"
+        );
+    }
+
+    /// Local review (Codex P2): a policy that takes transit away from C, with the Zode
+    /// reached only through C and no link changed, cuts the Zode off as surely as a
+    /// removed link: its VSS worker is stopped and it is sent nothing more.
+    #[tokio::test]
+    async fn test_a_transit_withdrawal_can_cut_a_node_off() {
+        let links = [(0, 2), (2, 1)];
+        let (asm, nodes, mut zode_rx) = relay_zb_zc_asm(&links).await;
+        asm.topo_mgr.set_transit_nodes(&[nodes[2]]);
+        assert!(asm.topo_mgr.get_best_route(&nodes[0], &nodes[1]).is_some());
+        asm.policy_mgr
+            .update_policy_from_container_bytes(relay_zb_zc_policy(nodes, &links, &[]))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+
+        assert!(
+            matches!(
+                next_cmd(&mut zode_rx).await,
+                Some(crate::vss::VssCmd::Stop())
+            ),
+            "the cut-off Zode's VSS worker is stopped"
+        );
+        assert!(
+            next_cmd(&mut zode_rx).await.is_none(),
+            "and nothing is pushed to it"
         );
     }
 

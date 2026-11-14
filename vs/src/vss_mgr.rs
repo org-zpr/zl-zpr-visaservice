@@ -7,13 +7,12 @@ use tokio::sync::oneshot;
 use tokio::task::LocalSet;
 use tracing::{debug, info};
 
-use libeval::policy::Policy;
 use zpr::vsapi_types::{ServiceDescriptor, Visa};
 
 use crate::assembly::Assembly;
 use crate::error::VssSyncError;
 use crate::logging::targets::VSS;
-use crate::policy_mgr::ResolvedPeer;
+use crate::policy_mgr::PolicySnapshot;
 use crate::vss::VssCmd;
 use crate::vss_worker;
 
@@ -277,16 +276,11 @@ impl VssHandle {
         resp_rx.await.map_err(|_| VssSyncError::ConnClosed)?
     }
 
-    /// Send a `setTopology` message to the node. `policy` must be the snapshot `peers`
-    /// was computed from -- the worker builds the wire-level `Link` structs from it and
-    /// resolves peers against it to mint bootstrap visas.
-    pub async fn set_topology(
-        &self,
-        peers: Vec<ResolvedPeer>,
-        policy: Arc<Policy>,
-    ) -> Result<(), VssSyncError> {
+    /// Send a `setTopology` message to the node, built from `psnap` (see
+    /// `vss_worker::proposed_links`).
+    pub async fn set_topology(&self, psnap: PolicySnapshot) -> Result<(), VssSyncError> {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let cmd = VssCmd::SetTopology(peers, policy, resp_tx);
+        let cmd = VssCmd::SetTopology(psnap, resp_tx);
         self.send_command(cmd).await?;
         resp_rx.await.map_err(|_| VssSyncError::ConnClosed)?
     }

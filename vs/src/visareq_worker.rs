@@ -1431,6 +1431,64 @@ mod tests {
         assert!(matches!(result, VisaDecision::Deny(DenyCode::NoRoute)));
     }
 
+    /// zl-zipline#255 acceptance: the direct link between the two docks is down, and
+    /// the only other way is through C, which policy does not mark transit-capable.
+    /// The visa request is denied `NoRoute`; it is not routed through C.
+    #[tokio::test]
+    async fn process_visa_request_denied_no_route_through_a_non_transit_node() {
+        use crate::test_helpers::{build_transit_asm, report_transit_asm_links, transit_policy};
+        let (asm, _a, _b, _c) = build_transit_asm().await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[]))
+            .await
+            .unwrap();
+        asm.topo_mgr.apply_transit_nodes(
+            &asm.topo_mgr.ops().await,
+            &asm.policy_mgr.get_current_snapshot(),
+        );
+        report_transit_asm_links(&asm, false);
+
+        let requesting_node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let pkt = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 1234, 80).unwrap();
+        let (job, _rx) = VisaRequestJob::new(requesting_node, pkt);
+        let result = process_visa_request(asm, &job).await.unwrap();
+        assert!(
+            matches!(result, VisaDecision::Deny(DenyCode::NoRoute)),
+            "expected NoRoute"
+        );
+    }
+
+    /// The same, with C in `Policy.transitNodes`: the request is routed through C (and
+    /// then denied `NoMatch` by the empty communication policy, which shows routing
+    /// succeeded).
+    #[tokio::test]
+    async fn process_visa_request_routes_through_a_transit_node() {
+        use crate::test_helpers::{build_transit_asm, report_transit_asm_links, transit_policy};
+        use libeval::route::LinkId;
+        let (asm, a, b, c) = build_transit_asm().await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[c]))
+            .await
+            .unwrap();
+        asm.topo_mgr.apply_transit_nodes(
+            &asm.topo_mgr.ops().await,
+            &asm.policy_mgr.get_current_snapshot(),
+        );
+        report_transit_asm_links(&asm, false);
+        assert_eq!(
+            asm.topo_mgr.get_best_route(&a, &b).unwrap().links,
+            vec![LinkId("ac".into()), LinkId("cb".into())]
+        );
+
+        let pkt = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 1234, 80).unwrap();
+        let (job, _rx) = VisaRequestJob::new(a, pkt);
+        let result = process_visa_request(asm, &job).await.unwrap();
+        assert!(
+            matches!(result, VisaDecision::Deny(DenyCode::NoMatch)),
+            "expected routing to succeed (NoMatch from the empty policy)"
+        );
+    }
+
     // An AAA destination actor with the AAA table pre-populated reaches policy evaluation.
     // Deny(NoMatch) confirms the actor was resolved and routing succeeded.
     #[tokio::test]

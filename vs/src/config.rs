@@ -29,9 +29,10 @@ pub const EVENT_QUEUE_DEPTH: usize = 1024;
 // patch >= the minimum): pre-1.0, an advanced compiler minor means "probably
 // won't work with this visa service", so vs rejects it (zipline#114). This
 // constant therefore moves in lockstep with zplc's minor on every zplc minor
-// bump.
+// bump. 0.21 (zl-zipline#256): routes follow Policy.transitNodes, which a
+// 0.20 policy does not carry.
 pub const POLICY_MIN_COMPILER_MAJOR: u32 = 0;
-pub const POLICY_MIN_COMPILER_MINOR: u32 = 20;
+pub const POLICY_MIN_COMPILER_MINOR: u32 = 21;
 pub const POLICY_MIN_COMPILER_PATCH: u32 = 0;
 
 /// Retry hint (seconds) sent with `temporarilyUnavailable` when an OIDC
@@ -480,28 +481,31 @@ mod test {
         let mut inner = Vec::new();
         capnp::serialize::write_message(&mut inner, &msg).unwrap();
 
-        // zplc at tip is 0.20.0: its containers must load.
-        let current = crate::test_helpers::make_container_bytes(0, 20, 0, &inner);
+        // zplc on feature/zodes is 0.21.0 (Policy.transitNodes is enforced,
+        // zl-zipline#227): its containers must load.
+        let current = crate::test_helpers::make_container_bytes(0, 21, 0, &inner);
         let loaded = libeval::pio::load_policy_from_container(
             &bytes::Bytes::from(current),
             &POLICY_MIN_VERSION,
         );
         assert!(
             loaded.is_ok(),
-            "a 0.20.0-compiled policy container must load against POLICY_MIN_VERSION {}: {:?}",
+            "a 0.21.0-compiled policy container must load against POLICY_MIN_VERSION {}: {:?}",
             POLICY_MIN_VERSION,
             loaded.err()
         );
 
         // The previous minor must be rejected — exact-minor matching.
-        let previous = crate::test_helpers::make_container_bytes(0, 19, 3, &inner);
+        // A 0.20.x container has no transitNodes: loaded, it would deny every
+        // multi-hop route as NoRoute instead of being refused.
+        let previous = crate::test_helpers::make_container_bytes(0, 20, 1, &inner);
         assert!(
             libeval::pio::load_policy_from_container(
                 &bytes::Bytes::from(previous),
                 &POLICY_MIN_VERSION
             )
             .is_err(),
-            "a 0.19.x-compiled policy container must be rejected by POLICY_MIN_VERSION {} (exact-minor match)",
+            "a 0.20.x-compiled policy container must be rejected by POLICY_MIN_VERSION {} (exact-minor match)",
             POLICY_MIN_VERSION
         );
     }

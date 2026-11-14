@@ -23,10 +23,10 @@ use zpr::write_to::WriteTo;
 use crate::assembly::Assembly;
 use crate::config;
 use crate::counters::CounterType;
-use crate::error::VssSyncError;
+use crate::error::{ServiceError, VssSyncError};
 use crate::logging::targets::VSS;
 use crate::net_mgr;
-use crate::policy_mgr::ResolvedPeer;
+use crate::policy_mgr::{PolicySnapshot, ResolvedPeer};
 use crate::vss::VssCmd;
 
 /// Default timeout for a single Cap'n Proto RPC call.
@@ -184,9 +184,9 @@ pub async fn vss_worker_loop(
                                 asm.counters.incr(CounterType::VssErrors);
                             }
                         }
-                        VssCmd::SetTopology(links, policy, resp_tx) => {
+                        VssCmd::SetTopology(psnap, resp_tx) => {
                             state.mark_topology_updated();
-                            if let Err(e) = resp_tx.send(vss_do_set_topology(&vss_handle, asm.clone(), &node_addr.ip(), policy, links).await) {
+                            if let Err(e) = resp_tx.send(vss_do_set_topology(&vss_handle, asm.clone(), &node_addr.ip(), psnap).await) {
                                 error!(target: VSS, "failed to send response for set-topology command: {:?}", e);
                                 asm.counters.incr(CounterType::VssErrors);
                             }
@@ -511,20 +511,9 @@ async fn send_topology(
     node_addr: &IpAddr,
     vss_handle: &v1::v_s_s_handle::Client,
 ) {
-    // One snapshot for both the resolved peers and the peer lookup inside.
     let psnap = asm.policy_mgr.get_current_snapshot();
-    let peers = psnap.resolved_peers_for_node(node_addr);
-
     debug!(target: VSS, "sending initial topology to VSS at {}", node_addr);
-    if let Err(e) = vss_do_set_topology(
-        vss_handle,
-        asm.clone(),
-        node_addr,
-        psnap.policy_arc(),
-        peers,
-    )
-    .await
-    {
+    if let Err(e) = vss_do_set_topology(vss_handle, asm.clone(), node_addr, psnap).await {
         error!(target: VSS, "failed to send initial topology to VSS at {}: {}", node_addr, e);
         asm.counters.incr(CounterType::VssErrors);
     } else {
@@ -801,29 +790,27 @@ async fn vss_do_configure(
     check_ok_or_error(configure_response_ok_or_err.get_res().unwrap())
 }
 
-/// Send the node's links via the `setTopology` RPC. Pass an empty vec to indicate no peers.
+/// Send the node's links via the `setTopology` RPC, built from `psnap`
+/// ([proposed_links]). No links means no peers.
 ///
-/// This is the one place the wire-level vsapi `Link` structs are built: `peers` carries
-/// only what the policy manager computed (link id + resolved substrate address), and the
-/// full `Link` — role, peer address, peer ZPR address and CN — is materialized here, just before
-/// it goes on the wire.
+/// This is the one place the wire-level vsapi `Link` structs are built and sent.
+/// `node_addr` is the ZPR address of the node on the other end of `vss_handle`; the
+/// links are that node's view of the topology.
 ///
-/// `node_addr` is the ZPR address of the node on the other end of `vss_handle`; the links are
-/// that node's view of the topology, so the peer lookup below must be keyed by it.
-///
-/// `policy` must be the snapshot `peers` was computed from. Reacquiring the current policy here
-/// would let a newly installed one pair its peers with the older snapshot's resolved peers.
+/// A failed address lookup fails the send, so the caller leaves the topology unsynced
+/// and the worker's heartbeat sends it again: no link goes out with a guessed address.
 async fn vss_do_set_topology(
     vss_handle: &v1::v_s_s_handle::Client,
     asm: Arc<Assembly>,
     node_addr: &IpAddr,
-    policy: Arc<Policy>,
-    peers: Vec<ResolvedPeer>,
+    psnap: PolicySnapshot,
 ) -> Result<(), VssSyncError> {
     // Each link names its peer's ZPR address and CN. It carries no visas (J8): a relay asks
     // for a joining peer's bootstrap visas when that peer's link comes up
     // (`requestBootstrapVisas`, see [crate::visa_bootstrap]).
-    let links = topology_links(&asm, &policy, node_addr, peers);
+    let links = proposed_links(&asm, &psnap, node_addr)
+        .await
+        .map_err(|e| VssSyncError::Internal(format!("building the topology: {e}")))?;
 
     let mut req = vss_handle.set_topology_request();
     let req_builder = req.get();
@@ -839,11 +826,122 @@ async fn vss_do_set_topology(
     check_ok_or_error(set_response_ok_or_err.get_res().unwrap())
 }
 
-/// The `Link`s of `node_addr`'s topology message: one per resolved peer, each naming the
-/// peer's ZPR address and CN. No link carries visas (J8). A link whose owner reported it
-/// `failed` is left out until the pair is cleared (R13a, `TopologyMgr::is_failed_pair`).
+/// The `Link`s the visa service proposes to `node_addr`, all read from `psnap`
+/// (ZODE_LINKS.md rule 13b, zl-zipline#255): it proposes a link only when it can work,
+/// and never asks a Zode to dial an address it does not know.
 ///
-/// `policy` must be the snapshot `peers` was computed from, as for [vss_do_set_topology].
+/// The candidates are [topology_links] (R13a and the CN rule apply there). Of those:
+/// - a **relay link** -- one end is the relay, the node the visa service docks on
+///   ([crate::visa_bootstrap::is_relay]; the v1 relay, §5.6) -- is always proposed:
+///   an endpoint dials its configured initial link, and the relay must know a joiner's
+///   CN before the joiner connects (J2). `peer` is the other end's known address, or
+///   unset if there is none (the relay never dials a joiner);
+/// - a **direct link** is proposed only when both ends have a known address, and its
+///   `peer` is the other end's. Which end dials is the Zodes' rule, not copied here.
+///
+/// A known address is [known_substrate_addr]. A lookup that fails is an error: the
+/// caller leaves the topology unsynced and it is sent again, never with a guess.
+pub(crate) async fn proposed_links(
+    asm: &Assembly,
+    psnap: &PolicySnapshot,
+    node_addr: &IpAddr,
+) -> Result<Vec<Link>, ServiceError> {
+    let candidates = topology_links(
+        asm,
+        psnap.policy(),
+        node_addr,
+        psnap.resolved_peers_for_node(node_addr),
+    );
+    let node_is_relay = crate::visa_bootstrap::is_relay(asm, node_addr);
+    let own_addr = known_substrate_addr(
+        asm,
+        crate::connection_control::substrate_addr_from_topology(psnap, node_addr),
+        node_addr,
+    )
+    .await?;
+    let mut links = Vec::with_capacity(candidates.len());
+    for mut link in candidates {
+        // `link.peer` holds the peer's policy address, if policy declares one.
+        let peer_addr =
+            known_substrate_addr(asm, link.peer.clone().map(SocketAddr::from), &link.zpr_addr)
+                .await?;
+        let is_relay_link = node_is_relay || crate::visa_bootstrap::is_relay(asm, &link.zpr_addr);
+        if !is_relay_link && (own_addr.is_none() || peer_addr.is_none()) {
+            let missing = if own_addr.is_none() {
+                node_addr
+            } else {
+                &link.zpr_addr
+            };
+            info!(target: VSS, "direct link {} between {node_addr} and {}: no known address for {missing}; left out of topology", link.link_id, link.zpr_addr);
+            continue;
+        }
+        link.peer = peer_addr.map(|addr| SockAddr {
+            addr: addr.ip(),
+            port: addr.port(),
+        });
+        links.push(link);
+    }
+    Ok(links)
+}
+
+/// The known substrate address of `node` (plan p37 rule 3): `policy_addr`, its
+/// DNS-resolved policy address, if policy declares one; else the `SUBSTRATE_ADDR`
+/// claim of its VS-API session, the stored node actor (a node with no stored node actor
+/// has no session; see `core_visas::require_current_session`). Nothing else: `None`
+/// means unknown.
+///
+/// A rejoin (`visa_bootstrap::end_previous_join`) ends a session but keeps the node actor,
+/// so its claim stays known until the node's next `connect` or `open` replaces it.
+/// ponytail: in that window a direct peer may be proposed the old address; the dial fails
+/// and the pair falls to R13a, cleared by that next session start. Mark ended sessions on
+/// the actor if the window ever matters.
+///
+/// The claim was checked when it was recorded (`accept_reported_substrate`). Trusting it
+/// steers only where a peer dials; the link still needs the node's CA-signed
+/// certificate with the expected CN. Whether a Zode can misuse the address it reports
+/// is zl-zipline#264.
+async fn known_substrate_addr(
+    asm: &Assembly,
+    policy_addr: Option<SocketAddr>,
+    node: &IpAddr,
+) -> Result<Option<SocketAddr>, ServiceError> {
+    if policy_addr.is_some() {
+        return Ok(policy_addr);
+    }
+    let Some(actor) = asm.actor_mgr.get_actor_by_zpr_addr(node).await? else {
+        return Ok(None);
+    };
+    if !actor.is_node() {
+        return Ok(None);
+    }
+    let Some(claim) = actor
+        .get_attribute(libeval::attribute::key::SUBSTRATE_ADDR)
+        .and_then(|attr| attr.get_single_value().ok())
+    else {
+        return Ok(None);
+    };
+    // A claim that names no place to dial is not a known address. It is not an error
+    // either: it would not change on a retry, and failing would withhold every link of
+    // the topology, the relay link too. Claims recorded by VS-API `connect`/`open` always
+    // parse; a bare IP comes from an adapter-path connect (`authorize_connect`).
+    match claim.parse::<SocketAddr>() {
+        Ok(addr) if crate::connection_control::require_dialable_substrate(addr).is_ok() => {
+            Ok(Some(addr))
+        }
+        _ => {
+            warn!(target: VSS, "node {node}: stored substrate address {claim:?} is not a dialable address; treated as unknown");
+            Ok(None)
+        }
+    }
+}
+
+/// The candidate `Link`s of `node_addr`'s topology message: one per resolved peer, each
+/// naming the peer's ZPR address and CN, with `peer` = the peer's policy address if
+/// policy declares one. No link carries visas (J8). A link whose owner reported it
+/// `failed` is left out until the pair is cleared (R13a, `TopologyMgr::is_failed_pair`).
+/// [proposed_links] decides which candidates are sent, and with which `peer`.
+///
+/// `policy` must be the snapshot `peers` was computed from.
 pub(crate) fn topology_links(
     asm: &Assembly,
     policy: &Policy,
@@ -881,10 +979,10 @@ pub(crate) fn topology_links(
         links.push(Link {
             link_id,
             role: LinkRole::Active, // only "active" support at the moment.
-            peer: SockAddr {
+            peer: sock_addr.map(|sock_addr| SockAddr {
                 addr: sock_addr.ip(),
                 port: sock_addr.port(),
-            },
+            }),
             zpr_addr: peer.remote_zpr_addr,
             peer_cn: peer_cn.to_string(),
         });
@@ -1070,5 +1168,224 @@ mod tests {
             res.is_err(),
             "binding a non-local source must fail, got {res:?}"
         );
+    }
+
+    /// Tests for which links the visa service proposes and with which `peer`
+    /// (ZODE_LINKS.md rule 13b, zl-zipline#255).
+    mod proposed {
+        use super::*;
+        use crate::db::{FakeDb, FaultMode};
+        use crate::test_helpers::{make_node_actor_defexp, make_peering};
+        use std::collections::HashMap;
+        use zpr::policy_types::{NetAddr, Peering};
+
+        /// The relay: the visa service docks on it. Policy declares its address.
+        const R: &str = "fd5a:5052:3000::1";
+        /// Endpoints with no address in policy: they report their own when they connect.
+        const A: &str = "fd5a:5052:3000::a";
+        const B: &str = "fd5a:5052:3000::b";
+        /// Nodes whose address policy declares.
+        const C: &str = "fd5a:5052:3000::c";
+        const D: &str = "fd5a:5052:3000::d";
+
+        fn ip(s: &str) -> IpAddr {
+            s.parse().unwrap()
+        }
+
+        fn sa(s: &str) -> SocketAddr {
+            s.parse().unwrap()
+        }
+
+        /// The policy address of `node` on its links, if policy declares one.
+        fn policy_port(node: &str) -> Option<u16> {
+            match node {
+                R => Some(7000),
+                C => Some(7003),
+                D => Some(7004),
+                _ => None,
+            }
+        }
+
+        /// A peering of `a` and `b`, each end at its own ZPR address with its
+        /// [policy_port], or with no address where policy declares none.
+        fn peering(a: &str, b: &str, link_id: &str) -> Peering {
+            let mut peering = make_peering(ip(a), ip(b), link_id, vec![]);
+            peering.substrate_a = policy_port(a).map(|port| NetAddr::new_for_ip_or_host(a, port));
+            peering.substrate_b = policy_port(b).map(|port| NetAddr::new_for_ip_or_host(b, port));
+            peering
+        }
+
+        /// An assembly whose policy links the relay R to A, B and C, and declares the
+        /// direct links A-B and C-D, with a CN for every node. The visa service docks
+        /// on R. No node has a VS-API session yet; see [connect].
+        async fn build() -> (Arc<Assembly>, Arc<FakeDb>) {
+            let (asm, event_rx, db) =
+                crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+            std::mem::forget(event_rx);
+            let peerings = [
+                peering(R, A, "link-ra"),
+                peering(R, B, "link-rb"),
+                peering(R, C, "link-rc"),
+                peering(A, B, "link-ab"),
+                peering(C, D, "link-cd"),
+            ];
+            let cns = [R, A, B, C, D].map(|n| (ip(n), n));
+            asm.policy_mgr
+                .update_policy_from_container_bytes(
+                    crate::test_helpers::policy_with_peerings_and_node_cns(&peerings, &cns),
+                )
+                .await
+                .unwrap();
+            asm.topo_mgr.add_node(ip(R)).unwrap();
+            asm.actor_mgr
+                .hack_set_vs_docking_node(&ip(R))
+                .await
+                .unwrap();
+            (Arc::new(asm), db)
+        }
+
+        /// `node` starts a VS-API session that reported `substrate`.
+        async fn connect(asm: &Assembly, node: &str, substrate: &str) {
+            asm.actor_mgr
+                .add_node(
+                    &make_node_actor_defexp(node, node, substrate),
+                    false,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        /// `node`'s proposed links, by peer ZPR address: `peer -> Link.peer`.
+        async fn links_of(asm: &Assembly, node: &str) -> HashMap<IpAddr, Option<SocketAddr>> {
+            let psnap = asm.policy_mgr.get_current_snapshot();
+            proposed_links(asm, &psnap, &ip(node))
+                .await
+                .expect("no lookup fails")
+                .into_iter()
+                .map(|link| (link.zpr_addr, link.peer.map(SocketAddr::from)))
+                .collect()
+        }
+
+        /// The relay's topology names a joiner that policy gives no address and that
+        /// has not connected yet, with `peer` unset: the relay never dials it, and must
+        /// know the joiner's CN before the joiner connects (J2).
+        #[tokio::test]
+        async fn a_relay_link_to_an_unaddressed_unconnected_joiner_has_no_peer() {
+            let (asm, _db) = build().await;
+            let relay = links_of(&asm, R).await;
+            assert_eq!(relay.get(&ip(A)), Some(&None), "{relay:?}");
+            assert_eq!(relay.get(&ip(B)), Some(&None), "{relay:?}");
+        }
+
+        /// Once the joiner connects, the relay's link to it names its reported address,
+        /// and the joiner's link to the relay names the relay's policy address.
+        #[tokio::test]
+        async fn a_relay_link_names_the_joiners_reported_address_once_it_connects() {
+            let (asm, _db) = build().await;
+            connect(&asm, A, "192.0.2.10:7000").await;
+            assert_eq!(
+                links_of(&asm, R).await.get(&ip(A)),
+                Some(&Some(sa("192.0.2.10:7000")))
+            );
+            assert_eq!(
+                links_of(&asm, A).await.get(&ip(R)),
+                Some(&Some(sa("[fd5a:5052:3000::1]:7000")))
+            );
+        }
+
+        /// A direct link (neither end is the relay) with one end's address unknown is
+        /// proposed to neither end: no Zode is asked to dial a link it cannot make.
+        #[tokio::test]
+        async fn a_direct_link_with_one_end_unknown_is_left_out_at_both_ends() {
+            let (asm, _db) = build().await;
+            connect(&asm, A, "192.0.2.10:7000").await;
+            let a = links_of(&asm, A).await;
+            assert!(!a.contains_key(&ip(B)), "{a:?}");
+            let b = links_of(&asm, B).await;
+            assert!(!b.contains_key(&ip(A)), "{b:?}");
+            assert!(b.contains_key(&ip(R)), "B's relay link stays: {b:?}");
+        }
+
+        /// A direct link with both ends' reported addresses known is proposed to both
+        /// ends, each naming the other's address.
+        #[tokio::test]
+        async fn a_direct_link_with_both_ends_reported_names_the_other_end() {
+            let (asm, _db) = build().await;
+            connect(&asm, A, "192.0.2.10:7000").await;
+            connect(&asm, B, "198.51.100.20:7001").await;
+            assert_eq!(
+                links_of(&asm, A).await.get(&ip(B)),
+                Some(&Some(sa("198.51.100.20:7001")))
+            );
+            assert_eq!(
+                links_of(&asm, B).await.get(&ip(A)),
+                Some(&Some(sa("192.0.2.10:7000")))
+            );
+        }
+
+        /// A policy address is a known address with or without a session, and wins over
+        /// a session's claim: links between policy-addressed nodes are unchanged.
+        #[tokio::test]
+        async fn a_policy_address_wins_and_needs_no_session() {
+            let (asm, _db) = build().await;
+            connect(&asm, C, "192.0.2.99:1").await;
+            assert_eq!(
+                links_of(&asm, R).await.get(&ip(C)),
+                Some(&Some(sa("[fd5a:5052:3000::c]:7003")))
+            );
+            assert_eq!(
+                links_of(&asm, C).await.get(&ip(D)),
+                Some(&Some(sa("[fd5a:5052:3000::d]:7004")))
+            );
+            assert_eq!(
+                links_of(&asm, D).await.get(&ip(C)),
+                Some(&Some(sa("[fd5a:5052:3000::c]:7003")))
+            );
+        }
+
+        /// A stored claim that names no dialable address (a bare IP from an adapter-path
+        /// connect, an unspecified IP, port 0) is not a known address, and it does not
+        /// fail the topology: the relay link is still proposed, with `peer` unset, and
+        /// the direct link left out (visaservice#68 review, Copilot).
+        #[tokio::test]
+        async fn a_claim_that_is_not_a_dialable_address_is_unknown() {
+            let (asm, _db) = build().await;
+            connect(&asm, B, "198.51.100.20:7001").await;
+            for claim in ["192.0.2.10", "0.0.0.0:7000", "192.0.2.10:0"] {
+                connect(&asm, A, "192.0.2.10:7000").await;
+                let mut actor = asm
+                    .actor_mgr
+                    .get_actor_by_zpr_addr(&ip(A))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                actor
+                    .add_attribute(
+                        libeval::attribute::Attribute::builder(
+                            libeval::attribute::key::SUBSTRATE_ADDR,
+                        )
+                        .value(claim),
+                    )
+                    .unwrap();
+                asm.actor_mgr
+                    .update_actor(&actor, &asm.policy_service_names())
+                    .await
+                    .unwrap();
+                assert_eq!(links_of(&asm, R).await.get(&ip(A)), Some(&None), "{claim}");
+                let b = links_of(&asm, B).await;
+                assert!(!b.contains_key(&ip(A)), "{claim}: {b:?}");
+            }
+        }
+
+        /// A session lookup that fails is an error, never a guessed or missing address:
+        /// the send fails and the topology stays unsynced, so the worker retries it.
+        #[tokio::test]
+        async fn a_failed_lookup_fails_the_topology() {
+            let (asm, db) = build().await;
+            db.set_exists_fault(FaultMode::Reject);
+            let psnap = asm.policy_mgr.get_current_snapshot();
+            assert!(proposed_links(&asm, &psnap, &ip(R)).await.is_err());
+        }
     }
 }

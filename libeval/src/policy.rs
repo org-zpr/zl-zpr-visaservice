@@ -75,6 +75,10 @@ pub struct Policy {
     /// Node ZPR address -> the CN that node authenticates with, read from the node join
     /// policies at load. See [Policy::node_cn_for_addr].
     node_cn_by_addr: HashMap<IpAddr, String>,
+    /// ZPR addresses of the nodes that may carry traffic between other nodes
+    /// (`Policy.transitNodes`). Fails closed: unset or empty means no node may.
+    /// See [Policy::is_transit_node].
+    transit_nodes: HashSet<IpAddr>,
 }
 
 /// A "Peer" is a one-way view of a link from the perspective of one endpoint.
@@ -134,6 +138,7 @@ impl Policy {
         let identity_attr_keys = resolve_identity_attr_keys(&trusted_services);
         let cpol_sources = load_cpol_sources(&policy)?;
         let peerings = load_peerings(&policy)?;
+        let transit_nodes = load_transit_nodes(&policy)?;
         let peer_table = if let Some(ref peerings) = peerings {
             load_peer_table(peerings)
         } else {
@@ -161,6 +166,7 @@ impl Policy {
             peer_table,
             link_attrs,
             node_cn_by_addr,
+            transit_nodes,
             ..Default::default()
         })
     }
@@ -433,6 +439,19 @@ impl Policy {
         self.node_cn_by_addr.get(node_zpr_addr).map(String::as_str)
     }
 
+    /// Whether policy lets the node at `node_zpr_addr` carry traffic between other
+    /// nodes, i.e. be an interior hop of a route (zl-zipline#255). Fails closed: a node
+    /// that `Policy.transitNodes` does not list is not transit-capable, and an unset or
+    /// empty list means no node is. A node is always allowed at either end of a route.
+    pub fn is_transit_node(&self, node_zpr_addr: &IpAddr) -> bool {
+        self.transit_nodes.contains(node_zpr_addr)
+    }
+
+    /// Every transit-capable node's ZPR address; see [Policy::is_transit_node].
+    pub fn transit_nodes(&self) -> &HashSet<IpAddr> {
+        &self.transit_nodes
+    }
+
     /// A link may have attributes on it, this returns them.
     pub fn get_link_attrs(&self, link_id: &str) -> Option<&[AttrExp]> {
         self.link_attrs.as_ref()?.get(link_id).map(|v| v.as_slice())
@@ -627,6 +646,28 @@ fn load_join_policies(policy: &policy_capnp::policy::Reader) -> Result<Vec<JPoli
         }
     }
     Ok(join_policies)
+}
+
+/// Read `Policy.transitNodes`: the ZPR addresses of the transit-capable nodes. An unset
+/// list yields the empty set (no node is transit-capable). An entry that is not an IP
+/// address fails the load: the compiler writes only addresses, so such a policy is not
+/// what it claims to be, and guessing would risk making the wrong node transit.
+fn load_transit_nodes(
+    policy: &policy_capnp::policy::Reader,
+) -> Result<HashSet<IpAddr>, PolicyError> {
+    let mut transit_nodes = HashSet::new();
+    if policy.has_transit_nodes() {
+        for entry in policy.get_transit_nodes()?.iter() {
+            let text = entry?.to_str()?;
+            let addr = text.parse::<IpAddr>().map_err(|_| {
+                PolicyError::InvalidFormat(format!(
+                    "transitNodes entry is not an IP address: {text:?}"
+                ))
+            })?;
+            transit_nodes.insert(addr);
+        }
+    }
+    Ok(transit_nodes)
 }
 
 fn load_cpol_sources(policy: &policy_capnp::policy::Reader) -> Result<Vec<String>, PolicyError> {
@@ -1599,5 +1640,66 @@ mod test {
             .unwrap();
         assert_eq!(result.attrs.len(), 1);
         assert_eq!(result.attrs[0].get_key(), "link.class");
+    }
+
+    // --- transitNodes (zl-zipline#255) ---
+
+    /// Build a policy whose `transitNodes` list is `entries`, or left unset for `None`.
+    fn policy_bytes_with_transit_nodes(entries: Option<&[&str]>) -> Bytes {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let policy = msg.init_root::<policy_capnp::policy::Builder>();
+            if let Some(entries) = entries {
+                let mut list = policy.init_transit_nodes(entries.len() as u32);
+                for (i, entry) in entries.iter().enumerate() {
+                    list.set(i as u32, *entry);
+                }
+            }
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+        Bytes::from(bytes)
+    }
+
+    #[test]
+    /// A node listed in `transitNodes` is transit-capable; one that is not listed is not.
+    fn test_transit_nodes_listed_and_unlisted() {
+        let policy =
+            Policy::new_from_policy_bytes(policy_bytes_with_transit_nodes(Some(&["fd5a:5052::1"])))
+                .unwrap();
+        assert!(policy.is_transit_node(&ip("fd5a:5052::1")));
+        assert!(!policy.is_transit_node(&ip("fd5a:5052::2")));
+    }
+
+    #[test]
+    /// An unset list fails closed: no node is transit-capable.
+    fn test_transit_nodes_unset_means_none() {
+        let policy = Policy::new_from_policy_bytes(policy_bytes_with_transit_nodes(None)).unwrap();
+        assert!(!policy.is_transit_node(&ip("fd5a:5052::1")));
+        assert!(policy.transit_nodes().is_empty());
+    }
+
+    #[test]
+    /// An empty list means the same as an unset one.
+    fn test_transit_nodes_empty_means_none() {
+        let policy =
+            Policy::new_from_policy_bytes(policy_bytes_with_transit_nodes(Some(&[]))).unwrap();
+        assert!(!policy.is_transit_node(&ip("fd5a:5052::1")));
+        assert!(policy.transit_nodes().is_empty());
+    }
+
+    #[test]
+    /// An entry that is not an IP address fails the load: the compiler never writes one,
+    /// so the policy is not what it claims to be.
+    fn test_transit_nodes_malformed_entry_fails_load() {
+        let result = Policy::new_from_policy_bytes(policy_bytes_with_transit_nodes(Some(&[
+            "fd5a:5052::1",
+            "relay.zpr",
+        ])));
+        match result {
+            Err(PolicyError::InvalidFormat(msg)) => assert!(msg.contains("relay.zpr"), "{msg}"),
+            Err(e) => panic!("expected InvalidFormat, got {e}"),
+            Ok(_) => panic!("a malformed transitNodes entry must fail the load"),
+        }
     }
 }
