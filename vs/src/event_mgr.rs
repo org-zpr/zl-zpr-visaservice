@@ -1739,6 +1739,72 @@ mod tests {
         );
     }
 
+    /// Local review (Codex P2) of visaservice#68 r3: a policy that removes the relay's
+    /// link to a Zode while making C transit-capable, with relay-C and C-Zode up, does
+    /// not cut the Zode off: the grant is applied before the pass asks which nodes the
+    /// removed links cut off, so the Zode is still reached through C.
+    #[tokio::test]
+    async fn test_a_transit_grant_counts_before_the_cut_off_check() {
+        use libeval::route::LinkId;
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let relay: IpAddr = "fd5a:5052::2".parse().unwrap();
+        let zode: IpAddr = "fd5a:5052::3".parse().unwrap();
+        let c: IpAddr = "fd5a:5052::4".parse().unwrap();
+        let cns = [(relay, "relay"), (zode, "zb"), (c, "zc")];
+        for (addr, cn) in cns {
+            asm.actor_mgr
+                .add_node(
+                    &make_node_actor_defexp(&addr.to_string(), cn, "10.0.0.1:1"),
+                    false,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            asm.topo_mgr.add_node(addr).unwrap();
+        }
+        asm.actor_mgr
+            .hack_set_vs_docking_node(&relay)
+            .await
+            .unwrap();
+        for (a, b, id) in [
+            (relay, zode, "relay-zb"),
+            (relay, c, "relay-zc"),
+            (c, zode, "zc-zb"),
+        ] {
+            asm.topo_mgr
+                .add_link(a, b, LinkId(id.into()), vec![], 1)
+                .unwrap();
+        }
+        // The new policy drops relay-zb, keeps the other two, and makes C transit.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(
+                crate::test_helpers::policy_with_peerings_cns_services_and_transit(
+                    &[
+                        crate::test_helpers::make_peering(relay, c, "relay-zc", vec![]),
+                        crate::test_helpers::make_peering(c, zode, "zc-zb", vec![]),
+                    ],
+                    &cns,
+                    &[],
+                    &[c],
+                ),
+            )
+            .await
+            .unwrap();
+        let (zode_tx, mut zode_rx) = mpsc::channel::<crate::vss::VssCmd>(16);
+        asm.vss_mgr.insert_test_handle(zode, zode_tx);
+
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+
+        assert!(
+            matches!(
+                next_cmd(&mut zode_rx).await,
+                Some(crate::vss::VssCmd::SetTopology(..))
+            ),
+            "the Zode is still reached through C: it gets its topology, not a Stop"
+        );
+    }
+
     /// PR #41 review (Codex P1, zipline#123): a policy update whose reauth
     /// obligation cannot be persisted must FAIL, not return Ok. The sweep
     /// discovers obligations only from the state DB, so an unrecorded
