@@ -1330,6 +1330,40 @@ mod tests {
             );
         }
 
+        /// A stored claim that names no dialable address (a bare IP from an adapter-path
+        /// connect, an unspecified IP, port 0) is not a known address, and it does not
+        /// fail the topology: the relay link is still proposed, with `peer` unset, and
+        /// the direct link left out (visaservice#68 review, Copilot).
+        #[tokio::test]
+        async fn a_claim_that_is_not_a_dialable_address_is_unknown() {
+            let (asm, _db) = build().await;
+            connect(&asm, B, "198.51.100.20:7001").await;
+            for claim in ["192.0.2.10", "0.0.0.0:7000", "192.0.2.10:0"] {
+                connect(&asm, A, "192.0.2.10:7000").await;
+                let mut actor = asm
+                    .actor_mgr
+                    .get_actor_by_zpr_addr(&ip(A))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                actor
+                    .add_attribute(
+                        libeval::attribute::Attribute::builder(
+                            libeval::attribute::key::SUBSTRATE_ADDR,
+                        )
+                        .value(claim),
+                    )
+                    .unwrap();
+                asm.actor_mgr
+                    .update_actor(&actor, &asm.policy_service_names())
+                    .await
+                    .unwrap();
+                assert_eq!(links_of(&asm, R).await.get(&ip(A)), Some(&None), "{claim}");
+                let b = links_of(&asm, B).await;
+                assert!(!b.contains_key(&ip(A)), "{claim}: {b:?}");
+            }
+        }
+
         /// A session lookup that fails is an error, never a guessed or missing address:
         /// the send fails and the topology stays unsynced, so the worker retries it.
         #[tokio::test]
