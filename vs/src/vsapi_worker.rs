@@ -2496,6 +2496,13 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         Ok(())
     }
 
+    /// `visaRequestById`: hand a live node its own copies of the requested visas. A node
+    /// asks only for visas it does not hold, usually on a Stream ID Request, and the VSS
+    /// push may not reach it yet, so every copy the push would deliver now (or already
+    /// has) is returned (zl-zipline#262, see
+    /// [crate::visa_mgr::VisaMgr::visas_for_node_by_ids]). Read-only: no copy is marked
+    /// installed here. This handler only checks liveness, caps the request and shapes
+    /// the reply.
     async fn visa_request_by_id(
         self: Rc<Self>,
         req: vsapi::v_s_handle::VisaRequestByIdParams,

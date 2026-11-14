@@ -625,21 +625,29 @@ impl VisaMgr {
     /// The visas among `ids` that `node_addr` may fetch by ID (`visaRequestById`), each
     /// actualized for `node_addr` ([VisaMgr::actualize_visa_for_target_node]). An ID the
     /// node may not have is left out: the schema reads a missing visa as "does not exist
-    /// for that node".
+    /// for that node". See [VisaMgr::fetchable_by_node] for the rule (zl-zipline#262).
+    ///
+    /// A node fetches a visa by ID only when it does not hold it, typically on a Stream ID
+    /// Request from its previous hop. Its copy is then usually still waiting for the VSS
+    /// push, which cannot reach it yet (no VSS connection during a join, or a restart).
+    /// So the fetch hands out every copy the push would deliver now, or already has.
+    ///
+    /// The fetch is read-only (gate g121 q3): it never marks a copy `Installed`. The VSS
+    /// push stays the only acknowledged delivery, so ingress last waits on real
+    /// acknowledgements; the push of a copy already fetched is a no-op on the node.
     pub async fn visas_for_node_by_ids(
         &self,
         node_addr: &IpAddr,
         ids: &[u64],
     ) -> Result<Vec<Visa>, ServiceError> {
-        let installed: HashSet<u64> = self
-            .get_installed_visa_ids_for_node(node_addr)
-            .await?
-            .into_iter()
-            .collect();
-        let mut visas = Vec::new();
-        for &id in ids.iter().filter(|id| installed.contains(id)) {
-            match self.get_visa_with_metadata_by_id(id).await {
-                Ok(Some(vwm)) => match self
+        let mut visas = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if !self.fetchable_by_node(id, node_addr) {
+                debug!(target: VISA, "node {node_addr} requested visa {id}: not deliverable to it");
+                continue;
+            }
+            match self.get_visa_with_metadata_by_id(id).await? {
+                Some(vwm) => match self
                     .actualize_visa_for_target_node(vwm.visa, node_addr)
                     .await
                 {
@@ -648,10 +656,23 @@ impl VisaMgr {
                         debug!(target: VISA, "node {node_addr} requested visa {id} but actualization failed")
                     }
                 },
-                _ => debug!(target: VISA, "node {node_addr} requested visa {id} but not found"),
+                None => debug!(target: VISA, "node {node_addr} requested visa {id} but not found"),
             }
         }
         Ok(visas)
+    }
+
+    /// Whether `node_addr` may fetch its copy of `visa_id` by ID: the copy is still
+    /// grantable ([VisaMgr::still_grantable]: `PendingInstall` or `Installed`, not
+    /// quarantined) and, if it is still `PendingInstall`, the VSS push would deliver it
+    /// now, which holds back only the ingress copy until every other hop has acknowledged
+    /// its own ([VisaMgr::deliverable_visas_for_node]). An `Installed` copy has already
+    /// been delivered, so the ingress-last check does not apply to it.
+    fn fetchable_by_node(&self, visa_id: u64, node_addr: &IpAddr) -> bool {
+        self.still_grantable(visa_id, node_addr)
+            && (self.repo.get_node_visa_state(visa_id, node_addr)
+                != Some(db::NodeVisaState::PendingInstall)
+                || self.other_hops_installed_if_ingress(visa_id, node_addr))
     }
 
     /// Quarantine a visa whose revocation write failed: it is never handed out by
