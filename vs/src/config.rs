@@ -29,9 +29,10 @@ pub const EVENT_QUEUE_DEPTH: usize = 1024;
 // patch >= the minimum): pre-1.0, an advanced compiler minor means "probably
 // won't work with this visa service", so vs rejects it (zipline#114). This
 // constant therefore moves in lockstep with zplc's minor on every zplc minor
-// bump.
+// bump. 0.21 (zl-zipline#256): routes follow Policy.transitNodes, which a
+// 0.20 policy does not carry.
 pub const POLICY_MIN_COMPILER_MAJOR: u32 = 0;
-pub const POLICY_MIN_COMPILER_MINOR: u32 = 20;
+pub const POLICY_MIN_COMPILER_MINOR: u32 = 21;
 pub const POLICY_MIN_COMPILER_PATCH: u32 = 0;
 
 /// Retry hint (seconds) sent with `temporarilyUnavailable` when an OIDC
