@@ -890,6 +890,12 @@ pub(crate) async fn proposed_links(
 /// has no session; see `core_visas::require_current_session`). Nothing else: `None`
 /// means unknown.
 ///
+/// A rejoin (`visa_bootstrap::end_previous_join`) ends a session but keeps the node actor,
+/// so its claim stays known until the node's next `connect` or `open` replaces it.
+/// ponytail: in that window a direct peer may be proposed the old address; the dial fails
+/// and the pair falls to R13a, cleared by that next session start. Mark ended sessions on
+/// the actor if the window ever matters.
+///
 /// The claim was checked when it was recorded (`accept_reported_substrate`). Trusting it
 /// steers only where a peer dials; the link still needs the node's CA-signed
 /// certificate with the expected CN. Whether a Zode can misuse the address it reports
@@ -914,11 +920,19 @@ async fn known_substrate_addr(
     else {
         return Ok(None);
     };
-    claim.parse::<SocketAddr>().map(Some).map_err(|e| {
-        ServiceError::Internal(format!(
-            "node {node}: stored substrate address {claim:?}: {e}"
-        ))
-    })
+    // A claim that names no place to dial is not a known address. It is not an error
+    // either: it would not change on a retry, and failing would withhold every link of
+    // the topology, the relay link too. Claims recorded by VS-API `connect`/`open` always
+    // parse; a bare IP comes from an adapter-path connect (`authorize_connect`).
+    match claim.parse::<SocketAddr>() {
+        Ok(addr) if crate::connection_control::require_dialable_substrate(addr).is_ok() => {
+            Ok(Some(addr))
+        }
+        _ => {
+            warn!(target: VSS, "node {node}: stored substrate address {claim:?} is not a dialable address; treated as unknown");
+            Ok(None)
+        }
+    }
 }
 
 /// The candidate `Link`s of `node_addr`'s topology message: one per resolved peer, each
