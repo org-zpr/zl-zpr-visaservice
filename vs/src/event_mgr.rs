@@ -206,11 +206,13 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
      */
 
     // Which nodes may pass traffic through comes from the current policy
-    // (zl-zipline#255). Applied first, under its own short topology guard, before
-    // anything fallible or slow: an error below ends this event with no retry, the
-    // actor refresh can take long, and until this runs the router would keep routing
-    // through a node the policy no longer lets carry traffic. A newer policy's own
-    // pass applies its set again, so a superseded pass does no harm here.
+    // (zl-zipline#255). Transit the policy takes away is withdrawn first, under its own
+    // short topology guard, before anything fallible or slow: an error below ends this
+    // event with no retry, the actor refresh can take long, and until this runs the
+    // router would keep routing through a node the policy no longer lets carry
+    // traffic. Transit the policy grants waits for the link reconciliation in
+    // `policy_pass_locked`. A newer policy's own pass applies its set again, so a
+    // superseded pass does no harm here.
     {
         let ops = asm.topo_mgr.ops().await;
         withdraw_policy_transit(asm, &ops, &asm.policy_mgr.get_current_snapshot()).await;
@@ -458,6 +460,16 @@ async fn policy_pass_locked(
         }
     }
 
+    // The links now match the policy (or no node is connected to have any), so the
+    // policy's full transit set can be applied, granting what the early step withheld.
+    // If the reconciliation failed, the grant is withheld too: fail closed until a
+    // later pass (or a restart) reconciles.
+    if reconciled.is_ok() {
+        apply_policy_transit(asm, ops, &psnap).await;
+    } else {
+        warn!(target: EVENT, "policy updated vinst={vinst}: link reconciliation failed; transit the policy grants is not applied");
+    }
+
     Ok(LockedPass::Applied {
         psnap,
         valid_node_addrs,
@@ -466,9 +478,16 @@ async fn policy_pass_locked(
     })
 }
 
-/// STUB (tests first): the same as [apply_policy_transit].
+/// The early transit step of a policy pass: take transit away from every node `psnap`'s
+/// policy no longer lists, and revoke the visas through a node that is not
+/// transit-capable, under the caller's [TopoOps]. A node the policy newly lists is
+/// **not** made transit-capable here: the router still has the old links, and the new
+/// policy may remove or change one of that node's links, so a route through it could
+/// use a link the policy no longer has. [policy_pass_locked] grants it, through
+/// [apply_policy_transit], once the links are reconciled (visaservice#68 review r3).
 async fn withdraw_policy_transit(asm: &Arc<Assembly>, ops: &TopoOps<'_>, psnap: &PolicySnapshot) {
-    apply_policy_transit(asm, ops, psnap).await;
+    asm.topo_mgr.withdraw_transit_nodes(ops, psnap);
+    let _ = crate::visa_reconciler::revoke_visas_through_non_transit(asm).await;
 }
 
 /// Make the router's transit set `psnap`'s (`Policy.transitNodes`, zl-zipline#255) and

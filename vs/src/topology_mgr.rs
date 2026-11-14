@@ -420,6 +420,29 @@ impl TopologyMgr {
         lost
     }
 
+    /// Take transit away from every node that `snapshot`'s policy does not list, and
+    /// grant none: the router's transit set becomes its current set intersected with
+    /// the policy's. A policy pass does this before its links are reconciled; it grants
+    /// with [Self::apply_transit_nodes] after. Returns the nodes that lost transit.
+    pub fn withdraw_transit_nodes(
+        &self,
+        _ops: &TopoOps<'_>,
+        snapshot: &PolicySnapshot,
+    ) -> Vec<IpAddr> {
+        let policy_transit = snapshot.policy().transit_nodes();
+        let kept = self
+            .router
+            .transit_nodes()
+            .into_iter()
+            .filter(|node| policy_transit.contains(node))
+            .collect();
+        let lost = self.router.set_transit_nodes(kept);
+        if !lost.is_empty() {
+            info!(target: TOPO, "policy vinst {}: nodes no longer transit-capable: {:?}", snapshot.vinst(), lost);
+        }
+        lost
+    }
+
     /// True if every interior node of a visa's recorded node `path` is transit-capable
     /// ([Router::interior_is_transit]).
     pub fn interior_is_transit(&self, path: &[IpAddr]) -> bool {

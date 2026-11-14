@@ -439,6 +439,12 @@ impl Router {
         true
     }
 
+    /// The ZPR addresses of the nodes currently transit-capable ([Router::set_transit_nodes]).
+    pub fn transit_nodes(&self) -> HashSet<IpAddr> {
+        let inner = self.inner.read().unwrap();
+        inner.topology.transit.iter().map(|nid| nid.0).collect()
+    }
+
     /// Replace the set of transit-capable nodes: the only nodes a route may pass
     /// through (`Policy.transitNodes`, zl-zipline#255). Any node may still start or end
     /// a route. Starts empty (fail closed).
