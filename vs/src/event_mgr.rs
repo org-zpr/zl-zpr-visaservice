@@ -118,11 +118,8 @@ async fn handle_actor_leaves(
 /// Failures are logged. Never call this under a [TopoOps]: it waits on node RPCs.
 pub(crate) async fn send_topology_to(asm: &Assembly, psnap: &PolicySnapshot, nodes: &[IpAddr]) {
     let futs = nodes.iter().filter_map(|naddr| {
-        let peers = psnap.resolved_peers_for_node(naddr);
-        // Same snapshot the peers came from: the worker builds the wire Links off it.
-        let policy = psnap.policy_arc();
         asm.vss_mgr.get_handle(naddr).map(|vss_handle| async move {
-            if let Err(e) = vss_handle.set_topology(peers, policy).await {
+            if let Err(e) = vss_handle.set_topology(psnap.clone()).await {
                 error!(target: EVENT, "failed to set topology for node {}: {}", naddr, e);
             }
         })
@@ -166,13 +163,11 @@ async fn push_policy_to_nodes(
         let Some(vss) = asm.vss_mgr.get_handle(&naddr) else {
             continue;
         };
-        // Same snapshot the peers come from: the worker builds the wire Links off it.
-        let peers = psnap.resolved_peers_for_node(&naddr);
-        let policy = psnap.policy_arc();
+        let psnap = psnap.clone();
         let services = services.clone();
         let asm = asm.clone();
         tokio::spawn(async move {
-            if let Err(e) = vss.set_topology(peers, policy).await {
+            if let Err(e) = vss.set_topology(psnap).await {
                 error!(target: EVENT, "failed to set topology for node {naddr}: {e}");
             }
             if let Some(services) = services {

@@ -2528,19 +2528,24 @@ impl ConnectionControl {
 /// value is authoritative (it is what policy declares and what every peer dials) and is
 /// already DNS-resolved, so it parses as a `SocketAddr`.
 ///
-/// Returns `None` when policy declares no peering for the node, or none of its links appear
-/// in the resolved topology -- both mean policy cannot tell us.
+/// Returns `None` when policy declares no peering for the node, or no address for the
+/// node on any of its links -- both mean policy cannot tell us.
+///
+/// Read from `psnap`, so a caller building a whole topology sees one policy.
 ///
 /// Does not support multi-homed nodes!
-pub fn substrate_addr_from_topology(asm: &Assembly, node_addr: &IpAddr) -> Option<SocketAddr> {
-    let psnap = asm.policy_mgr.get_current_snapshot();
+pub fn substrate_addr_from_topology(
+    psnap: &PolicySnapshot,
+    node_addr: &IpAddr,
+) -> Option<SocketAddr> {
     for peer in psnap.policy().get_peers_for_node(node_addr)? {
-        if let Some((_, sock_addr)) = psnap
+        let declared = psnap
             .resolved_peers_for_node(&peer.remote_zpr_addr)
             .into_iter()
             .find(|(link_id, _)| *link_id == peer.link_id)
-        {
-            return Some(sock_addr);
+            .and_then(|(_, sock_addr)| sock_addr);
+        if declared.is_some() {
+            return declared;
         }
     }
     None
@@ -2571,7 +2576,7 @@ pub fn accept_reported_substrate(
     reported: SocketAddr,
 ) -> Result<SocketAddr, ServiceError> {
     require_dialable_substrate(reported)?;
-    match substrate_addr_from_topology(asm, node_addr) {
+    match substrate_addr_from_topology(&asm.policy_mgr.get_current_snapshot(), node_addr) {
         Some(declared) if declared != reported => Err(ServiceError::Param(format!(
             "substrate address mismatch: policy declares {declared}, node reported {reported}"
         ))),
@@ -2751,12 +2756,12 @@ mod tests {
 
         // make_peering uses each node's own address as its substrate, port 0.
         assert_eq!(
-            substrate_addr_from_topology(&asm, &b),
+            substrate_addr_from_topology(&asm.policy_mgr.get_current_snapshot(), &b),
             Some(SocketAddr::new(b, 0)),
             "node B's substrate is the address peer A dials it at"
         );
         assert_eq!(
-            substrate_addr_from_topology(&asm, &unpeered),
+            substrate_addr_from_topology(&asm.policy_mgr.get_current_snapshot(), &unpeered),
             None,
             "a node with no peering has no policy-derived substrate"
         );

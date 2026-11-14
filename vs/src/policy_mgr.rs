@@ -49,10 +49,11 @@ pub trait DnsResolver: Send + Sync {
 pub const DEFAULT_POLICY_ID: u64 = 0;
 
 /// A peer link resolved from policy topology: the link id paired with the peer's
-/// DNS-resolved substrate address. This is all the policy manager computes; the
-/// wire-level vsapi `Link` struct is built from it only when a topology message
-/// is actually sent (see `vss_worker::vss_do_set_topology`).
-pub type ResolvedPeer = (String, SocketAddr);
+/// DNS-resolved substrate address, or `None` when policy declares no address for the
+/// peer (it reports its own when it connects, zl-zipline#225). This is all the policy
+/// manager computes; the wire-level vsapi `Link` struct is built from it only when a
+/// topology message is actually sent (see `vss_worker::proposed_links`).
+pub type ResolvedPeer = (String, Option<SocketAddr>);
 
 /// Combined policy, source container, and resolved topology — swapped atomically
 /// as a unit so the three can never drift apart.
@@ -832,30 +833,19 @@ impl PolicyResolver {
     /// vsapi `Link` struct is deliberately deferred to the topology-message send path.
     ///
     /// A peer whose remote substrate address is not in policy (the node reports its own,
-    /// zl-zipline#225) is skipped with a warning: no link can be sent without an address
-    /// yet. zl-zipline#227 fills it in from the address the node reports.
+    /// zl-zipline#225) is kept with `None`: whether a link to it is proposed, and with
+    /// which address, is decided when the topology is sent (`vss_worker::proposed_links`).
     async fn resolve_peers(&self, peers: &[Peer]) -> Result<Vec<ResolvedPeer>, ResolverError> {
-        let addressed = peers.iter().filter_map(|peer| match &peer.remote_substrate {
-            Some(naddr) => Some((peer, naddr)),
-            None => {
-                warn!(
-                    target: MAIN,
-                    "link {}: no substrate address in policy for peer {}; skipping it until the node reports one",
-                    peer.link_id, peer.remote_zpr_addr
-                );
-                None
-            }
-        });
         // Parallelize the DNS lookups then check for the first error.
-        let futs = addressed.map(|(peer, naddr)| async move {
-            (peer, resolve_netaddr(naddr, self.resolver.as_ref()).await)
+        let futs = peers.iter().map(|peer| async move {
+            let sock_addr = match &peer.remote_substrate {
+                Some(naddr) => Some(resolve_netaddr(naddr, self.resolver.as_ref()).await?),
+                None => None,
+            };
+            Ok((peer.link_id.clone(), sock_addr))
         });
 
-        futures::future::join_all(futs)
-            .await
-            .into_iter()
-            .map(|(peer, result)| result.map(|sock_addr| (peer.link_id.clone(), sock_addr)))
-            .collect()
+        futures::future::join_all(futs).await.into_iter().collect()
     }
 }
 
@@ -1905,7 +1895,7 @@ mod tests {
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].0, "link-a");
-        assert_eq!(resolved[0].1, SocketAddr::new(ip, 4000));
+        assert_eq!(resolved[0].1, Some(SocketAddr::new(ip, 4000)));
     }
 
     /// Multiple IP peers produce one resolved pair each, in the same order.
@@ -1920,15 +1910,16 @@ mod tests {
 
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].0, "link-a");
-        assert_eq!(resolved[0].1.ip(), ip_a);
+        assert_eq!(resolved[0].1.unwrap().ip(), ip_a);
         assert_eq!(resolved[1].0, "link-b");
-        assert_eq!(resolved[1].1.ip(), ip_b);
+        assert_eq!(resolved[1].1.unwrap().ip(), ip_b);
     }
 
     /// A peer whose remote substrate address is not in policy (the node reports its own,
-    /// zl-zipline#225) is skipped, not an error: the other peers still resolve.
+    /// zl-zipline#225) is kept with no address, not dropped and not an error
+    /// (zl-zipline#255): the topology send decides what to do with it.
     #[tokio::test]
-    async fn test_resolve_peers_skips_unset_substrate() {
+    async fn test_resolve_peers_keeps_unset_substrate() {
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
         let good = ip_peer("link-good", ip, 4000);
         let mut reported = ip_peer("link-reported", ip, 4001);
@@ -1937,8 +1928,13 @@ mod tests {
 
         let resolved = presolver.resolve_peers(&[good, reported]).await.unwrap();
 
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].0, "link-good");
+        assert_eq!(
+            resolved,
+            vec![
+                ("link-good".to_string(), Some(SocketAddr::new(ip, 4000))),
+                ("link-reported".to_string(), None),
+            ]
+        );
     }
 
     /// A peer with an unresolvable hostname causes resolve_peers to return an error.
@@ -2126,6 +2122,6 @@ mod tests {
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].0, "link-h");
-        assert_eq!(resolved[0].1, SocketAddr::new(resolved_ip, 5000));
+        assert_eq!(resolved[0].1, Some(SocketAddr::new(resolved_ip, 5000)));
     }
 }

@@ -1,14 +1,12 @@
 //! Shared VSS related types.
 
 use std::net::IpAddr;
-use std::sync::Arc;
 use tokio::sync::oneshot;
 
-use libeval::policy::Policy;
 use zpr::vsapi_types::{Param, ServiceDescriptor, Visa};
 
 use crate::error::VssSyncError;
-use crate::policy_mgr::ResolvedPeer;
+use crate::policy_mgr::PolicySnapshot;
 
 pub type VssPushResponse = Result<usize, VssSyncError>; // usize is number items pushed.
 pub type VssRevokeAuthResponse = Result<usize, VssSyncError>; // usize is number of items revoked.
@@ -35,12 +33,8 @@ pub enum VssCmd {
         oneshot::Sender<VssSetServicesResponse>,
     ), // (version, services-descriptor-list, channel)
     Configure(Vec<Param>, oneshot::Sender<VssConfigureResponse>),
-    /// The resolved peers plus the policy snapshot they were computed from. The snapshot
-    /// rides along so the worker can build the wire-level `Link` structs against the same
-    /// view that produced the peers.
-    SetTopology(
-        Vec<ResolvedPeer>,
-        Arc<Policy>,
-        oneshot::Sender<VssSetTopologyResponse>,
-    ),
+    /// The policy snapshot to build the node's topology from. The worker builds the
+    /// wire-level `Link` structs from this one snapshot (peers, CNs and policy
+    /// addresses), so they never mix two policies (see `vss_worker::proposed_links`).
+    SetTopology(PolicySnapshot, oneshot::Sender<VssSetTopologyResponse>),
 }
