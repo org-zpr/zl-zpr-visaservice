@@ -542,26 +542,23 @@ async fn add_node_serialized(
 /// reconnect), so its peers may now be able to make a link to it they could not before:
 /// a direct link is proposed only when both ends' addresses are known, and the node's
 /// reported address has just become known, or changed (ZODE_LINKS.md rule 13b,
-/// zl-zipline#255). And R13a: the session start counts as "something about the pair
-/// changed" for every failed pair `node` is part of.
+/// zl-zipline#255). `cleared` are the other ends of the failed pairs the session start
+/// cleared under the topology guard (R13a: it counts as "something about the pair
+/// changed"; [TopologyMgr::clear_failed_pairs_for]).
 ///
-/// So this clears those failed-pair marks ([TopologyMgr::clear_failed_pairs_for]), then
-/// sends `setTopology` to every policy peer of `node` with a live VSS worker, and to the
-/// other end of each cleared pair. `node` itself gets its topology through its normal
-/// connect sync. Nothing is sent when a session ends: the next topology built for any
-/// reason simply leaves out what can no longer work.
+/// Sends `setTopology` to every policy peer of `node` with a live VSS worker, and to
+/// every node in `cleared`. `node` itself gets its topology through its normal connect
+/// sync. Nothing is sent when a session ends: the next topology built for any reason
+/// simply leaves out what can no longer work.
 ///
-/// Called under the topology guard, so the clear is ordered with reports and policy
-/// passes. The sends wait on node RPCs, so they run in a spawned task, which first waits
-/// for the caller's guard to be released ([TopoOps] rules): the topology the peers get is
-/// read after everything the caller committed under it.
-fn repropose_links_to_peers(asm: &Arc<Assembly>, ops: &TopoOps<'_>, node: &IpAddr) {
-    let cleared = asm.topo_mgr.clear_failed_pairs_for(ops, node);
+/// Call it only once the session is committed -- after the last step that can fail and
+/// roll it back -- and never under the topology guard: the sends wait on node RPCs
+/// ([TopoOps] rules), so they run in a spawned task. A session that is rolled back must
+/// not have told its peers its address (visaservice#68 review).
+fn repropose_links_to_peers(asm: &Arc<Assembly>, node: &IpAddr, cleared: Vec<IpAddr>) {
     let asm = asm.clone();
     let node = *node;
     tokio::spawn(async move {
-        // Taken and dropped at once: it only orders this task after the caller's section.
-        drop(asm.topo_mgr.ops().await);
         let psnap = asm.policy_mgr.get_current_snapshot();
         let mut peers: Vec<IpAddr> = psnap
             .policy()
@@ -1114,10 +1111,16 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         if matches!(vs_connect_request.ctype, ConnectType::Reset) {
             warn!(target: API, "{} requests RESET: not yet implemented", vs_connect_request.cn);
         }
-        // A session reconnect: the node's failed pairs are proposed again (R13a).
-        repropose_links_to_peers(&self.asm, &ops, &node_zpr_addr);
+        // A session reconnect: the node's failed pairs are cleared (R13a), under the guard.
+        let cleared_pairs = self
+            .asm
+            .topo_mgr
+            .clear_failed_pairs_for(&ops, &node_zpr_addr);
 
         drop(ops);
+
+        // The session is committed: tell the node's peers.
+        repropose_links_to_peers(&self.asm, &node_zpr_addr, cleared_pairs);
 
         start_session_core_visas(&self.asm, &existing_actor).await;
 
@@ -1426,9 +1429,12 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         // Install the node's policy-declared links to already-connected peers. Must happen
         // before ActorJoins: that event drives the topology fan-out, which reads the router.
         install_policy_links_for_node(&self.asm, &ops, &node_actor, &node_zpr_addr).await;
-        // A new connect, reconnect or reset: the node's failed pairs are proposed again
-        // (R13a).
-        repropose_links_to_peers(&self.asm, &ops, &node_zpr_addr);
+        // A new connect, reconnect or reset: the node's failed pairs are cleared (R13a),
+        // under the guard. The peers are told once the session is committed, below.
+        let cleared_pairs = self
+            .asm
+            .topo_mgr
+            .clear_failed_pairs_for(&ops, &node_zpr_addr);
         drop(ops);
 
         let evt = VsEvent::ActorJoins(node_zpr_addr);
@@ -1460,6 +1466,9 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                 "authentication failed: not authorized",
             );
         }
+
+        // The session is committed (nothing below rolls it back): tell the node's peers.
+        repropose_links_to_peers(&self.asm, &node_zpr_addr, cleared_pairs);
 
         start_session_core_visas(&self.asm, &node_actor).await;
 
@@ -4509,23 +4518,6 @@ mod tests {
                         Some(SocketAddr::new(b, R13A_PORT)),
                         "B's address as it reported it on open"
                     );
-                })
-                .await;
-        }
-
-        /// The re-proposal never sends while the caller holds the topology guard: it
-        /// waits for the guard, so the peers' topology sees what the caller committed.
-        #[tokio::test]
-        async fn the_re_proposal_waits_for_the_callers_topology_guard() {
-            tokio::task::LocalSet::new()
-                .run_until(async {
-                    let (asm, _handle) = build_with(true, R13A_PORT).await;
-                    let mut a_vss = capture_vss(&asm, NODE_A);
-                    let ops = asm.topo_mgr.ops().await;
-                    repropose_links_to_peers(&asm, &ops, &NODE_B.parse().unwrap());
-                    assert!(gets_nothing(&mut a_vss).await, "nothing under the guard");
-                    drop(ops);
-                    assert!(gets_topology(&mut a_vss).await, "sent once it is released");
                 })
                 .await;
         }
