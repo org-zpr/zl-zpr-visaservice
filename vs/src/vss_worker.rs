@@ -826,29 +826,108 @@ async fn vss_do_set_topology(
     check_ok_or_error(set_response_ok_or_err.get_res().unwrap())
 }
 
-/// The `Link`s the visa service proposes to `node_addr`, all read from `psnap`.
+/// The `Link`s the visa service proposes to `node_addr`, all read from `psnap`
+/// (ZODE_LINKS.md rule 13b, zl-zipline#255): it proposes a link only when it can work,
+/// and never asks a Zode to dial an address it does not know.
+///
+/// The candidates are [topology_links] (R13a and the CN rule apply there). Of those:
+/// - a **relay link** -- one end is the relay, the node the visa service docks on
+///   ([crate::visa_bootstrap::is_relay]; the v1 relay, §5.6) -- is always proposed:
+///   an endpoint dials its configured initial link, and the relay must know a joiner's
+///   CN before the joiner connects (J2). `peer` is the other end's known address, or
+///   unset if there is none (the relay never dials a joiner);
+/// - a **direct link** is proposed only when both ends have a known address, and its
+///   `peer` is the other end's. Which end dials is the Zodes' rule, not copied here.
+///
+/// A known address is [known_substrate_addr]. A lookup that fails is an error: the
+/// caller leaves the topology unsynced and it is sent again, never with a guess.
 pub(crate) async fn proposed_links(
     asm: &Assembly,
     psnap: &PolicySnapshot,
     node_addr: &IpAddr,
 ) -> Result<Vec<Link>, ServiceError> {
-    // STUB (tests first): today's rule, a link only with a policy address.
-    Ok(topology_links(
+    let candidates = topology_links(
         asm,
         psnap.policy(),
         node_addr,
         psnap.resolved_peers_for_node(node_addr),
+    );
+    let node_is_relay = crate::visa_bootstrap::is_relay(asm, node_addr);
+    let own_addr = known_substrate_addr(
+        asm,
+        crate::connection_control::substrate_addr_from_topology(psnap, node_addr),
+        node_addr,
     )
-    .into_iter()
-    .filter(|link| link.peer.is_some())
-    .collect())
+    .await?;
+    let mut links = Vec::with_capacity(candidates.len());
+    for mut link in candidates {
+        // `link.peer` holds the peer's policy address, if policy declares one.
+        let peer_addr =
+            known_substrate_addr(asm, link.peer.clone().map(SocketAddr::from), &link.zpr_addr)
+                .await?;
+        let is_relay_link = node_is_relay || crate::visa_bootstrap::is_relay(asm, &link.zpr_addr);
+        if !is_relay_link && (own_addr.is_none() || peer_addr.is_none()) {
+            let missing = if own_addr.is_none() {
+                node_addr
+            } else {
+                &link.zpr_addr
+            };
+            info!(target: VSS, "direct link {} between {node_addr} and {}: no known address for {missing}; left out of topology", link.link_id, link.zpr_addr);
+            continue;
+        }
+        link.peer = peer_addr.map(|addr| SockAddr {
+            addr: addr.ip(),
+            port: addr.port(),
+        });
+        links.push(link);
+    }
+    Ok(links)
 }
 
-/// The `Link`s of `node_addr`'s topology message: one per resolved peer, each naming the
-/// peer's ZPR address and CN. No link carries visas (J8). A link whose owner reported it
-/// `failed` is left out until the pair is cleared (R13a, `TopologyMgr::is_failed_pair`).
+/// The known substrate address of `node` (plan p37 rule 3): `policy_addr`, its
+/// DNS-resolved policy address, if policy declares one; else the `SUBSTRATE_ADDR`
+/// claim of its VS-API session, the stored node actor (a node with no stored node actor
+/// has no session; see `core_visas::require_current_session`). Nothing else: `None`
+/// means unknown.
 ///
-/// `policy` must be the snapshot `peers` was computed from, as for [vss_do_set_topology].
+/// The claim was checked when it was recorded (`accept_reported_substrate`). Trusting it
+/// steers only where a peer dials; the link still needs the node's CA-signed
+/// certificate with the expected CN. Whether a Zode can misuse the address it reports
+/// is zl-zipline#264.
+async fn known_substrate_addr(
+    asm: &Assembly,
+    policy_addr: Option<SocketAddr>,
+    node: &IpAddr,
+) -> Result<Option<SocketAddr>, ServiceError> {
+    if policy_addr.is_some() {
+        return Ok(policy_addr);
+    }
+    let Some(actor) = asm.actor_mgr.get_actor_by_zpr_addr(node).await? else {
+        return Ok(None);
+    };
+    if !actor.is_node() {
+        return Ok(None);
+    }
+    let Some(claim) = actor
+        .get_attribute(libeval::attribute::key::SUBSTRATE_ADDR)
+        .and_then(|attr| attr.get_single_value().ok())
+    else {
+        return Ok(None);
+    };
+    claim.parse::<SocketAddr>().map(Some).map_err(|e| {
+        ServiceError::Internal(format!(
+            "node {node}: stored substrate address {claim:?}: {e}"
+        ))
+    })
+}
+
+/// The candidate `Link`s of `node_addr`'s topology message: one per resolved peer, each
+/// naming the peer's ZPR address and CN, with `peer` = the peer's policy address if
+/// policy declares one. No link carries visas (J8). A link whose owner reported it
+/// `failed` is left out until the pair is cleared (R13a, `TopologyMgr::is_failed_pair`).
+/// [proposed_links] decides which candidates are sent, and with which `peer`.
+///
+/// `policy` must be the snapshot `peers` was computed from.
 pub(crate) fn topology_links(
     asm: &Assembly,
     policy: &Policy,
