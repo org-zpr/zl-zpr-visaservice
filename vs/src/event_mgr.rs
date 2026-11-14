@@ -452,7 +452,7 @@ async fn policy_pass_locked(
                 // over them (g101): every call would wait out its RPC timeout. Its VSS
                 // worker is stopped instead. Its VS-API session ran over the same
                 // link, so it rejoins (J10), and the rejoin starts a new worker.
-                let cut_off = nodes_cut_off(asm, &report.links_down);
+                let cut_off = nodes_cut_off(asm, &psnap, &report.links_down, &valid_node_addrs);
                 valid_node_addrs.retain(|naddr| {
                     if !cut_off.contains(naddr) {
                         return true;
@@ -513,21 +513,38 @@ async fn apply_policy_transit(asm: &Arc<Assembly>, ops: &TopoOps<'_>, psnap: &Po
     let _ = crate::visa_reconciler::revoke_visas_through_non_transit(asm).await;
 }
 
-/// The ends of `links_down` the visa service can no longer reach: those with no
-/// route from the node it docks on (the relay). It reached them over a link the
-/// policy pass just took down. If the visa service is not docked, it reaches no node
-/// and none is set apart.
-fn nodes_cut_off(asm: &Assembly, links_down: &[(IpAddr, IpAddr)]) -> HashSet<IpAddr> {
+/// The connected nodes the visa service can no longer reach: those with no route from
+/// the node it docks on (the relay). Candidates are the ends of `links_down`, which the
+/// policy pass just took down, and every node of `connected` with a link up: a transit
+/// withdrawal (zl-zipline#255) cuts a node off without taking any link down. A node
+/// with no link up is not a candidate unless a link of it just went down: it is still
+/// joining, or restored and not yet reported (R14), and is not reached over links yet.
+/// If the visa service is not docked, it reaches no node and none is set apart.
+fn nodes_cut_off(
+    asm: &Assembly,
+    psnap: &PolicySnapshot,
+    links_down: &[(IpAddr, IpAddr)],
+    connected: &[IpAddr],
+) -> HashSet<IpAddr> {
     let Some(dock) = asm
         .actor_mgr
         .get_docking_node_for_adapter(&asm.config.get_vs_addr())
     else {
         return HashSet::new();
     };
+    let has_link_up = |naddr: &IpAddr| {
+        psnap
+            .policy()
+            .get_peers_for_node(naddr)
+            .unwrap_or_default()
+            .iter()
+            .any(|peer| asm.topo_mgr.link_up(naddr, &peer.remote_zpr_addr))
+    };
     links_down
         .iter()
         .flat_map(|&(a, b)| [a, b])
-        .filter(|naddr| asm.topo_mgr.get_best_route(&dock, naddr).is_none())
+        .chain(connected.iter().copied().filter(has_link_up))
+        .filter(|naddr| *naddr != dock && asm.topo_mgr.get_best_route(&dock, naddr).is_none())
         .collect()
 }
 
