@@ -213,7 +213,7 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // pass applies its set again, so a superseded pass does no harm here.
     {
         let ops = asm.topo_mgr.ops().await;
-        apply_policy_transit(asm, &ops, &asm.policy_mgr.get_current_snapshot()).await;
+        withdraw_policy_transit(asm, &ops, &asm.policy_mgr.get_current_snapshot()).await;
     }
 
     // The snapshot for the attribute and hostname reconciliation below. The
@@ -464,6 +464,11 @@ async fn policy_pass_locked(
         stopped_workers,
         reconciled,
     })
+}
+
+/// STUB (tests first): the same as [apply_policy_transit].
+async fn withdraw_policy_transit(asm: &Arc<Assembly>, ops: &TopoOps<'_>, psnap: &PolicySnapshot) {
+    apply_policy_transit(asm, ops, psnap).await;
 }
 
 /// Make the router's transit set `psnap`'s (`Policy.transitNodes`, zl-zipline#255) and
@@ -1101,6 +1106,43 @@ mod tests {
                 .contains(&id),
             "the visa through C is revoked"
         );
+    }
+
+    /// visaservice#68 review r3 (Codex P1): the early transit step of a policy pass only
+    /// takes transit away. A node the new policy makes transit-capable becomes so only
+    /// once the pass has reconciled the links, so no route is built through it over a
+    /// link the new policy may have removed.
+    #[tokio::test]
+    async fn test_the_early_transit_step_withdraws_but_never_grants() {
+        use crate::test_helpers::{build_transit_asm, transit_policy};
+        let (asm, a, b, c) = build_transit_asm().await;
+
+        // C is not transit-capable; the new policy grants it: not yet.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[c]))
+            .await
+            .unwrap();
+        withdraw_policy_transit(
+            &asm,
+            &asm.topo_mgr.ops().await,
+            &asm.policy_mgr.get_current_snapshot(),
+        )
+        .await;
+        assert!(!asm.topo_mgr.interior_is_transit(&[a, c, b]), "no grant");
+
+        // C is transit-capable; the new policy takes it away: at once.
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[]))
+            .await
+            .unwrap();
+        withdraw_policy_transit(
+            &asm,
+            &asm.topo_mgr.ops().await,
+            &asm.policy_mgr.get_current_snapshot(),
+        )
+        .await;
+        assert!(!asm.topo_mgr.interior_is_transit(&[a, c, b]), "withdrawn");
     }
 
     /// Review r2 (Codex): the policy's transit set is applied, and the visas through a
