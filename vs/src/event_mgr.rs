@@ -433,6 +433,12 @@ async fn policy_pass_locked(
                     report.orphaned_nodes.len()
                 );
 
+                // The links now match the policy, so its full transit set is applied,
+                // granting what the early step withheld -- before the cut-off check
+                // below, so a node reached through a newly transit-capable node is not
+                // taken for cut off.
+                apply_policy_transit(asm, ops, &psnap).await;
+
                 // Links the reconciliation took down or removed: revoke the visas
                 // crossing them through the ungated link path (zl-zipline#224). The
                 // policy sweep would skip a visa committed under this policy before the
@@ -456,18 +462,17 @@ async fn policy_pass_locked(
                     false
                 });
             }
-            Err(e) => reconciled = Err(e),
+            Err(e) => {
+                // Fail closed: the grant is withheld until a later pass (or a restart)
+                // reconciles the links.
+                warn!(target: EVENT, "policy updated vinst={vinst}: link reconciliation failed; transit the policy grants is not applied");
+                reconciled = Err(e);
+            }
         }
-    }
-
-    // The links now match the policy (or no node is connected to have any), so the
-    // policy's full transit set can be applied, granting what the early step withheld.
-    // If the reconciliation failed, the grant is withheld too: fail closed until a
-    // later pass (or a restart) reconciles.
-    if reconciled.is_ok() {
-        apply_policy_transit(asm, ops, &psnap).await;
     } else {
-        warn!(target: EVENT, "policy updated vinst={vinst}: link reconciliation failed; transit the policy grants is not applied");
+        // No node is connected, so there are no links to reconcile: apply the policy's
+        // full transit set for the nodes that connect later.
+        apply_policy_transit(asm, ops, &psnap).await;
     }
 
     Ok(LockedPass::Applied {
@@ -1774,6 +1779,31 @@ mod tests {
             asm.topo_mgr
                 .add_link(a, b, LinkId(id.into()), vec![], 1)
                 .unwrap();
+        }
+        // Under R14 a link is up while both ends report it up: every pair reports.
+        let cn_of = move |n: &IpAddr| {
+            cns.iter()
+                .find(|(addr, _)| addr == n)
+                .map(|(_, cn)| cn.to_string())
+        };
+        for (reporter, peers) in [
+            (relay, ["zb", "zc"]),
+            (zode, ["relay", "zc"]),
+            (c, ["relay", "zb"]),
+        ] {
+            asm.topo_mgr.record_link_states_with_cns(
+                &asm.topo_mgr.ops_now(),
+                &reporter,
+                None,
+                peers
+                    .iter()
+                    .map(|cn| zpr::vsapi_types::LinkStateReport {
+                        peer_cn: cn.to_string(),
+                        state: zpr::vsapi_types::LinkState::Up,
+                    })
+                    .collect(),
+                &cn_of,
+            );
         }
         // The new policy drops relay-zb, keeps the other two, and makes C transit.
         asm.policy_mgr
