@@ -538,25 +538,47 @@ async fn add_node_serialized(
         .await
 }
 
-/// R13a (ZODE_LINKS.md): `node` has just (re)connected its VS-API session, which counts as
-/// "something about the pair changed" for every failed pair it is part of. Clear those
-/// marks ([TopologyMgr::clear_failed_pairs_for]) and send `setTopology` to the other end
-/// of each, so its topology names the link again and the owner tries once more (R13).
-/// `node` itself gets its topology through its normal connect sync.
+/// A VS-API session of `node` has just started (`authenticate`, or `open` for a
+/// reconnect), so its peers may now be able to make a link to it they could not before:
+/// a direct link is proposed only when both ends' addresses are known, and the node's
+/// reported address has just become known, or changed (ZODE_LINKS.md rule 13b,
+/// zl-zipline#255). And R13a: the session start counts as "something about the pair
+/// changed" for every failed pair `node` is part of.
+///
+/// So this clears those failed-pair marks ([TopologyMgr::clear_failed_pairs_for]), then
+/// sends `setTopology` to every policy peer of `node` with a live VSS worker, and to the
+/// other end of each cleared pair. `node` itself gets its topology through its normal
+/// connect sync. Nothing is sent when a session ends: the next topology built for any
+/// reason simply leaves out what can no longer work.
 ///
 /// Called under the topology guard, so the clear is ordered with reports and policy
-/// passes. The sends wait on node RPCs, so they run in a spawned task and never under the
-/// guard ([TopoOps] rules); they read the marks after the clear, whenever they run.
+/// passes. The sends wait on node RPCs, so they run in a spawned task, which first waits
+/// for the caller's guard to be released ([TopoOps] rules): the topology the peers get is
+/// read after everything the caller committed under it.
 fn repropose_links_to_peers(asm: &Arc<Assembly>, ops: &TopoOps<'_>, node: &IpAddr) {
-    let others = asm.topo_mgr.clear_failed_pairs_for(ops, node);
-    if others.is_empty() {
-        return;
-    }
-    info!(target: API, "node {node} reconnected: proposing its failed links to {others:?} again");
+    let cleared = asm.topo_mgr.clear_failed_pairs_for(ops, node);
     let asm = asm.clone();
-    tokio::task::spawn_local(async move {
+    let node = *node;
+    tokio::spawn(async move {
+        // Taken and dropped at once: it only orders this task after the caller's section.
+        drop(asm.topo_mgr.ops().await);
         let psnap = asm.policy_mgr.get_current_snapshot();
-        crate::event_mgr::send_topology_to(&asm, &psnap, &others).await;
+        let mut peers: Vec<IpAddr> = psnap
+            .policy()
+            .get_peers_for_node(&node)
+            .unwrap_or_default()
+            .iter()
+            .map(|peer| peer.remote_zpr_addr)
+            .chain(cleared)
+            .filter(|peer| asm.vss_mgr.has_live_worker(peer))
+            .collect();
+        peers.sort();
+        peers.dedup();
+        if peers.is_empty() {
+            return;
+        }
+        info!(target: API, "node {node} started a VS-API session: proposing links to its peers {peers:?} again");
+        crate::event_mgr::send_topology_to(&asm, &psnap, &peers).await;
     });
 }
 
