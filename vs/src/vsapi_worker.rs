@@ -2540,51 +2540,15 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             return Ok(());
         }
 
-        // Have to know what visas the node is actually allowed to know about
-        // TODO would it be better to make a function that gets a visa by id but only if it is installed on a given node?
-        // I don't think so because I think this would result in more db access than the current strategy
-        let installed_visas_res = self
+        // Which of the requested visas the node may have, actualized for it: the rule
+        // lives in the visa manager, next to the VSS push it mirrors.
+        match self
             .asm
             .visa_mgr
-            .get_installed_visa_ids_for_node(requestor_addr)
-            .await;
-
-        match installed_visas_res {
-            Ok(installed_visas) => {
-                // Remove all ids that are not installed on the node
-                let installed_set: std::collections::HashSet<u64> =
-                    installed_visas.into_iter().collect();
-                let filtered_ids: Vec<u64> = ids
-                    .into_iter()
-                    .filter(|id| installed_set.contains(id))
-                    .collect();
-
-                // Create vec of actualized visas
-                let mut visas = Vec::new();
-                for id in filtered_ids.iter() {
-                    match self.asm.visa_mgr.get_visa_with_metadata_by_id(*id).await {
-                        Ok(Some(visa_with_metadata)) => {
-                            match self
-                                .asm
-                                .visa_mgr
-                                .actualize_visa_for_target_node(
-                                    visa_with_metadata.visa,
-                                    requestor_addr,
-                                )
-                                .await
-                            {
-                                Ok(v) => visas.push(v),
-                                Err(_) => {
-                                    debug!(target: API, "Node {requestor_addr} requested visa {id} but actualization failed")
-                                }
-                            };
-                        }
-                        _ => {
-                            debug!(target: API, "Node {requestor_addr} requested visa {id} but not found")
-                        }
-                    }
-                }
-
+            .visas_for_node_by_ids(requestor_addr, &ids)
+            .await
+        {
+            Ok(visas) => {
                 let mut ok_builder = res_builder.initn_ok(visas.len() as u32);
 
                 for (i, v) in visas.iter().enumerate() {
@@ -2597,7 +2561,7 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
                 write_error(
                     &mut err_builder,
                     vsapi::ErrorCode::Internal,
-                    "failed to retrieve visa ids",
+                    "failed to retrieve visas",
                 );
             }
         }

@@ -622,6 +622,38 @@ impl VisaMgr {
         staged && !self.quarantine.lock().unwrap().contains(&visa_id)
     }
 
+    /// The visas among `ids` that `node_addr` may fetch by ID (`visaRequestById`), each
+    /// actualized for `node_addr` ([VisaMgr::actualize_visa_for_target_node]). An ID the
+    /// node may not have is left out: the schema reads a missing visa as "does not exist
+    /// for that node".
+    pub async fn visas_for_node_by_ids(
+        &self,
+        node_addr: &IpAddr,
+        ids: &[u64],
+    ) -> Result<Vec<Visa>, ServiceError> {
+        let installed: HashSet<u64> = self
+            .get_installed_visa_ids_for_node(node_addr)
+            .await?
+            .into_iter()
+            .collect();
+        let mut visas = Vec::new();
+        for &id in ids.iter().filter(|id| installed.contains(id)) {
+            match self.get_visa_with_metadata_by_id(id).await {
+                Ok(Some(vwm)) => match self
+                    .actualize_visa_for_target_node(vwm.visa, node_addr)
+                    .await
+                {
+                    Ok(v) => visas.push(v),
+                    Err(_) => {
+                        debug!(target: VISA, "node {node_addr} requested visa {id} but actualization failed")
+                    }
+                },
+                _ => debug!(target: VISA, "node {node_addr} requested visa {id} but not found"),
+            }
+        }
+        Ok(visas)
+    }
+
     /// Quarantine a visa whose revocation write failed: it is never handed out by
     /// [VisaMgr::get_pending_visas_for_node], which also retries the revocation until
     /// it succeeds. Covers visas installed or pending on any route, whatever later
@@ -2114,18 +2146,29 @@ mod tests {
     /// Store a visa across the path [a, b, c] (a is the requesting node, Installed;
     /// b and c PendingInstall).
     async fn store_multihop_visa(mgr: &VisaMgr, id: u64, a: IpAddr, b: IpAddr, c: IpAddr) {
+        store_path_visa(mgr, id, vec![a, b, c], db::NodeVisaState::Installed).await;
+    }
+
+    /// Store a visa across `path`, requested by its first node (the ingress), which is
+    /// left in `requester_state`; every other node on the path is PendingInstall.
+    async fn store_path_visa(
+        mgr: &VisaMgr,
+        id: u64,
+        path: Vec<IpAddr>,
+        requester_state: db::NodeVisaState,
+    ) {
         let visa = make_visa(id, Duration::from_secs(60));
         let md = db::VisaMetadata::new(
-            a,
+            path[0],
             0,
             0,
             String::new(),
             Direction::Forward,
-            Some(vec![a, b, c]),
+            Some(path),
             &make_pdesc(),
         );
         mgr.repo
-            .store_visa(&visa, md, db::NodeVisaState::Installed)
+            .store_visa(&visa, md, requester_state)
             .await
             .unwrap();
     }
@@ -2177,6 +2220,132 @@ mod tests {
         store_node_visa(&mgr, 821, node, db::NodeVisaState::PendingInstall).await;
         let ready = mgr.deliverable_visas_for_node(&node).await.unwrap();
         assert!(ready.iter().any(|v| v.issuer_id == 821));
+    }
+
+    // --- visas_for_node_by_ids (visaRequestById, zl-zipline#262) ---
+
+    /// The IDs of the visas `node` gets back when it fetches `ids` by ID.
+    async fn fetched_ids(mgr: &VisaMgr, node: &IpAddr, ids: &[u64]) -> Vec<u64> {
+        mgr.visas_for_node_by_ids(node, ids)
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v.issuer_id)
+            .collect()
+    }
+
+    /// The race of zl-zipline#262, made deterministic: on the path [relay, zb] the relay
+    /// requested the visa and holds its copy (Installed), while zb's copy still waits for
+    /// the VSS push (PendingInstall). The relay sends a Stream ID Request, so zb fetches
+    /// the visa by ID. zb is not the ingress, so the push would deliver its copy now, and
+    /// the fetch must too: zb's own copy, naming the relay as its previous hop.
+    #[tokio::test]
+    async fn test_fetch_by_id_returns_pending_non_ingress_copy() {
+        let mgr = make_mgr().await;
+        let relay: IpAddr = "fd5a:5052::a".parse().unwrap();
+        let zb: IpAddr = "fd5a:5052::b".parse().unwrap();
+        store_path_visa(&mgr, 1016, vec![relay, zb], db::NodeVisaState::Installed).await;
+
+        let visas = mgr.visas_for_node_by_ids(&zb, &[1016]).await.unwrap();
+
+        assert_eq!(visas.len(), 1, "zb must get its pending copy");
+        assert_eq!(visas[0].issuer_id, 1016);
+        assert_eq!(
+            visas[0].prev_hop,
+            Some(relay),
+            "zb's copy, actualized for zb"
+        );
+    }
+
+    /// Ingress last holds for the fetch as for the push (gate g89 q4): on [A, B, C] with
+    /// every copy pending, the ingress A cannot fetch its copy while B or C has not
+    /// acknowledged theirs. B and C can fetch theirs from the start.
+    #[tokio::test]
+    async fn test_fetch_by_id_ingress_copy_only_after_every_other_hop_installed() {
+        let mgr = make_mgr().await;
+        let a: IpAddr = "fd5a:5052::a".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::b".parse().unwrap();
+        let c: IpAddr = "fd5a:5052::c".parse().unwrap();
+        store_path_visa(&mgr, 1100, vec![a, b, c], db::NodeVisaState::PendingInstall).await;
+
+        assert_eq!(fetched_ids(&mgr, &b, &[1100]).await, vec![1100]);
+        assert_eq!(fetched_ids(&mgr, &c, &[1100]).await, vec![1100]);
+        assert!(fetched_ids(&mgr, &a, &[1100]).await.is_empty());
+
+        mgr.visa_installed(1100, &b).await.unwrap();
+        assert!(
+            fetched_ids(&mgr, &a, &[1100]).await.is_empty(),
+            "C has not acknowledged yet"
+        );
+
+        mgr.visa_installed(1100, &c).await.unwrap();
+        assert_eq!(fetched_ids(&mgr, &a, &[1100]).await, vec![1100]);
+    }
+
+    /// An Installed copy is fetchable: a pathless visa, and the requesting ingress's copy
+    /// while the other hops are still pending (ingress last holds back pending copies only).
+    #[tokio::test]
+    async fn test_fetch_by_id_returns_installed_copy() {
+        let mgr = make_mgr().await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        store_node_visa(&mgr, 1110, node, db::NodeVisaState::Installed).await;
+        assert_eq!(fetched_ids(&mgr, &node, &[1110]).await, vec![1110]);
+
+        let a: IpAddr = "fd5a:5052::a".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::b".parse().unwrap();
+        store_path_visa(&mgr, 1111, vec![a, b], db::NodeVisaState::Installed).await;
+        assert_eq!(fetched_ids(&mgr, &a, &[1111]).await, vec![1111]);
+    }
+
+    /// Nothing the node may not have is fetchable: a visa off its path, an unknown ID, a
+    /// copy being revoked (PendingRevoke), and a quarantined copy, even an Installed one.
+    #[tokio::test]
+    async fn test_fetch_by_id_withholds_off_path_unknown_revoked_and_quarantined() {
+        let mgr = make_mgr().await;
+        let a: IpAddr = "fd5a:5052::a".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::b".parse().unwrap();
+        let off_path: IpAddr = "fd5a:5052::dead".parse().unwrap();
+
+        store_path_visa(&mgr, 1120, vec![a, b], db::NodeVisaState::Installed).await;
+        assert!(fetched_ids(&mgr, &off_path, &[1120]).await.is_empty());
+        assert!(fetched_ids(&mgr, &b, &[9999]).await.is_empty());
+
+        store_path_visa(&mgr, 1121, vec![a, b], db::NodeVisaState::Installed).await;
+        mgr.mark_visa_revoked(1121).await.unwrap();
+        assert!(fetched_ids(&mgr, &a, &[1121]).await.is_empty());
+        assert!(fetched_ids(&mgr, &b, &[1121]).await.is_empty());
+
+        store_path_visa(&mgr, 1122, vec![a, b], db::NodeVisaState::Installed).await;
+        mgr.quarantine(1122);
+        assert!(fetched_ids(&mgr, &a, &[1122]).await.is_empty());
+        assert!(fetched_ids(&mgr, &b, &[1122]).await.is_empty());
+    }
+
+    /// The fetch is read-only (gate g121 q3): handing out a pending copy does not mark it
+    /// Installed. The VSS push stays the only acknowledged delivery, so ingress last still
+    /// waits on real acknowledgements.
+    #[tokio::test]
+    async fn test_fetch_by_id_changes_no_install_state() {
+        let mgr = make_mgr().await;
+        let a: IpAddr = "fd5a:5052::a".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::b".parse().unwrap();
+        let c: IpAddr = "fd5a:5052::c".parse().unwrap();
+        store_path_visa(&mgr, 1130, vec![a, b, c], db::NodeVisaState::PendingInstall).await;
+
+        for node in [a, b, c] {
+            mgr.visas_for_node_by_ids(&node, &[1130]).await.unwrap();
+        }
+
+        for node in [a, b, c] {
+            assert_eq!(
+                mgr.repo.get_node_visa_state(1130, &node),
+                Some(db::NodeVisaState::PendingInstall)
+            );
+        }
+        assert!(
+            fetched_ids(&mgr, &a, &[1130]).await.is_empty(),
+            "the ingress copy is still held back"
+        );
     }
 
     /// Multihop [A, B, C] visa; intermediary B departs. The visa's other nodes go
