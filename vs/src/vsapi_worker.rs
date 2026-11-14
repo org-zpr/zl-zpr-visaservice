@@ -547,7 +547,7 @@ async fn add_node_serialized(
 /// Called under the topology guard, so the clear is ordered with reports and policy
 /// passes. The sends wait on node RPCs, so they run in a spawned task and never under the
 /// guard ([TopoOps] rules); they read the marks after the clear, whenever they run.
-fn repropose_failed_pairs(asm: &Arc<Assembly>, ops: &TopoOps<'_>, node: &IpAddr) {
+fn repropose_links_to_peers(asm: &Arc<Assembly>, ops: &TopoOps<'_>, node: &IpAddr) {
     let others = asm.topo_mgr.clear_failed_pairs_for(ops, node);
     if others.is_empty() {
         return;
@@ -1093,7 +1093,7 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             warn!(target: API, "{} requests RESET: not yet implemented", vs_connect_request.cn);
         }
         // A session reconnect: the node's failed pairs are proposed again (R13a).
-        repropose_failed_pairs(&self.asm, &ops, &node_zpr_addr);
+        repropose_links_to_peers(&self.asm, &ops, &node_zpr_addr);
 
         drop(ops);
 
@@ -1406,7 +1406,7 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         install_policy_links_for_node(&self.asm, &ops, &node_actor, &node_zpr_addr).await;
         // A new connect, reconnect or reset: the node's failed pairs are proposed again
         // (R13a).
-        repropose_failed_pairs(&self.asm, &ops, &node_zpr_addr);
+        repropose_links_to_peers(&self.asm, &ops, &node_zpr_addr);
         drop(ops);
 
         let evt = VsEvent::ActorJoins(node_zpr_addr);
@@ -4398,8 +4398,9 @@ mod tests {
             }
         }
 
-        /// A reconnect of a node outside the pair leaves the mark alone and sends no
-        /// topology to the pair's ends.
+        /// A reconnect of a node outside the pair leaves the mark alone. Of the pair's
+        /// ends only A, which is C's policy peer, is sent topology (the session-start
+        /// re-proposal, zl-zipline#255); B, which is not, gets nothing.
         #[tokio::test]
         async fn reconnect_of_an_unrelated_node_keeps_the_mark() {
             tokio::task::LocalSet::new()
@@ -4421,8 +4422,103 @@ mod tests {
                         asm.topo_mgr
                             .is_failed_pair(&NODE_A.parse().unwrap(), &NODE_B.parse().unwrap())
                     );
-                    assert!(gets_nothing(&mut a_vss).await);
+                    assert!(gets_topology(&mut a_vss).await, "A is C's policy peer");
                     assert!(gets_nothing(&mut b_vss).await);
+                })
+                .await;
+        }
+
+        // --- Session start re-proposes links to the node's peers (zl-zipline#255) ---
+
+        /// `open` sends `setTopology` to every policy peer of the node that has a VSS,
+        /// with no failed pair involved: B's peer A is told, C (not B's peer) is not,
+        /// and B itself gets its topology from its own sync.
+        #[tokio::test]
+        async fn open_re_proposes_links_to_the_nodes_policy_peers() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, _handle) = build_with(true, R13A_PORT).await;
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+                    let mut c_vss = capture_vss(&asm, NODE_C);
+                    reopen(&asm, NODE_B, "node-b").await;
+                    assert!(gets_topology(&mut a_vss).await, "A is B's policy peer");
+                    assert!(gets_nothing(&mut c_vss).await, "C is not B's peer");
+                    assert!(gets_nothing(&mut b_vss).await);
+                })
+                .await;
+        }
+
+        /// The re-proposal carries what the peer needs to propose the link: here a
+        /// policy that declares no address for A or B, so the A-B link is direct and
+        /// needs both reported addresses. After B opens with a new address, the
+        /// topology sent to A names the link to B at that address.
+        #[tokio::test]
+        async fn a_peer_is_re_proposed_the_link_at_the_new_address_on_open() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, _handle) = build_with(true, R13A_PORT).await;
+                    let (a, b): (IpAddr, IpAddr) =
+                        (NODE_A.parse().unwrap(), NODE_B.parse().unwrap());
+                    let mut peering = make_peering(a, b, "link-ab", vec![]);
+                    peering.substrate_a = None;
+                    peering.substrate_b = None;
+                    asm.policy_mgr
+                        .update_policy_from_container_bytes(policy_with_peerings_and_node_cns(
+                            &[peering],
+                            &[(a, "node-a"), (b, "node-b")],
+                        ))
+                        .await
+                        .unwrap();
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    reopen(&asm, NODE_B, "node-b").await;
+                    let Ok(Some(crate::vss::VssCmd::SetTopology(psnap, _))) =
+                        tokio::time::timeout(Duration::from_secs(1), a_vss.recv()).await
+                    else {
+                        panic!("A is sent topology");
+                    };
+                    let links = crate::vss_worker::proposed_links(&asm, &psnap, &a)
+                        .await
+                        .unwrap();
+                    assert_eq!(links.len(), 1, "{links:?}");
+                    assert_eq!(links[0].zpr_addr, b);
+                    assert_eq!(
+                        links[0].peer.clone().map(SocketAddr::from),
+                        Some(SocketAddr::new(b, R13A_PORT)),
+                        "B's address as it reported it on open"
+                    );
+                })
+                .await;
+        }
+
+        /// The re-proposal never sends while the caller holds the topology guard: it
+        /// waits for the guard, so the peers' topology sees what the caller committed.
+        #[tokio::test]
+        async fn the_re_proposal_waits_for_the_callers_topology_guard() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, _handle) = build_with(true, R13A_PORT).await;
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let ops = asm.topo_mgr.ops().await;
+                    repropose_links_to_peers(&asm, &ops, &NODE_B.parse().unwrap());
+                    assert!(gets_nothing(&mut a_vss).await, "nothing under the guard");
+                    drop(ops);
+                    assert!(gets_topology(&mut a_vss).await, "sent once it is released");
+                })
+                .await;
+        }
+
+        /// A peer whose VSS worker has exited is skipped; the other peers are still told.
+        #[tokio::test]
+        async fn a_peer_without_a_live_vss_is_skipped() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, _handle) = build_with(true, R13A_PORT).await;
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+                    drop(capture_vss(&asm, NODE_C)); // C's worker has exited
+                    reopen(&asm, NODE_A, "node-a").await;
+                    assert!(gets_topology(&mut b_vss).await);
+                    assert!(!asm.vss_mgr.has_live_worker(&NODE_C.parse().unwrap()));
                 })
                 .await;
         }
