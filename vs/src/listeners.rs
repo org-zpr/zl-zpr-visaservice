@@ -102,8 +102,23 @@ impl std::error::Error for ListenerError {
 /// listen answers a connection attempt with a reset, so a client sees
 /// "connection refused" until [start_listening] runs.
 pub fn bind_reserved(role: ListenerRole, addr: SocketAddr) -> Result<TcpSocket, ListenerError> {
-    let _ = (role, addr);
-    todo!("zl-zipline#266: bind_reserved")
+    let fail = |source: io::Error| ListenerError {
+        role,
+        addr,
+        stage: ListenerStage::Bind,
+        source,
+    };
+    let sock = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4(),
+        SocketAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .map_err(fail)?;
+    // Same as `TcpListener::bind`: a restarted service can re-bind its port
+    // while connections of the previous process are still in TIME_WAIT. It
+    // does not let two processes listen on the same port.
+    sock.set_reuseaddr(true).map_err(fail)?;
+    sock.bind(addr).map_err(fail)?;
+    Ok(sock)
 }
 
 /// Turn a socket from [bind_reserved] into a listening socket.
@@ -173,5 +188,29 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("admin"), "{msg}");
         assert!(msg.contains("another process already listens"), "{msg}");
+    }
+
+    /// zl-zipline#266: a reserved socket refuses connections until
+    /// [start_listening] runs, and accepts them after. This is what keeps the
+    /// startup behaviour unchanged for clients: "connection refused" while
+    /// the visa service hydrates.
+    #[tokio::test]
+    async fn bind_reserved_then_listen_accepts() {
+        let sock = bind_reserved(ListenerRole::VsApi, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = sock.local_addr().unwrap();
+
+        let early = tokio::net::TcpStream::connect(addr).await;
+        assert_eq!(
+            early.err().map(|e| e.kind()),
+            Some(io::ErrorKind::ConnectionRefused),
+            "a reserved socket must refuse connections before start_listening"
+        );
+
+        let listener = start_listening(ListenerRole::VsApi, sock).unwrap();
+        assert_eq!(listener.local_addr().unwrap(), addr);
+        let (connected, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        connected.expect("connect after start_listening must succeed");
+        accepted.expect("the listener must accept the connection");
     }
 }
