@@ -10,9 +10,14 @@
 //! "connection refused" during startup, as before.
 
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::{TcpListener, TcpSocket};
+use tokio::task::{JoinHandle, JoinSet};
+use tracing::error;
+
+use crate::logging::targets::MAIN;
 
 /// Backlog for a listening socket; the value `TcpListener::bind` uses.
 const LISTEN_BACKLOG: u32 = 1024;
@@ -43,6 +48,8 @@ pub enum ListenerStage {
     Bind,
     /// Turning the bound socket into a listening socket (end of startup).
     Listen,
+    /// Serving: the accept loop ended (runtime).
+    Serve,
 }
 
 /// A listener failure: which listener, on which address, at which step, and
@@ -53,6 +60,18 @@ pub struct ListenerError {
     pub addr: SocketAddr,
     pub stage: ListenerStage,
     pub source: io::Error,
+}
+
+impl ListenerError {
+    /// A listener that was serving on `addr` stopped because of `source`.
+    pub fn stopped(role: ListenerRole, addr: SocketAddr, source: io::Error) -> ListenerError {
+        ListenerError {
+            role,
+            addr,
+            stage: ListenerStage::Serve,
+            source,
+        }
+    }
 }
 
 impl fmt::Display for ListenerError {
@@ -77,6 +96,7 @@ impl fmt::Display for ListenerError {
             ListenerStage::Listen => {
                 write!(f, "cannot listen on {role} socket {addr}: {source}")
             }
+            ListenerStage::Serve => write!(f, "{role} listener on {addr} stopped: {source}"),
         }
     }
 }
@@ -147,6 +167,49 @@ impl ReservedListeners {
     }
 }
 
+/// A running listener task, as [supervise] watches it.
+pub type ListenerTask = (ListenerRole, JoinHandle<Result<(), ListenerError>>);
+
+/// Why [supervise] stopped the service: which listener ended, and how.
+#[derive(Debug)]
+pub struct ListenerExit {
+    pub role: ListenerRole,
+    pub reason: String,
+}
+
+impl fmt::Display for ListenerExit {
+    /// One line for the operator.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} listener ended ({})", self.role, self.reason)
+    }
+}
+
+/// Drive the visa service's tasks until a listener ends (zl-zipline#266).
+///
+/// A listener that ends -- with an error, without one, or by a panic -- is
+/// fatal: a visa service with no VS-API (or no admin API) must not keep
+/// running, so that a supervisor restarts it. When that happens this logs the
+/// cause, shuts down every task in `others` and then calls `release` (which
+/// releases the ValKey instance lock), and returns the [ListenerExit]. The
+/// order matters: the lock renewal task is in `others`, and a renewal after
+/// the release would take the lock again.
+///
+/// A task in `others` that panics panics the caller, as `main` has always
+/// done. If `others` runs empty, the listeners still govern. Returns `None`
+/// only if there are no listeners and every task in `others` has finished.
+pub async fn supervise<R, Fut>(
+    listeners: Vec<ListenerTask>,
+    others: &mut JoinSet<()>,
+    release: R,
+) -> Option<ListenerExit>
+where
+    R: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let _ = (listeners, others, release);
+    todo!("zl-zipline#266: supervise")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +274,134 @@ mod tests {
             tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
         connected.expect("connect after start_listening must succeed");
         accepted.expect("the listener must accept the connection");
+    }
+
+    /// A task that never ends, and a guard that records when it is dropped
+    /// (the task was aborted).
+    fn endless_task(
+        dropped: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let flag = DropFlag(dropped.clone());
+        async move {
+            let _flag = flag;
+            std::future::pending::<()>().await
+        }
+    }
+
+    /// Run [supervise] over one listener task built from `listener` and one
+    /// endless other task. Returns the outcome, whether the release hook ran,
+    /// and whether the other task was shut down before the release ran.
+    async fn supervise_one<F>(role: ListenerRole, listener: F) -> (Option<ListenerExit>, bool, bool)
+    where
+        F: Future<Output = Result<(), ListenerError>> + Send + 'static,
+    {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let other_dropped = Arc::new(AtomicBool::new(false));
+        let mut others = JoinSet::new();
+        others.spawn(endless_task(&other_dropped));
+
+        let released = Arc::new(AtomicBool::new(false));
+        let others_down_at_release = Arc::new(AtomicBool::new(false));
+        let outcome = {
+            let (released, down, dropped) = (
+                released.clone(),
+                others_down_at_release.clone(),
+                other_dropped.clone(),
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                supervise(
+                    vec![(role, tokio::spawn(listener))],
+                    &mut others,
+                    || async move {
+                        down.store(dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+                        released.store(true, Ordering::SeqCst);
+                    },
+                ),
+            )
+            .await
+            .expect("supervise must return when a listener ends")
+        };
+        (
+            outcome,
+            released.load(Ordering::SeqCst),
+            others_down_at_release.load(Ordering::SeqCst),
+        )
+    }
+
+    /// zl-zipline#266: a listener that stops with an error ends supervision.
+    /// The outcome names the listener and the error, the other tasks are shut
+    /// down, and only then the lock release hook runs.
+    #[tokio::test]
+    async fn supervise_returns_when_a_listener_fails() {
+        let addr: SocketAddr = "[fd5a:5052::1]:5002".parse().unwrap();
+        let (outcome, released, others_down) = supervise_one(ListenerRole::VsApi, async move {
+            Err(ListenerError::stopped(
+                ListenerRole::VsApi,
+                addr,
+                io::Error::other("accept failed"),
+            ))
+        })
+        .await;
+        let exit = outcome.expect("a listener ended, so there is an outcome");
+        assert_eq!(exit.role, ListenerRole::VsApi);
+        let msg = exit.to_string();
+        assert!(msg.contains("VS-API"), "{msg}");
+        assert!(msg.contains("[fd5a:5052::1]:5002"), "{msg}");
+        assert!(msg.contains("accept failed"), "{msg}");
+        assert!(released, "the lock release hook must run");
+        assert!(
+            others_down,
+            "the other tasks (lock renewal among them) must be shut down before the release"
+        );
+    }
+
+    /// A listener task that panics (the admin TLS setup `expect`s its cert
+    /// files) is the same outcome, not a panic of the caller.
+    #[tokio::test]
+    async fn supervise_returns_when_a_listener_panics() {
+        let (outcome, released, others_down) = supervise_one(ListenerRole::Admin, async move {
+            panic!("failed to read admin cert file");
+        })
+        .await;
+        let exit = outcome.expect("a listener ended, so there is an outcome");
+        assert_eq!(exit.role, ListenerRole::Admin);
+        assert!(exit.to_string().contains("panicked"), "{exit}");
+        assert!(released && others_down);
+    }
+
+    /// A listener that returns without an error has also stopped serving.
+    #[tokio::test]
+    async fn supervise_returns_when_a_listener_returns_ok() {
+        let (outcome, released, _) = supervise_one(ListenerRole::Admin, async { Ok(()) }).await;
+        let exit = outcome.expect("a listener ended, so there is an outcome");
+        assert_eq!(exit.role, ListenerRole::Admin);
+        assert!(released);
+    }
+
+    /// Other tasks that finish do not end supervision while a listener runs.
+    #[tokio::test]
+    async fn supervise_keeps_running_while_listeners_run() {
+        let mut others = JoinSet::new();
+        others.spawn(async {});
+        let listener = tokio::spawn(std::future::pending::<Result<(), ListenerError>>());
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            supervise(
+                vec![(ListenerRole::VsApi, listener)],
+                &mut others,
+                || async {},
+            ),
+        )
+        .await;
+        assert!(res.is_err(), "supervise must keep running: {res:?}");
     }
 }
