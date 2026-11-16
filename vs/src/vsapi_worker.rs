@@ -29,6 +29,7 @@ use crate::counters::CounterType;
 use crate::error::ServiceError;
 use crate::event_mgr::VsEvent;
 use crate::link_state::validate_snapshot;
+use crate::listeners::{ListenerError, ListenerRole};
 use crate::logging::targets::API;
 use crate::login_nonce::MintError;
 use crate::net_mgr;
@@ -97,50 +98,237 @@ impl AuthenticateUndo {
     }
 }
 
+/// Serve the capnp VS-API on `listener`, which `main` has already bound to
+/// `vs_addr` and put into the listening state (zl-zipline#266).
+///
+/// Each connection is served in its own task, TLS handshake included, so a
+/// slow or stuck client cannot block `accept` for everyone, and an error on
+/// one connection is logged at `warn!` with the peer address and ends only
+/// that connection (zl-zipline#266, Q2). The handshake must finish within
+/// [VSAPI_TLS_HANDSHAKE_TIMEOUT], so a client that never completes it cannot
+/// hold its socket for ever. Only an `accept` error that is not
+/// about a single connection or a passing resource shortage ends the loop
+/// (see [accept_error_action]); the error is returned.
 pub async fn launch_capnp(
     asm: Arc<Assembly>,
-    listen: SocketAddr,
+    listener: tokio::net::TcpListener,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let listen = listener.local_addr()?;
     info!(target: API, "VSAPI service listening on {} (capnp)", listen);
     let acceptor = tls_acceptor(listen)?;
-    let listener = tokio::net::TcpListener::bind(listen).await?;
 
     loop {
-        let (sock, addr) = listener.accept().await?;
+        let (sock, addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => match accept_error_action(&e) {
+                AcceptErrorAction::Skip => {
+                    warn!(target: API, "VSAPI accept failed for one connection: {e}");
+                    continue;
+                }
+                AcceptErrorAction::PauseAndRetry => {
+                    warn!(target: API, "VSAPI accept failed, retrying in {ACCEPT_RETRY_PAUSE:?}: {e}");
+                    tokio::time::sleep(ACCEPT_RETRY_PAUSE).await;
+                    continue;
+                }
+                AcceptErrorAction::Stop => return Err(e.into()),
+            },
+        };
         info!(target: API, "TCP connection from {}", addr);
-        sock.set_nodelay(true)?;
-
-        let tls = acceptor.accept(sock).await?;
-        info!(target: API, "TLS connection");
-        let (reader, writer) = tokio::io::split(tls);
-
-        let network = capnp_rpc::twoparty::VatNetwork::new(
-            tokio::io::BufReader::new(reader).compat(),
-            tokio::io::BufWriter::new(writer).compat_write(),
-            capnp_rpc::rpc_twoparty_capnp::Side::Server,
-            capnp::message::ReaderOptions::new(),
-        );
-
-        let vs_service: vsapi::visa_service::Client = capnp_rpc::new_client(VisaServiceImpl {
-            asm: asm.clone(),
-            remote: addr,
-        });
-
-        let rpc_system =
-            capnp_rpc::RpcSystem::new(Box::new(network), Some(vs_service.clone().client));
-
-        tokio::task::spawn_local(async move {
-            let err = rpc_system.await;
-            err
-        });
+        tokio::task::spawn_local(serve_vsapi_connection(
+            asm.clone(),
+            acceptor.clone(),
+            sock,
+            addr,
+        ));
     }
 }
 
-pub async fn launch(asm: Arc<Assembly>, listen: SocketAddr) {
-    match launch_capnp(asm.clone(), listen).await {
-        Ok(()) => (),
-        Err(e) => error!(target: API, "VSAPI capnp error: {}", e),
+/// Pause before the next `accept` after a resource shortage (the admin
+/// accept loop uses the same value).
+const ACCEPT_RETRY_PAUSE: Duration = Duration::from_millis(100);
+
+/// What the VS-API accept loop does with an error from `accept`.
+#[derive(Debug, PartialEq, Eq)]
+enum AcceptErrorAction {
+    /// The error belongs to one pending connection: go on at once.
+    Skip,
+    /// A passing resource shortage (file descriptors, memory): pause, retry.
+    PauseAndRetry,
+    /// Anything else: the listener is broken; end the loop.
+    Stop,
+}
+
+/// Sort an `accept` error. On Linux, `accept(2)` reports network errors that
+/// are pending on the new connection as its own error, and the man page says
+/// to treat them like EAGAIN and retry: ENETDOWN, EPROTO, ENOPROTOOPT,
+/// EHOSTDOWN, ENONET, EHOSTUNREACH, EOPNOTSUPP and ENETUNREACH. Those, and a
+/// connection aborted or reset before it was accepted, are
+/// [AcceptErrorAction::Skip]. EMFILE and ENFILE (too many open files, per
+/// process or system wide), ENOBUFS (no socket buffer memory) and ENOMEM
+/// are [AcceptErrorAction::PauseAndRetry]: they clear when connections
+/// close, and a busy loop would not help. The errno values come from `libc`,
+/// which has the right ones for each platform (zl-zipline#266, review 2).
+fn accept_error_action(e: &std::io::Error) -> AcceptErrorAction {
+    use std::io::ErrorKind;
+    if let Some(errno) = e.raw_os_error() {
+        if is_resource_shortage_errno(errno) {
+            return AcceptErrorAction::PauseAndRetry;
+        }
+        if is_pending_connection_errno(errno) {
+            return AcceptErrorAction::Skip;
+        }
+    }
+    if e.kind() == ErrorKind::OutOfMemory {
+        return AcceptErrorAction::PauseAndRetry;
+    }
+    match e.kind() {
+        ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::NetworkDown
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::HostUnreachable => AcceptErrorAction::Skip,
+        _ => AcceptErrorAction::Stop,
+    }
+}
+
+/// True for an `accept` errno that is a passing shortage of descriptors or
+/// buffer memory: EMFILE, ENFILE, ENOBUFS.
+#[cfg(unix)]
+fn is_resource_shortage_errno(errno: i32) -> bool {
+    matches!(errno, libc::EMFILE | libc::ENFILE | libc::ENOBUFS)
+}
+
+/// No errno mapping off Unix; `ErrorKind` still covers ENOMEM.
+#[cfg(not(unix))]
+fn is_resource_shortage_errno(_errno: i32) -> bool {
+    false
+}
+
+/// True for an `accept` errno that Linux `accept(2)` documents as a network
+/// error already pending on the new connection, to be treated like EAGAIN.
+/// Other platforms do not pass these through `accept`, so this is Linux
+/// only; the `ErrorKind` arms in [accept_error_action] cover the portable
+/// subset (ENETDOWN, ENETUNREACH, EHOSTUNREACH).
+#[cfg(target_os = "linux")]
+fn is_pending_connection_errno(errno: i32) -> bool {
+    matches!(
+        errno,
+        libc::ENETDOWN
+            | libc::EPROTO
+            | libc::ENOPROTOOPT
+            | libc::EHOSTDOWN
+            | libc::ENONET
+            | libc::EHOSTUNREACH
+            | libc::EOPNOTSUPP
+            | libc::ENETUNREACH
+    )
+}
+
+/// Off Linux, `accept` reports no pending-connection errnos.
+#[cfg(not(target_os = "linux"))]
+fn is_pending_connection_errno(_errno: i32) -> bool {
+    false
+}
+
+/// Serve one VS-API connection: TLS handshake, then the capnp RPC system
+/// until the peer goes away. Every error here ends only this connection and
+/// is logged with the peer address.
+async fn serve_vsapi_connection(
+    asm: Arc<Assembly>,
+    acceptor: TlsAcceptor,
+    sock: tokio::net::TcpStream,
+    addr: SocketAddr,
+) {
+    if let Err(e) = sock.set_nodelay(true) {
+        warn!(target: API, "VSAPI connection from {addr}: cannot set TCP_NODELAY: {e}");
+    }
+
+    let Some(tls) = accept_tls_within(&acceptor, sock, addr, VSAPI_TLS_HANDSHAKE_TIMEOUT).await
+    else {
+        return;
     };
+    info!(target: API, "TLS connection from {addr}");
+    let (reader, writer) = tokio::io::split(tls);
+
+    let network = capnp_rpc::twoparty::VatNetwork::new(
+        tokio::io::BufReader::new(reader).compat(),
+        tokio::io::BufWriter::new(writer).compat_write(),
+        capnp_rpc::rpc_twoparty_capnp::Side::Server,
+        capnp::message::ReaderOptions::new(),
+    );
+
+    let vs_service: vsapi::visa_service::Client =
+        capnp_rpc::new_client(VisaServiceImpl { asm, remote: addr });
+
+    let rpc_system = capnp_rpc::RpcSystem::new(Box::new(network), Some(vs_service.client));
+    if let Err(e) = rpc_system.await {
+        debug!(target: API, "VSAPI connection from {addr} ended: {e}");
+    }
+}
+
+/// How long an accepted VS-API connection may take to finish its TLS
+/// handshake before the server drops it (zl-zipline#266, review round 1).
+///
+/// The handshake runs in the per-connection task, before the peer has
+/// authenticated anything, so without a bound a client that connects and
+/// never sends a ClientHello holds a socket and a task for ever; enough of
+/// them exhaust file descriptors, and the EMFILE pause in the accept loop
+/// cannot recover while they stay open. A legitimate client needs one round
+/// trip plus key exchange: well under a second on the substrate links ZPR
+/// runs over. 10 s leaves a wide margin for a loaded host or a slow link and
+/// still caps how long one unauthenticated socket can live.
+const VSAPI_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run the TLS handshake for the connection from `addr` on `sock`.
+/// Returns the TLS stream, or `None` after logging the reason at `warn!`
+/// with the peer address, in which case the socket has been dropped.
+/// `deadline` bounds the handshake; it is a parameter so that tests can use
+/// a short one (production passes [VSAPI_TLS_HANDSHAKE_TIMEOUT]).
+async fn accept_tls_within(
+    acceptor: &TlsAcceptor,
+    sock: tokio::net::TcpStream,
+    addr: SocketAddr,
+    deadline: Duration,
+) -> Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+    // On timeout the handshake future is dropped, and with it `sock`, which
+    // closes the connection.
+    match tokio::time::timeout(deadline, acceptor.accept(sock)).await {
+        Ok(Ok(tls)) => Some(tls),
+        Ok(Err(e)) => {
+            warn!(target: API, "VSAPI connection from {addr}: TLS handshake failed: {e}");
+            None
+        }
+        Err(_) => {
+            warn!(
+                target: API,
+                "VSAPI connection from {addr}: no TLS handshake within {deadline:?}; dropped"
+            );
+            None
+        }
+    }
+}
+
+/// Run the VS-API on `listener` until it stops (zl-zipline#266). It stops
+/// only on an error, which is returned so that `main` can stop the service.
+pub async fn launch(
+    asm: Arc<Assembly>,
+    listener: tokio::net::TcpListener,
+) -> Result<(), ListenerError> {
+    let addr = listener
+        .local_addr()
+        .map_err(|e| ListenerError::stopped(ListenerRole::VsApi, unknown_addr(), e))?;
+    launch_capnp(asm.clone(), listener).await.map_err(|e| {
+        ListenerError::stopped(
+            ListenerRole::VsApi,
+            addr,
+            std::io::Error::other(e.to_string()),
+        )
+    })
+}
+
+/// Placeholder address for an error on a listener whose address is unknown.
+fn unknown_addr() -> SocketAddr {
+    SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 0)
 }
 
 // This function creates a certificate, and the clients will not require verification of the
@@ -5991,5 +6179,259 @@ mod tests {
                 })
                 .await;
         }
+    }
+}
+
+/// zl-zipline#266 (Q2): one bad client must not end or stall the VS-API
+/// accept loop. Before the fix the TLS handshake ran inline in the loop and
+/// its error was returned with `?`, so one client that failed its handshake
+/// (a port scan, a client that aborted mid-handshake) stopped the VS-API for
+/// the life of the process, and one client that never finished its handshake
+/// blocked `accept` for everyone.
+#[cfg(test)]
+mod accept_loop_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// How long a good client gets to finish its TLS handshake.
+    const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// Start `launch_capnp` on a fresh 127.0.0.1 listener inside the current
+    /// LocalSet. Returns the address and the server task.
+    async fn start_vsapi() -> (
+        SocketAddr,
+        tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error>>>,
+    ) {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::task::spawn_local(launch_capnp(asm, listener));
+        (addr, server)
+    }
+
+    /// Connect to `addr` and complete a TLS handshake, within the deadline.
+    async fn tls_handshake(addr: SocketAddr) -> Result<(), String> {
+        let attempt = async {
+            let sock = tokio::net::TcpStream::connect(addr)
+                .await
+                .map_err(|e| format!("TCP connect: {e}"))?;
+            crate::vss_worker::tls_connect()
+                .connect(addr.ip().into(), sock)
+                .await
+                .map_err(|e| format!("TLS handshake: {e}"))?;
+            Ok(())
+        };
+        tokio::time::timeout(HANDSHAKE_DEADLINE, attempt)
+            .await
+            .unwrap_or_else(|_| Err(format!("no TLS handshake within {HANDSHAKE_DEADLINE:?}")))
+    }
+
+    /// A client that sends garbage instead of a ClientHello fails its
+    /// handshake; the next client still completes one, and the server task
+    /// is still running.
+    #[tokio::test]
+    async fn accept_loop_survives_a_failed_tls_handshake() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (addr, server) = start_vsapi().await;
+
+                let mut bad = tokio::net::TcpStream::connect(addr).await.unwrap();
+                bad.write_all(b"GET / HTTP/1.0\r\n\r\nthis is not a TLS ClientHello")
+                    .await
+                    .unwrap();
+                // Wait for the server to give up on this client (EOF or reset).
+                let mut buf = [0u8; 256];
+                let _ = tokio::time::timeout(HANDSHAKE_DEADLINE, async {
+                    while matches!(bad.read(&mut buf).await, Ok(n) if n > 0) {}
+                })
+                .await;
+                drop(bad);
+
+                tls_handshake(addr).await.unwrap_or_else(|e| {
+                    panic!("a good client must still be served after a bad handshake: {e}")
+                });
+                assert!(
+                    !server.is_finished(),
+                    "the VS-API accept loop must keep running after a bad handshake"
+                );
+            })
+            .await;
+    }
+
+    /// A client that connects and never sends a ClientHello does not block
+    /// the handshake of the next client.
+    #[tokio::test]
+    async fn accept_loop_not_blocked_by_a_stalled_handshake() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (addr, server) = start_vsapi().await;
+
+                let stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+                tls_handshake(addr).await.unwrap_or_else(|e| {
+                    panic!("a stalled client must not block the next handshake: {e}")
+                });
+                assert!(!server.is_finished());
+                drop(stalled);
+            })
+            .await;
+    }
+
+    /// The accept-error policy: per-connection errors are skipped, file
+    /// descriptor and memory shortages are retried after a pause, and
+    /// anything else stops the loop.
+    #[test]
+    fn accept_error_action_sorts_errors() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::NetworkDown,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+        ] {
+            assert_eq!(
+                accept_error_action(&Error::from(kind)),
+                AcceptErrorAction::Skip,
+                "{kind:?}"
+            );
+        }
+        // EMFILE and ENFILE.
+        for errno in [24, 23] {
+            assert_eq!(
+                accept_error_action(&Error::from_raw_os_error(errno)),
+                AcceptErrorAction::PauseAndRetry,
+                "errno {errno}"
+            );
+        }
+        assert_eq!(
+            accept_error_action(&Error::from(ErrorKind::OutOfMemory)),
+            AcceptErrorAction::PauseAndRetry
+        );
+        for kind in [ErrorKind::InvalidInput, ErrorKind::Other] {
+            assert_eq!(
+                accept_error_action(&Error::from(kind)),
+                AcceptErrorAction::Stop,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// zl-zipline#266, review round 2 (Copilot): Linux `accept(2)` passes
+    /// network errors that are already pending on the new connection to the
+    /// caller, and its man page says to treat them like EAGAIN and retry.
+    /// Each one is skipped; it must not stop the VS-API listener. The values
+    /// come from `libc`, so they are right on every Linux architecture (mips,
+    /// sparc and alpha number several of them differently).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accept_error_action_skips_pending_network_errnos() {
+        use std::io::Error;
+        for (name, errno) in [
+            ("ENETDOWN", libc::ENETDOWN),
+            ("EPROTO", libc::EPROTO),
+            ("ENOPROTOOPT", libc::ENOPROTOOPT),
+            ("EHOSTDOWN", libc::EHOSTDOWN),
+            ("ENONET", libc::ENONET),
+            ("EHOSTUNREACH", libc::EHOSTUNREACH),
+            ("EOPNOTSUPP", libc::EOPNOTSUPP),
+            ("ENETUNREACH", libc::ENETUNREACH),
+        ] {
+            assert_eq!(
+                accept_error_action(&Error::from_raw_os_error(errno)),
+                AcceptErrorAction::Skip,
+                "{name} ({errno})"
+            );
+        }
+    }
+
+    /// zl-zipline#266, review round 2 (Copilot): ENOBUFS from `accept` is a
+    /// passing shortage of socket buffer memory, like ENOMEM: pause and
+    /// retry, do not stop the listener.
+    #[cfg(unix)]
+    #[test]
+    fn accept_error_action_retries_enobufs() {
+        assert_eq!(
+            accept_error_action(&std::io::Error::from_raw_os_error(libc::ENOBUFS)),
+            AcceptErrorAction::PauseAndRetry
+        );
+    }
+
+    /// The errors that mean the listening socket itself is broken still
+    /// stop the loop: EBADF (not a socket descriptor), EINVAL (not
+    /// listening) and ENOTSOCK.
+    #[cfg(unix)]
+    #[test]
+    fn accept_error_action_stops_on_a_broken_listener() {
+        for (name, errno) in [
+            ("EBADF", libc::EBADF),
+            ("EINVAL", libc::EINVAL),
+            ("ENOTSOCK", libc::ENOTSOCK),
+        ] {
+            assert_eq!(
+                accept_error_action(&std::io::Error::from_raw_os_error(errno)),
+                AcceptErrorAction::Stop,
+                "{name} ({errno})"
+            );
+        }
+    }
+
+    /// Review round 1 (Codex P1): a client that connects and never sends a
+    /// ClientHello is dropped once the handshake deadline passes. Without a
+    /// deadline each such socket would hold a file descriptor and a task for
+    /// ever. The test uses a short deadline; an outer bound turns a hang into
+    /// a failure.
+    #[tokio::test]
+    async fn stalled_tls_handshake_is_dropped_at_the_deadline() {
+        const SHORT: Duration = Duration::from_millis(200);
+        const OUTER: Duration = Duration::from_secs(3);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let acceptor = tls_acceptor(listen).unwrap();
+
+        // The client connects and then says nothing.
+        let mut stalled = tokio::net::TcpStream::connect(listen).await.unwrap();
+        let (sock, peer) = listener.accept().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(OUTER, accept_tls_within(&acceptor, sock, peer, SHORT))
+            .await
+            .expect("the handshake of a silent client must end at its deadline, not hang");
+        assert!(
+            outcome.is_none(),
+            "a client that never sent a ClientHello cannot have a TLS stream"
+        );
+        assert!(
+            started.elapsed() >= SHORT,
+            "the server must wait for the deadline, not give up at once"
+        );
+
+        // The server dropped the socket: the client reads EOF (or a reset).
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(OUTER, stalled.read(&mut buf))
+            .await
+            .expect("the server must have closed the stalled socket");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "expected EOF or reset on the dropped socket, got {read:?}"
+        );
+    }
+
+    /// The deadline does not get in the way of a client that does its
+    /// handshake promptly.
+    #[tokio::test]
+    async fn prompt_tls_handshake_completes_within_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let acceptor = tls_acceptor(listen).unwrap();
+
+        let client = tokio::spawn(tls_handshake(listen));
+        let (sock, peer) = listener.accept().await.unwrap();
+        let outcome = accept_tls_within(&acceptor, sock, peer, HANDSHAKE_DEADLINE).await;
+        assert!(outcome.is_some(), "a prompt client must get a TLS stream");
+        client.await.unwrap().unwrap();
     }
 }

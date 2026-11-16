@@ -89,19 +89,21 @@ struct ProtocolDetails {
     dest_port: Option<u16>,
 }
 
-/// Blocking start of the admin server.
+/// Blocking start of the admin server on `listener`, which the caller has
+/// already bound and put into the listening state (zl-zipline#266: `main`
+/// binds it at startup so a bad `vs_addr` stops the process at once).
 /// TODO: Do I need a handle or something to stop this cleanly?
 pub async fn start_admin_server(
     key_file: &Path,
     cert_file: &Path,
-    listen: SocketAddr,
+    listener: TcpListener,
     asm: &Arc<Assembly>,
 ) {
     debug!(target: ADMIN, "admin service starting");
     let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
     serve(
         rustls_tls_acceptor(key_file, cert_file),
-        listen,
+        listener,
         shared_state,
     )
     .await;
@@ -223,12 +225,16 @@ fn admin_app(state: SharedState) -> Router {
         .with_state(state.clone())
 }
 
-async fn serve(tls_acceptor: TlsAcceptor, listen: SocketAddr, state: SharedState) {
+/// Accept admin HTTPS connections on `listener` and serve each one in its own
+/// task. An accept error is logged and retried after a short pause.
+async fn serve(tls_acceptor: TlsAcceptor, listener: TcpListener, state: SharedState) {
     let app = admin_app(state);
-    let listener = TcpListener::bind(listen).await.unwrap_or_else(|e| {
-        panic!("failed to bind admin https listener on {listen}: {e}");
-    });
-    info!(target: ADMIN, "admin https service listening on {listen} (TLS)");
+    match listener.local_addr() {
+        Ok(listen) => info!(target: ADMIN, "admin https service listening on {listen} (TLS)"),
+        Err(e) => {
+            info!(target: ADMIN, "admin https service listening (TLS); local address unknown: {e}")
+        }
+    }
 
     loop {
         let tower_service = app.clone();
@@ -4394,10 +4400,11 @@ mod tests {
 #[cfg(test)]
 mod e2e_actor_guard {
     use std::collections::HashMap;
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::IpAddr;
     use std::path::Path;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
+    use tokio::net::TcpListener;
 
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -4544,18 +4551,10 @@ mod e2e_actor_guard {
     /// writes out) and return the base URL plus a client trusting that cert.
     /// The server is verified up and serving OUR cert before this returns.
     ///
-    /// Port selection under cargo's parallel test harness is inherently racy:
-    /// the OS-assigned probe listener must be dropped before
-    /// `start_admin_server` re-binds the port, and another test or process can
-    /// claim it in that gap, panicking the server task. `start_admin_server`
-    /// takes only a `SocketAddr` — threading a pre-bound listener through it
-    /// would be a production-code change, and zipline#33 is docs-and-tests
-    /// only — so instead the race is made detectable-and-retryable here: a
-    /// lost bind panics the spawned task, `JoinHandle::is_finished()` exposes
-    /// that, and the loop probes a fresh port. A successful response on the
-    /// cert-pinned client proves the port is served by THIS server (no other
-    /// process holds this test's freshly generated key), so the returned base
-    /// URL can never point at a foreign squatter.
+    /// `start_admin_server` takes an already-bound listener (zl-zipline#266),
+    /// so the port is bound here on `127.0.0.1:0` and handed over: no other
+    /// test or process can claim it in between. (Before #266 the server bound
+    /// a `SocketAddr` itself and this helper had to retry a probe-port race.)
     async fn start_real_admin_server(asm: &Arc<Assembly>, dir: &Path) -> (String, reqwest::Client) {
         let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let cert_path = dir.join("admin-tls-cert.pem");
@@ -4569,46 +4568,33 @@ mod e2e_actor_guard {
             .build()
             .unwrap();
 
-        for _ in 0..10 {
-            // Ephemeral port: bind-and-release, then hand it to the real server.
-            let port = {
-                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                probe.local_addr().unwrap().port()
-            };
-            let listen: SocketAddr = SocketAddr::from(([127, 0, 0, 1], port));
-            let asm = asm.clone();
-            let (key_path, cert_path) = (key_path.clone(), cert_path.clone());
-            let handle = tokio::spawn(async move {
-                start_admin_server(&key_path, &cert_path, listen, &asm).await;
-            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let asm = asm.clone();
+        let handle = tokio::spawn(async move {
+            start_admin_server(&key_path, &cert_path, listener, &asm).await;
+        });
 
-            let base = format!("https://127.0.0.1:{port}");
-            for _ in 0..250 {
-                if handle.is_finished() {
-                    // The bind panicked: something else claimed the port in
-                    // the probe-to-bind gap. Retry with a fresh port.
-                    break;
-                }
-                // Any HTTP status back (401 — no API key) proves the TLS
-                // server on `port` presented our pinned cert; a connect or
-                // handshake error means not up yet (or a foreign squatter,
-                // in which case our task's bind panic ends the inner loop).
-                if client
-                    .get(format!("{base}/admin/stats"))
-                    .send()
-                    .await
-                    .is_ok()
-                {
-                    return (base, client);
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+        let base = format!("https://127.0.0.1:{port}");
+        for _ in 0..250 {
             assert!(
-                handle.is_finished(),
-                "admin server on {base} neither served nor failed within 5s"
+                !handle.is_finished(),
+                "admin server task on {base} ended before it served"
             );
+            // Any HTTP status back (401 — no API key) proves the TLS server
+            // on `port` presented our pinned cert; a connect or handshake
+            // error means not up yet.
+            if client
+                .get(format!("{base}/admin/stats"))
+                .send()
+                .await
+                .is_ok()
+            {
+                return (base, client);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("could not win a free port for the admin server in 10 attempts");
+        panic!("admin server on {base} did not serve within 5s");
     }
 
     /// GET `url` with the API key, retrying while the server task binds.

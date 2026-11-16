@@ -581,7 +581,7 @@ impl ServerCertVerifier for NoVerification {
 
 // Create a dangerous connector - the verifier will always approve
 // TODO decide if we want to use an actual certificate
-fn tls_connect() -> TlsConnector {
+pub(crate) fn tls_connect() -> TlsConnector {
     let cfg = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerification))

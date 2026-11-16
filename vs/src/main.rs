@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -33,6 +33,7 @@ mod error;
 mod event_mgr;
 mod http_util;
 mod link_state;
+mod listeners;
 mod loaded_policy;
 mod logging;
 mod login_nonce;
@@ -167,6 +168,25 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    // zl-zipline#266: bind the VS-API and admin sockets on `vs_addr` now,
+    // before identity, ValKey and the instance lock, so a `vs_addr` that is
+    // not on a local interface (or a port already taken) stops the process
+    // at once with the address and the OS error -- and holds no ValKey lock
+    // that would block a supervisor's restart. The sockets do not listen
+    // until hydration is done (see `start_listening` below), so clients get
+    // "connection refused" until then, as before.
+    let reserved = match listeners::ReservedListeners::bind(
+        cfg.get_vs_addr(),
+        cfg.core.vsapi_port.unwrap_or(config::VSAPI_PORT),
+        cfg.core.admin_port.unwrap_or(config::ADMIN_HTTPS_PORT),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            error!(target: MAIN, "{e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
     let identity = match initialize_identity(
         &cfg.core.identity,
         &cli.regen_identity,
@@ -253,7 +273,9 @@ async fn main() -> std::process::ExitCode {
     // un-renewed fuse (VALKEY_LOCK_TIMEOUT) through all of startup. This must be
     // a plain spawn (not spawn_local): LocalSet tasks aren't polled until
     // run_until, which is only reached after hydration completes.
-    js.spawn(db_worker::launch(db_handle.clone(), vslock_desc));
+    // The descriptor is kept so `main` can release the lock when it exits on a
+    // listener failure (zl-zipline#266).
+    js.spawn(db_worker::launch(db_handle.clone(), vslock_desc.clone()));
 
     let counters = Arc::new(Counters::default());
 
@@ -437,27 +459,46 @@ async fn main() -> std::process::ExitCode {
     js.spawn_local(event_mgr::launch(asm.clone(), event_rx));
 
     // The visa service's own ZPR address (`vs_addr`) is used both ways: the
-    // VS-API and admin listeners bind it here, and every outbound VSS
-    // connection binds it as its source (`vss_worker::connect_from`).
-    js.spawn_local(vsapi_worker::launch(
-        asm.clone(),
-        SocketAddr::new(
-            cfg.get_vs_addr(),
-            cfg.core.vsapi_port.unwrap_or(config::VSAPI_PORT),
-        ),
+    // VS-API and admin listeners are bound to it at startup (above), and every
+    // outbound VSS connection binds it as its source (`vss_worker::connect_from`).
+    // Hydration is done: start listening on the reserved sockets now.
+    let (vsapi_listener, admin_listener) = match (
+        listeners::start_listening(listeners::ListenerRole::VsApi, reserved.vsapi),
+        listeners::start_listening(listeners::ListenerRole::Admin, reserved.admin),
+    ) {
+        (Ok(v), Ok(a)) => (v, a),
+        (Err(e), _) | (_, Err(e)) => {
+            error!(target: MAIN, "{e}");
+            // Stop the lock renewal before the release, so it cannot take the
+            // lock again. The LocalSet must run for its tasks to be stopped.
+            local_set.run_until(js.shutdown()).await;
+            release_instance_lock(asm.state_db.as_ref(), &vslock_desc).await;
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    // zl-zipline#266: the listener tasks are kept apart from `js`. If either
+    // one ends, the service stops (see `listeners::supervise` below).
+    let mut listener_tasks: Vec<listeners::ListenerTask> = Vec::new();
+    listener_tasks.push((
+        listeners::ListenerRole::VsApi,
+        tokio::task::spawn_local(vsapi_worker::launch(asm.clone(), vsapi_listener)),
     ));
 
     {
         let admin_key = cfg.core.admin_key.clone();
         let admin_cert = cfg.core.admin_cert.clone();
-        let admin_listen = SocketAddr::new(
-            cfg.get_vs_addr(),
-            cfg.core.admin_port.unwrap_or(config::ADMIN_HTTPS_PORT),
-        );
         let admin_asm = asm.clone();
-        js.spawn_local(async move {
-            start_admin_server(&admin_key, &admin_cert, admin_listen, &admin_asm).await;
-        });
+        // The admin accept loop retries its errors and never returns; it
+        // ends only by a panic (for example an unreadable cert file), which
+        // `supervise` reports.
+        listener_tasks.push((
+            listeners::ListenerRole::Admin,
+            tokio::task::spawn_local(async move {
+                start_admin_server(&admin_key, &admin_cert, admin_listener, &admin_asm).await;
+                Ok(())
+            }),
+        ));
     }
 
     js.spawn_local(visareq_worker::launch_arena(
@@ -482,16 +523,85 @@ async fn main() -> std::process::ExitCode {
     // TODO: Setup/launch the workers for the visa service. Those that will do the actual work
     // of generating visas, and all the housekeeping.
 
-    local_set
-        .run_until(async {
-            while let Some(res) = js.join_next().await {
-                res.unwrap();
-            }
-        })
+    // Run until a listener ends (zl-zipline#266). A visa service without its
+    // VS-API or admin listener must not keep running: stop the other tasks,
+    // release the instance lock so a supervisor's restart is not refused,
+    // and exit with a failure status.
+    let listener_exit = local_set
+        .run_until(listeners::supervise(listener_tasks, &mut js, || {
+            release_instance_lock(asm.state_db.as_ref(), &vslock_desc)
+        }))
         .await;
+    if listener_exit.is_some() {
+        return std::process::ExitCode::FAILURE;
+    }
 
     info!(target: MAIN, "exiting");
     std::process::ExitCode::SUCCESS
+}
+
+/// Release the visa service instance lock, best effort, before an error exit
+/// (zl-zipline#266). Without this the lock outlives the process until
+/// `VALKEY_LOCK_TIMEOUT`, and a supervisor's restart fails with "lock is
+/// currently held by another instance" until it expires. A failure, or no
+/// answer within [LOCK_RELEASE_TIMEOUT], is logged and otherwise ignored:
+/// the process exits either way.
+async fn release_instance_lock(db: &dyn DbConnection, desc: &LockDescriptor) {
+    release_lock_within(db.release_lock(desc), LOCK_RELEASE_TIMEOUT).await;
+}
+
+/// How long an error exit waits for ValKey to answer the instance lock
+/// release (zl-zipline#266, review round 2).
+///
+/// The release is best effort, and the exit must not depend on it: if ValKey
+/// stays connected but stops answering, an unbounded wait would keep `vs`
+/// running, and its supervisor could not restart it. The redis crate's own
+/// response timeout (500 ms by default) usually ends the wait sooner, but a
+/// reconnect can take several seconds, and that bound is an implicit crate
+/// default, so the exit path sets its own. 5 s is ten times a normal reply
+/// and still short beside `VALKEY_LOCK_TIMEOUT` (90 s), the time a lock that
+/// was not released takes to expire.
+const LOCK_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The outcome of one attempt to release the instance lock.
+#[derive(Debug, PartialEq, Eq)]
+enum LockRelease {
+    /// ValKey answered: the lock is released (or was no longer ours).
+    Released,
+    /// ValKey answered with an error.
+    Failed,
+    /// ValKey did not answer within the deadline.
+    TimedOut,
+}
+
+/// Wait for `release` (a `release_lock` call) for at most `deadline`, and
+/// log the outcome: success at `info!`, an error or a timeout at `warn!` as
+/// a failed release. `deadline` is a parameter so that a test can pass any
+/// value; production passes [LOCK_RELEASE_TIMEOUT].
+async fn release_lock_within<F>(release: F, deadline: std::time::Duration) -> LockRelease
+where
+    F: std::future::Future<Output = db::DbResult<bool>>,
+{
+    // On timeout the release future is dropped; the lock then expires on its
+    // own after `VALKEY_LOCK_TIMEOUT`, as it did before zl-zipline#266.
+    match tokio::time::timeout(deadline, release).await {
+        Ok(Ok(_)) => {
+            info!(target: MAIN, "released visa service lock");
+            LockRelease::Released
+        }
+        Ok(Err(e)) => {
+            warn!(target: MAIN, "failed to release visa service lock: {e}");
+            LockRelease::Failed
+        }
+        Err(_) => {
+            warn!(
+                target: MAIN,
+                "failed to release visa service lock: no answer from ValKey within {deadline:?}; \
+                 the lock expires on its own"
+            );
+            LockRelease::TimedOut
+        }
+    }
 }
 
 /// Load configuration from an explicit path, the default path, or fall back to defaults.
@@ -1008,5 +1118,49 @@ mod restore_tests {
             "the visa through C is revoked"
         );
         assert!(!revoked.contains(&a_to_b), "a visa not through C is kept");
+    }
+}
+
+/// zl-zipline#266, review round 2 (Copilot): the best-effort release of the
+/// instance lock on an error exit must not wait for ever on a ValKey that
+/// stays connected but stops answering.
+#[cfg(test)]
+mod lock_release_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A release that never gets an answer (ValKey connected but silent)
+    /// ends at the deadline as `TimedOut`, so `vs` goes on to exit.
+    #[tokio::test]
+    async fn release_that_never_answers_ends_at_the_deadline() {
+        let silent = std::future::pending::<db::DbResult<bool>>();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            release_lock_within(silent, Duration::from_millis(100)),
+        )
+        .await
+        .expect("the release must give up at its deadline, not hang");
+        assert_eq!(outcome, LockRelease::TimedOut);
+    }
+
+    /// A release that ValKey answers is reported as such, and an error
+    /// answer as a failed release; neither waits for the deadline.
+    #[tokio::test]
+    async fn answered_release_reports_its_outcome() {
+        let ok = release_lock_within(async { Ok(true) }, Duration::from_secs(60)).await;
+        assert_eq!(ok, LockRelease::Released);
+        let err = release_lock_within(
+            async { Err(redis::RedisError::from((redis::ErrorKind::Io, "gone"))) },
+            Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(err, LockRelease::Failed);
+    }
+
+    /// The production deadline stays well under the lock timeout, so a
+    /// release that times out never costs more than the expiry it avoids.
+    #[test]
+    fn lock_release_timeout_is_short_beside_the_lock_timeout() {
+        assert!(LOCK_RELEASE_TIMEOUT < config::VALKEY_LOCK_TIMEOUT / 10);
     }
 }
