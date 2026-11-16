@@ -543,8 +543,9 @@ async fn main() -> std::process::ExitCode {
 /// Release the visa service instance lock, best effort, before an error exit
 /// (zl-zipline#266). Without this the lock outlives the process until
 /// `VALKEY_LOCK_TIMEOUT`, and a supervisor's restart fails with "lock is
-/// currently held by another instance" until it expires. A failure is logged
-/// and otherwise ignored: the process exits either way.
+/// currently held by another instance" until it expires. A failure, or no
+/// answer within [LOCK_RELEASE_TIMEOUT], is logged and otherwise ignored:
+/// the process exits either way.
 async fn release_instance_lock(db: &dyn DbConnection, desc: &LockDescriptor) {
     release_lock_within(db.release_lock(desc), LOCK_RELEASE_TIMEOUT).await;
 }
@@ -581,16 +582,24 @@ async fn release_lock_within<F>(release: F, deadline: std::time::Duration) -> Lo
 where
     F: std::future::Future<Output = db::DbResult<bool>>,
 {
-    // RED (zl-zipline#266, review round 2): the deadline is not applied yet.
-    let _ = deadline;
-    match release.await {
-        Ok(_) => {
+    // On timeout the release future is dropped; the lock then expires on its
+    // own after `VALKEY_LOCK_TIMEOUT`, as it did before zl-zipline#266.
+    match tokio::time::timeout(deadline, release).await {
+        Ok(Ok(_)) => {
             info!(target: MAIN, "released visa service lock");
             LockRelease::Released
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!(target: MAIN, "failed to release visa service lock: {e}");
             LockRelease::Failed
+        }
+        Err(_) => {
+            warn!(
+                target: MAIN,
+                "failed to release visa service lock: no answer from ValKey within {deadline:?}; \
+                 the lock expires on its own"
+            );
+            LockRelease::TimedOut
         }
     }
 }
