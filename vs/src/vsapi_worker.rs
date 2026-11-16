@@ -104,7 +104,9 @@ impl AuthenticateUndo {
 /// Each connection is served in its own task, TLS handshake included, so a
 /// slow or stuck client cannot block `accept` for everyone, and an error on
 /// one connection is logged at `warn!` with the peer address and ends only
-/// that connection (zl-zipline#266, Q2). Only an `accept` error that is not
+/// that connection (zl-zipline#266, Q2). The handshake must finish within
+/// [VSAPI_TLS_HANDSHAKE_TIMEOUT], so a client that never completes it cannot
+/// hold its socket for ever. Only an `accept` error that is not
 /// about a single connection or a passing resource shortage ends the loop
 /// (see [accept_error_action]); the error is returned.
 pub async fn launch_capnp(
@@ -240,11 +242,19 @@ async fn accept_tls_within(
     addr: SocketAddr,
     deadline: Duration,
 ) -> Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
-    let _ = deadline; // RED: not applied yet.
-    match acceptor.accept(sock).await {
-        Ok(tls) => Some(tls),
-        Err(e) => {
+    // On timeout the handshake future is dropped, and with it `sock`, which
+    // closes the connection.
+    match tokio::time::timeout(deadline, acceptor.accept(sock)).await {
+        Ok(Ok(tls)) => Some(tls),
+        Ok(Err(e)) => {
             warn!(target: API, "VSAPI connection from {addr}: TLS handshake failed: {e}");
+            None
+        }
+        Err(_) => {
+            warn!(
+                target: API,
+                "VSAPI connection from {addr}: no TLS handshake within {deadline:?}; dropped"
+            );
             None
         }
     }
