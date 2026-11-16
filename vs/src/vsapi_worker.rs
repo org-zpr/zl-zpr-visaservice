@@ -193,12 +193,9 @@ async fn serve_vsapi_connection(
         warn!(target: API, "VSAPI connection from {addr}: cannot set TCP_NODELAY: {e}");
     }
 
-    let tls = match acceptor.accept(sock).await {
-        Ok(tls) => tls,
-        Err(e) => {
-            warn!(target: API, "VSAPI connection from {addr}: TLS handshake failed: {e}");
-            return;
-        }
+    let Some(tls) = accept_tls_within(&acceptor, sock, addr, VSAPI_TLS_HANDSHAKE_TIMEOUT).await
+    else {
+        return;
     };
     info!(target: API, "TLS connection from {addr}");
     let (reader, writer) = tokio::io::split(tls);
@@ -216,6 +213,40 @@ async fn serve_vsapi_connection(
     let rpc_system = capnp_rpc::RpcSystem::new(Box::new(network), Some(vs_service.client));
     if let Err(e) = rpc_system.await {
         debug!(target: API, "VSAPI connection from {addr} ended: {e}");
+    }
+}
+
+/// How long an accepted VS-API connection may take to finish its TLS
+/// handshake before the server drops it (zl-zipline#266, review round 1).
+///
+/// The handshake runs in the per-connection task, before the peer has
+/// authenticated anything, so without a bound a client that connects and
+/// never sends a ClientHello holds a socket and a task for ever; enough of
+/// them exhaust file descriptors, and the EMFILE pause in the accept loop
+/// cannot recover while they stay open. A legitimate client needs one round
+/// trip plus key exchange: well under a second on the substrate links ZPR
+/// runs over. 10 s leaves a wide margin for a loaded host or a slow link and
+/// still caps how long one unauthenticated socket can live.
+const VSAPI_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run the TLS handshake for the connection from `addr` on `sock`.
+/// Returns the TLS stream, or `None` after logging the reason at `warn!`
+/// with the peer address, in which case the socket has been dropped.
+/// `deadline` bounds the handshake; it is a parameter so that tests can use
+/// a short one (production passes [VSAPI_TLS_HANDSHAKE_TIMEOUT]).
+async fn accept_tls_within(
+    acceptor: &TlsAcceptor,
+    sock: tokio::net::TcpStream,
+    addr: SocketAddr,
+    deadline: Duration,
+) -> Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+    let _ = deadline; // RED: not applied yet.
+    match acceptor.accept(sock).await {
+        Ok(tls) => Some(tls),
+        Err(e) => {
+            warn!(target: API, "VSAPI connection from {addr}: TLS handshake failed: {e}");
+            None
+        }
     }
 }
 
@@ -5825,5 +5856,62 @@ mod accept_loop_tests {
                 "{kind:?}"
             );
         }
+    }
+
+    /// Review round 1 (Codex P1): a client that connects and never sends a
+    /// ClientHello is dropped once the handshake deadline passes. Without a
+    /// deadline each such socket would hold a file descriptor and a task for
+    /// ever. The test uses a short deadline; an outer bound turns a hang into
+    /// a failure.
+    #[tokio::test]
+    async fn stalled_tls_handshake_is_dropped_at_the_deadline() {
+        const SHORT: Duration = Duration::from_millis(200);
+        const OUTER: Duration = Duration::from_secs(3);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let acceptor = tls_acceptor(listen).unwrap();
+
+        // The client connects and then says nothing.
+        let mut stalled = tokio::net::TcpStream::connect(listen).await.unwrap();
+        let (sock, peer) = listener.accept().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(OUTER, accept_tls_within(&acceptor, sock, peer, SHORT))
+            .await
+            .expect("the handshake of a silent client must end at its deadline, not hang");
+        assert!(
+            outcome.is_none(),
+            "a client that never sent a ClientHello cannot have a TLS stream"
+        );
+        assert!(
+            started.elapsed() >= SHORT,
+            "the server must wait for the deadline, not give up at once"
+        );
+
+        // The server dropped the socket: the client reads EOF (or a reset).
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(OUTER, stalled.read(&mut buf))
+            .await
+            .expect("the server must have closed the stalled socket");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "expected EOF or reset on the dropped socket, got {read:?}"
+        );
+    }
+
+    /// The deadline does not get in the way of a client that does its
+    /// handshake promptly.
+    #[tokio::test]
+    async fn prompt_tls_handshake_completes_within_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let acceptor = tls_acceptor(listen).unwrap();
+
+        let client = tokio::spawn(tls_handshake(listen));
+        let (sock, peer) = listener.accept().await.unwrap();
+        let outcome = accept_tls_within(&acceptor, sock, peer, HANDSHAKE_DEADLINE).await;
+        assert!(outcome.is_some(), "a prompt client must get a TLS stream");
+        client.await.unwrap().unwrap();
     }
 }
