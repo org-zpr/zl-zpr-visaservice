@@ -57,7 +57,8 @@ use zpr::vsapi_types::{LinkState, LinkStateReport};
 /// request refreshes actor attributes, whose commit takes it). So `authenticate` drops
 /// it before recording `ActorJoins`, `disconnect` before stopping the node's VSS
 /// worker, `register_vss` prepares its visas before taking it, and the policy pass
-/// drops it before sending `setTopology`.
+/// drops it before sending `setTopology` (as does a re-proposal after a `down`
+/// report, `vsapi_worker::repropose_link_after_down`).
 ///
 /// Actor attribute refreshes query trusted services outside the guard and commit
 /// under it, applying only the attributes they changed onto the actor as stored then
@@ -112,6 +113,18 @@ pub struct RevalidationReport {
     /// committed under the new policy before this ran is not re-checked by the
     /// policy sweep, whose generation gate considers it current.
     pub links_down: Vec<(IpAddr, IpAddr)>,
+}
+
+/// What one link-state report changed ([TopologyMgr::record_link_states]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LinkStateChanges {
+    /// Links that went from up to down, as `(reporter, peer)`, so the caller can revoke
+    /// the visas that use them.
+    pub went_down: Vec<(IpAddr, IpAddr)>,
+    /// The reporter's declared peers whose link the report newly lists `down`
+    /// (`LinkStateTable::newly_down`), so the caller can propose the link again
+    /// (zl-zipline#268).
+    pub newly_down: Vec<IpAddr>,
 }
 
 /// Special error returned by [TopologyMgr::add_linked_node] that records
@@ -197,7 +210,8 @@ impl TopologyMgr {
     ///
     /// Returns the links that went from up to down, as `(reporter, peer)`, so the caller
     /// can revoke the visas that use them. A link coming up is not returned: it affects
-    /// new visas only (Zodes plan §5.8).
+    /// new visas only (Zodes plan §5.8). Also returns the declared peers whose link the
+    /// report newly lists `down` (zl-zipline#268), resolved by CN like `failed` entries.
     ///
     /// `session` is the VS-API session the report came from. A report from an older
     /// session generation than the node's latest is dropped
@@ -206,7 +220,8 @@ impl TopologyMgr {
     ///
     /// A `failed` entry also marks the pair {reporter, that peer} failed (R13a). The
     /// peer is the policy-declared peer of `reporter` whose CN (from the same policy
-    /// snapshot) is the entry's `peerCn`. Recording a report never sends topology.
+    /// snapshot) is the entry's `peerCn`. Recording a report never sends topology: the
+    /// caller decides what to send for [LinkStateChanges::newly_down].
     pub fn record_link_states(
         &self,
         _ops: &TopoOps<'_>,
@@ -214,7 +229,7 @@ impl TopologyMgr {
         session: Option<&str>,
         entries: Vec<LinkStateReport>,
         current_policy: &dyn Fn() -> PolicySnapshot,
-    ) -> Vec<(IpAddr, IpAddr)> {
+    ) -> LinkStateChanges {
         let mut table = self.link_state.lock().unwrap();
         let snapshot = current_policy();
         let declared_peers: Vec<IpAddr> = snapshot
@@ -245,7 +260,7 @@ impl TopologyMgr {
         session: Option<&str>,
         entries: Vec<LinkStateReport>,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
-    ) -> Vec<(IpAddr, IpAddr)> {
+    ) -> LinkStateChanges {
         let mut table = self.link_state.lock().unwrap();
         let declared_peers = self.router.get_peers(reporter);
         self.record_locked(
@@ -273,10 +288,10 @@ impl TopologyMgr {
         entries: Vec<LinkStateReport>,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
         declared_peers: &[IpAddr],
-    ) -> Vec<(IpAddr, IpAddr)> {
+    ) -> LinkStateChanges {
         if !table.accept_session(*reporter, session) {
             debug!(target: TOPO, "link-state report from {reporter}: from a superseded session; dropped");
-            return Vec::new();
+            return LinkStateChanges::default();
         }
         // A report from a node that is no longer in the router -- a stale handle whose
         // node was disconnected meanwhile -- is dropped: storing it would let a
@@ -284,28 +299,56 @@ impl TopologyMgr {
         // `remove_node` clears the snapshot and the router node under this same lock.
         if !self.router.has_node(reporter) {
             debug!(target: TOPO, "link-state report from {reporter}: node is no longer connected; dropped");
-            return Vec::new();
+            return LinkStateChanges::default();
         }
         // R13a: remember each pair whose link the owner newly reports `failed`
-        // (LinkStateTable::record_failures). A CN that names none of the reporter's peers
-        // marks nothing (it may race a policy change).
-        let mut failed_peers = Vec::new();
-        for entry in entries.iter().filter(|e| e.state == LinkState::Failed) {
-            match declared_peers
-                .iter()
-                .find(|p| cn_of(p).as_deref() == Some(entry.peer_cn.as_str()))
-            {
-                Some(peer) => failed_peers.push(*peer),
-                None => {
-                    debug!(target: TOPO, "failed report from {reporter} for peerCn '{}': no such peer; nothing marked", entry.peer_cn);
-                }
-            }
-        }
+        // (LinkStateTable::record_failures).
+        let failed_cns: Vec<String> = entries
+            .iter()
+            .filter(|e| e.state == LinkState::Failed)
+            .map(|e| e.peer_cn.clone())
+            .collect();
+        let failed_peers = Self::declared_peers_named(reporter, &failed_cns, declared_peers, cn_of);
         for peer in table.record_failures(*reporter, &failed_peers) {
             info!(target: TOPO, "link {reporter} <-> {peer} reported failed; left out of topology until either end reconnects");
         }
+        // zl-zipline#268: the links this snapshot newly lists `down`, compared with the
+        // stored snapshot it is about to replace.
+        let newly_down = Self::declared_peers_named(
+            reporter,
+            &table.newly_down(reporter, &entries),
+            declared_peers,
+            cn_of,
+        );
         table.set_snapshot(*reporter, entries);
-        self.refresh_links_locked(table, reporter, cn_of)
+        LinkStateChanges {
+            went_down: self.refresh_links_locked(table, reporter, cn_of),
+            newly_down,
+        }
+    }
+
+    /// The peers among `declared_peers` whose CN (by `cn_of`) is one of `peer_cns`, the
+    /// CNs of some entries of a report from `reporter`. A CN that names none of the
+    /// reporter's peers resolves to nothing (it may race a policy change) and is logged.
+    fn declared_peers_named(
+        reporter: &IpAddr,
+        peer_cns: &[String],
+        declared_peers: &[IpAddr],
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
+    ) -> Vec<IpAddr> {
+        peer_cns
+            .iter()
+            .filter_map(|cn| {
+                let peer = declared_peers
+                    .iter()
+                    .find(|p| cn_of(p).as_deref() == Some(cn.as_str()))
+                    .copied();
+                if peer.is_none() {
+                    debug!(target: TOPO, "report from {reporter} for peerCn '{cn}': no such peer; ignored");
+                }
+                peer
+            })
+            .collect()
     }
 
     /// Forget `node`'s link-state reports and re-evaluate every router link incident to it,
@@ -394,6 +437,20 @@ impl TopologyMgr {
     /// call it too.
     pub fn clear_failed_pairs_for(&self, _ops: &TopoOps<'_>, node: &IpAddr) -> Vec<IpAddr> {
         self.link_state.lock().unwrap().clear_failed_for(node)
+    }
+
+    /// Mark the link between `a` and `b` as waiting to be proposed again after a `down`
+    /// report (zl-zipline#268). Returns false if a re-proposal is already pending, in
+    /// which case the caller schedules nothing: the pending one covers this report too.
+    pub fn mark_repropose(&self, _ops: &TopoOps<'_>, a: &IpAddr, b: &IpAddr) -> bool {
+        self.link_state.lock().unwrap().mark_repropose(*a, *b)
+    }
+
+    /// Take the pending re-proposal mark of the link between `a` and `b`
+    /// ([Self::mark_repropose]), so the next `down` schedules a new one. Returns false if
+    /// there was none.
+    pub fn take_repropose(&self, _ops: &TopoOps<'_>, a: &IpAddr, b: &IpAddr) -> bool {
+        self.link_state.lock().unwrap().take_repropose(*a, *b)
     }
 
     /// Make the router's transit set the one `snapshot`'s policy declares
@@ -2327,7 +2384,7 @@ mod tests {
             vec![report("b.zpr", LinkState::Up)],
             &cn_of,
         );
-        assert_eq!(down, vec![(a, b)]);
+        assert_eq!(down.went_down, vec![(a, b)]);
         assert!(!topo.router.link_between(&a, &b).unwrap().up);
 
         // B says up too: the edge comes up; coming up is not a "went down".
@@ -2338,7 +2395,7 @@ mod tests {
             vec![report("a.zpr", LinkState::Up)],
             &cn_of,
         );
-        assert!(down.is_empty());
+        assert!(down.went_down.is_empty());
         assert!(topo.router.link_between(&a, &b).unwrap().up);
 
         // B says down: the edge goes down and is reported as such, once.
@@ -2349,7 +2406,7 @@ mod tests {
             vec![report("a.zpr", LinkState::Down)],
             &cn_of,
         );
-        assert_eq!(down, vec![(b, a)]);
+        assert_eq!(down.went_down, vec![(b, a)]);
         assert!(!topo.router.link_between(&a, &b).unwrap().up);
         assert!(topo.get_best_route(&a, &b).is_none());
         let again = topo.record_link_states_with_cns(
@@ -2360,7 +2417,7 @@ mod tests {
             &cn_of,
         );
         assert!(
-            again.is_empty(),
+            again.went_down.is_empty(),
             "an edge already down is not reported again"
         );
 
@@ -2372,7 +2429,7 @@ mod tests {
             vec![report("a.zpr", LinkState::Up)],
             &cn_of,
         );
-        assert!(down.is_empty());
+        assert!(down.went_down.is_empty());
         assert!(topo.router.link_between(&a, &b).unwrap().up);
         assert!(topo.get_best_route(&a, &b).is_some());
     }
@@ -2403,7 +2460,10 @@ mod tests {
                 vec![report(peer_cn, LinkState::Up)],
                 &cn_of,
             );
-            assert!(down.is_empty(), "no edge yet, so nothing went down");
+            assert!(
+                down.went_down.is_empty(),
+                "no edge yet, so nothing went down"
+            );
         }
 
         let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
@@ -2718,7 +2778,7 @@ mod tests {
             vec![report("b.zpr", LinkState::Up)],
             &cn_of,
         );
-        assert!(down.is_empty());
+        assert!(down.went_down.is_empty());
         assert!(
             !topo.router.link_between(&a, &b).unwrap().up,
             "the older session's report does not overwrite the newer one"
@@ -2841,6 +2901,6 @@ mod tests {
 
         drop(in_flight);
         let down = report.await.unwrap();
-        assert_eq!(down, vec![(a, b)], "and runs once it is released");
+        assert_eq!(down.went_down, vec![(a, b)], "and runs once it is released");
     }
 }

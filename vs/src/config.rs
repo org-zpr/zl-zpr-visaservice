@@ -97,6 +97,23 @@ pub const RECONCILE_RETRY: Duration = Duration::from_secs(30);
 /// is refused because policy changed while it was authorized (zl-zipline#232).
 pub const LOGIN_POLICY_CHANGED_RETRY_SECS: u32 = 1;
 
+/// How long the visa service waits, after one end of a direct Zode link newly reports it
+/// `down`, before it sends `setTopology` to both ends again so the owner makes one more
+/// attempt (zl-zipline#268; ZODE_LINKS.md rules 6, 13 and 13a).
+///
+/// Why 5 s (operator, pd gate g149 q2):
+/// - A silent link is reported only once the Zodes' keep-alive gives up (3 s period, three
+///   misses: about 9-12 s), but a closed connection is reported at once. Waiting keeps the
+///   retry from landing in the same instant as the fault.
+/// - The two ends detect a silent link independently, up to one 3 s keep-alive period apart.
+///   5 s lets the second end's `down` coalesce into the pending re-proposal.
+/// - The owner then redials about once a second for its 10 s link-up window
+///   (`LINK_UP_WINDOW` in zl-zpr-core), so an outage that clears within about 15 s of the
+///   first `down` heals by itself. A longer one ends in `failed`, and rule 13a stops
+///   proposing the link until something about the pair changes.
+/// - Much longer only keeps the pair on the relay for no benefit.
+pub const LINK_REPROPOSE_DELAY: Duration = Duration::from_secs(5);
+
 pub const MAX_VISA_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
 /// A visa must be valid for at least this long to be worth issuing. Below this the node

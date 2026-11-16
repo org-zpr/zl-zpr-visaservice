@@ -586,7 +586,7 @@ mod tests {
             vec![],
             &|_: &IpAddr| None,
         );
-        assert_eq!(down, vec![(node_a, node_b)]);
+        assert_eq!(down.went_down, vec![(node_a, node_b)]);
         assert!(
             try_create_sweep_visa_on_route(&asm, &node_a, 0, &route)
                 .await

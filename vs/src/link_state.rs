@@ -28,6 +28,11 @@
 //! link that cannot come up is not proposed, and retried, over and over. Like the
 //! reports, the marks are in memory only: a visa-service restart forgets them, and
 //! every link is proposed again.
+//!
+//! Finally it remembers which pairs have a **re-proposal pending** (zl-zipline#268): when
+//! an end newly reports a direct link `down` ([LinkStateTable::newly_down]), the visa
+//! service proposes the link to both ends again after a short delay, once. Further `down`
+//! reports for the pair are coalesced into that one re-proposal until it is sent.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -44,17 +49,22 @@ pub struct LinkStateTable {
     /// a session the node has since replaced, and is dropped.
     latest_session: HashMap<IpAddr, u64>,
     /// Unordered node pairs whose link the owner reported `failed` (R13a), each stored
-    /// as (lower address, higher address); see [failed_pair_key].
+    /// as (lower address, higher address); see [pair_key].
     failed_pairs: HashSet<(IpAddr, IpAddr)>,
     /// (reporter, peer) for every peer the reporter's latest accepted snapshot lists as
     /// `failed`, so a repeated `failed` does not count as a new failure
     /// ([Self::record_failures]). Kept across [Self::remove_node]: the first report after
     /// a reconnect may still list the failure the reconnect has just cleared.
     listed_failed: HashSet<(IpAddr, IpAddr)>,
+    /// Unordered node pairs whose link newly went `down` and is waiting to be proposed
+    /// again (zl-zipline#268), each stored as [pair_key]. Coalesces every further `down`
+    /// for the pair until the delayed re-proposal takes the mark.
+    pending_repropose: HashSet<(IpAddr, IpAddr)>,
 }
 
-/// The key of the unordered pair {a, b} in [LinkStateTable::failed_pairs].
-fn failed_pair_key(a: IpAddr, b: IpAddr) -> (IpAddr, IpAddr) {
+/// The key of the unordered pair {a, b} in [LinkStateTable::failed_pairs] and
+/// [LinkStateTable::pending_repropose].
+fn pair_key(a: IpAddr, b: IpAddr) -> (IpAddr, IpAddr) {
     if a <= b { (a, b) } else { (b, a) }
 }
 
@@ -85,7 +95,7 @@ impl LinkStateTable {
     /// clears it; `up` and `down` reports never touch it. Reports mark through
     /// [Self::record_failures].
     fn mark_failed(&mut self, a: IpAddr, b: IpAddr) {
-        self.failed_pairs.insert(failed_pair_key(a, b));
+        self.failed_pairs.insert(pair_key(a, b));
     }
 
     /// Apply the `failed` entries of `reporter`'s latest accepted snapshot (resolved to
@@ -114,9 +124,41 @@ impl LinkStateTable {
         newly_marked
     }
 
+    /// The peer CNs that `entries` (a snapshot from `reporter`, not yet stored) lists as
+    /// `down` while `reporter`'s stored snapshot did not (zl-zipline#268). Call it before
+    /// [Self::set_snapshot] replaces the stored one.
+    ///
+    /// Only a move into `down` counts. A snapshot sent for some other change repeats the
+    /// `down` it listed before, and a link the owner retries from `down` stays listed
+    /// `down` during its window, so neither counts again: a new `down` needs the link to
+    /// have been up in between (ZODE_LINKS.md "Reporting summary"). A reporter with no
+    /// stored snapshot (it never reported, or [Self::remove_node] forgot it) has nothing
+    /// to compare against, so each `down` it lists counts.
+    pub fn newly_down(&self, reporter: &IpAddr, entries: &[LinkStateReport]) -> Vec<String> {
+        let previous = self.snapshots.get(reporter);
+        entries
+            .iter()
+            .filter(|e| e.state == LinkState::Down)
+            .filter(|e| previous.and_then(|p| p.get(&e.peer_cn)) != Some(&LinkState::Down))
+            .map(|e| e.peer_cn.clone())
+            .collect()
+    }
+
+    /// Mark the link between `a` and `b` as waiting to be proposed again (zl-zipline#268).
+    /// Returns false if a mark is already pending, so the caller schedules nothing more.
+    pub fn mark_repropose(&mut self, a: IpAddr, b: IpAddr) -> bool {
+        self.pending_repropose.insert(pair_key(a, b))
+    }
+
+    /// Take the pending mark of the link between `a` and `b`, set by
+    /// [Self::mark_repropose]. Returns false if there was none.
+    pub fn take_repropose(&mut self, a: IpAddr, b: IpAddr) -> bool {
+        self.pending_repropose.remove(&pair_key(a, b))
+    }
+
     /// True if the link between `a` and `b` is marked failed (in either order).
     pub fn is_failed(&self, a: &IpAddr, b: &IpAddr) -> bool {
-        self.failed_pairs.contains(&failed_pair_key(*a, *b))
+        self.failed_pairs.contains(&pair_key(*a, *b))
     }
 
     /// Clear every failed pair `node` is part of, because something about those pairs
@@ -322,6 +364,69 @@ mod tests {
         assert!(!usable(&t), "B's reports went with it; the link is down");
         t.set_snapshot(ip(B), vec![entry("a.zpr", LinkState::Up)]);
         assert!(usable(&t), "B reported up again");
+    }
+
+    // --- zl-zipline#268: entries newly listed `down`, and pending re-proposals ---
+
+    #[test]
+    fn down_after_up_is_newly_down() {
+        let mut t = LinkStateTable::new();
+        t.set_snapshot(ip(A), vec![entry("b.zpr", LinkState::Up)]);
+        assert_eq!(
+            t.newly_down(&ip(A), &[entry("b.zpr", LinkState::Down)]),
+            vec!["b.zpr".to_string()]
+        );
+    }
+
+    #[test]
+    fn repeated_down_is_not_newly_down() {
+        // A snapshot sent for some other change repeats the `down` it listed before
+        // (and a link retried from `down` stays listed `down` during its window).
+        let mut t = LinkStateTable::new();
+        t.set_snapshot(ip(A), vec![entry("b.zpr", LinkState::Down)]);
+        let again = [
+            entry("b.zpr", LinkState::Down),
+            entry("c.zpr", LinkState::Up),
+        ];
+        assert!(t.newly_down(&ip(A), &again).is_empty());
+    }
+
+    #[test]
+    fn up_and_failed_are_never_newly_down() {
+        let mut t = LinkStateTable::new();
+        t.set_snapshot(ip(A), vec![entry("b.zpr", LinkState::Up)]);
+        let entries = [
+            entry("b.zpr", LinkState::Failed),
+            entry("c.zpr", LinkState::Up),
+        ];
+        assert!(t.newly_down(&ip(A), &entries).is_empty());
+    }
+
+    #[test]
+    fn down_after_remove_node_is_newly_down() {
+        // Documented: a forgotten reporter has no previous snapshot, so a `down` in its
+        // first report after a reconnect counts as new. The re-proposal it schedules is
+        // coalesced with, or rechecked after, the session start's own re-proposal.
+        let mut t = LinkStateTable::new();
+        t.set_snapshot(ip(A), vec![entry("b.zpr", LinkState::Down)]);
+        t.remove_node(&ip(A));
+        assert_eq!(
+            t.newly_down(&ip(A), &[entry("b.zpr", LinkState::Down)]),
+            vec!["b.zpr".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_pending_repropose_is_marked_once_per_unordered_pair() {
+        let mut t = LinkStateTable::new();
+        assert!(t.mark_repropose(ip(A), ip(B)), "first mark");
+        assert!(
+            !t.mark_repropose(ip(B), ip(A)),
+            "already pending, either order"
+        );
+        assert!(t.take_repropose(ip(B), ip(A)), "taken");
+        assert!(!t.take_repropose(ip(A), ip(B)), "nothing left to take");
+        assert!(t.mark_repropose(ip(A), ip(B)), "can be marked again");
     }
 
     // --- R13a: failed pairs ---
