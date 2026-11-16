@@ -160,16 +160,25 @@ enum AcceptErrorAction {
 
 /// Sort an `accept` error. On Linux, `accept(2)` reports network errors that
 /// are pending on the new connection as its own error, and the man page says
-/// to retry: those, and a connection aborted or reset before it was
-/// accepted, are [AcceptErrorAction::Skip]. EMFILE and ENFILE (too many open
-/// files, per process or system wide; 24 and 23 on Linux and the BSDs) and
-/// ENOMEM are [AcceptErrorAction::PauseAndRetry]: they clear when
-/// connections close, and a busy loop would not help.
+/// to treat them like EAGAIN and retry: ENETDOWN, EPROTO, ENOPROTOOPT,
+/// EHOSTDOWN, ENONET, EHOSTUNREACH, EOPNOTSUPP and ENETUNREACH. Those, and a
+/// connection aborted or reset before it was accepted, are
+/// [AcceptErrorAction::Skip]. EMFILE and ENFILE (too many open files, per
+/// process or system wide), ENOBUFS (no socket buffer memory) and ENOMEM
+/// are [AcceptErrorAction::PauseAndRetry]: they clear when connections
+/// close, and a busy loop would not help. The errno values come from `libc`,
+/// which has the right ones for each platform (zl-zipline#266, review 2).
 fn accept_error_action(e: &std::io::Error) -> AcceptErrorAction {
     use std::io::ErrorKind;
-    const ENFILE: i32 = 23;
-    const EMFILE: i32 = 24;
-    if matches!(e.raw_os_error(), Some(EMFILE | ENFILE)) || e.kind() == ErrorKind::OutOfMemory {
+    if let Some(errno) = e.raw_os_error() {
+        if is_resource_shortage_errno(errno) {
+            return AcceptErrorAction::PauseAndRetry;
+        }
+        if is_pending_connection_errno(errno) {
+            return AcceptErrorAction::Skip;
+        }
+    }
+    if e.kind() == ErrorKind::OutOfMemory {
         return AcceptErrorAction::PauseAndRetry;
     }
     match e.kind() {
@@ -180,6 +189,45 @@ fn accept_error_action(e: &std::io::Error) -> AcceptErrorAction {
         | ErrorKind::HostUnreachable => AcceptErrorAction::Skip,
         _ => AcceptErrorAction::Stop,
     }
+}
+
+/// True for an `accept` errno that is a passing shortage of descriptors or
+/// buffer memory: EMFILE, ENFILE, ENOBUFS.
+#[cfg(unix)]
+fn is_resource_shortage_errno(errno: i32) -> bool {
+    matches!(errno, libc::EMFILE | libc::ENFILE | libc::ENOBUFS)
+}
+
+/// No errno mapping off Unix; `ErrorKind` still covers ENOMEM.
+#[cfg(not(unix))]
+fn is_resource_shortage_errno(_errno: i32) -> bool {
+    false
+}
+
+/// True for an `accept` errno that Linux `accept(2)` documents as a network
+/// error already pending on the new connection, to be treated like EAGAIN.
+/// Other platforms do not pass these through `accept`, so this is Linux
+/// only; the `ErrorKind` arms in [accept_error_action] cover the portable
+/// subset (ENETDOWN, ENETUNREACH, EHOSTUNREACH).
+#[cfg(target_os = "linux")]
+fn is_pending_connection_errno(errno: i32) -> bool {
+    matches!(
+        errno,
+        libc::ENETDOWN
+            | libc::EPROTO
+            | libc::ENOPROTOOPT
+            | libc::EHOSTDOWN
+            | libc::ENONET
+            | libc::EHOSTUNREACH
+            | libc::EOPNOTSUPP
+            | libc::ENETUNREACH
+    )
+}
+
+/// Off Linux, `accept` reports no pending-connection errnos.
+#[cfg(not(target_os = "linux"))]
+fn is_pending_connection_errno(_errno: i32) -> bool {
+    false
 }
 
 /// Serve one VS-API connection: TLS handshake, then the capnp RPC system
