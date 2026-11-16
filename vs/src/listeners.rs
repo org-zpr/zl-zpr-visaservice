@@ -123,8 +123,17 @@ pub fn bind_reserved(role: ListenerRole, addr: SocketAddr) -> Result<TcpSocket, 
 
 /// Turn a socket from [bind_reserved] into a listening socket.
 pub fn start_listening(role: ListenerRole, sock: TcpSocket) -> Result<TcpListener, ListenerError> {
-    let _ = (role, sock, LISTEN_BACKLOG);
-    todo!("zl-zipline#266: start_listening")
+    // Read the address first, for the error message: `listen` consumes the
+    // socket. A bound socket always has one; the fallback is never expected.
+    let addr = sock
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 0));
+    sock.listen(LISTEN_BACKLOG).map_err(|source| ListenerError {
+        role,
+        addr,
+        stage: ListenerStage::Listen,
+        source,
+    })
 }
 
 /// The VS-API and admin sockets, bound to `vs_addr` but not yet listening.
