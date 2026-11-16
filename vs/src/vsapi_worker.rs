@@ -100,6 +100,13 @@ impl AuthenticateUndo {
 
 /// Serve the capnp VS-API on `listener`, which `main` has already bound to
 /// `vs_addr` and put into the listening state (zl-zipline#266).
+///
+/// Each connection is served in its own task, TLS handshake included, so a
+/// slow or stuck client cannot block `accept` for everyone, and an error on
+/// one connection is logged at `warn!` with the peer address and ends only
+/// that connection (zl-zipline#266, Q2). Only an `accept` error that is not
+/// about a single connection or a passing resource shortage ends the loop
+/// (see [accept_error_action]); the error is returned.
 pub async fn launch_capnp(
     asm: Arc<Assembly>,
     listener: tokio::net::TcpListener,
@@ -109,33 +116,106 @@ pub async fn launch_capnp(
     let acceptor = tls_acceptor(listen)?;
 
     loop {
-        let (sock, addr) = listener.accept().await?;
+        let (sock, addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => match accept_error_action(&e) {
+                AcceptErrorAction::Skip => {
+                    warn!(target: API, "VSAPI accept failed for one connection: {e}");
+                    continue;
+                }
+                AcceptErrorAction::PauseAndRetry => {
+                    warn!(target: API, "VSAPI accept failed, retrying in {ACCEPT_RETRY_PAUSE:?}: {e}");
+                    tokio::time::sleep(ACCEPT_RETRY_PAUSE).await;
+                    continue;
+                }
+                AcceptErrorAction::Stop => return Err(e.into()),
+            },
+        };
         info!(target: API, "TCP connection from {}", addr);
-        sock.set_nodelay(true)?;
+        tokio::task::spawn_local(serve_vsapi_connection(
+            asm.clone(),
+            acceptor.clone(),
+            sock,
+            addr,
+        ));
+    }
+}
 
-        let tls = acceptor.accept(sock).await?;
-        info!(target: API, "TLS connection");
-        let (reader, writer) = tokio::io::split(tls);
+/// Pause before the next `accept` after a resource shortage (the admin
+/// accept loop uses the same value).
+const ACCEPT_RETRY_PAUSE: Duration = Duration::from_millis(100);
 
-        let network = capnp_rpc::twoparty::VatNetwork::new(
-            tokio::io::BufReader::new(reader).compat(),
-            tokio::io::BufWriter::new(writer).compat_write(),
-            capnp_rpc::rpc_twoparty_capnp::Side::Server,
-            capnp::message::ReaderOptions::new(),
-        );
+/// What the VS-API accept loop does with an error from `accept`.
+#[derive(Debug, PartialEq, Eq)]
+enum AcceptErrorAction {
+    /// The error belongs to one pending connection: go on at once.
+    Skip,
+    /// A passing resource shortage (file descriptors, memory): pause, retry.
+    PauseAndRetry,
+    /// Anything else: the listener is broken; end the loop.
+    Stop,
+}
 
-        let vs_service: vsapi::visa_service::Client = capnp_rpc::new_client(VisaServiceImpl {
-            asm: asm.clone(),
-            remote: addr,
-        });
+/// Sort an `accept` error. On Linux, `accept(2)` reports network errors that
+/// are pending on the new connection as its own error, and the man page says
+/// to retry: those, and a connection aborted or reset before it was
+/// accepted, are [AcceptErrorAction::Skip]. EMFILE and ENFILE (too many open
+/// files, per process or system wide; 24 and 23 on Linux and the BSDs) and
+/// ENOMEM are [AcceptErrorAction::PauseAndRetry]: they clear when
+/// connections close, and a busy loop would not help.
+fn accept_error_action(e: &std::io::Error) -> AcceptErrorAction {
+    use std::io::ErrorKind;
+    const ENFILE: i32 = 23;
+    const EMFILE: i32 = 24;
+    if matches!(e.raw_os_error(), Some(EMFILE | ENFILE)) || e.kind() == ErrorKind::OutOfMemory {
+        return AcceptErrorAction::PauseAndRetry;
+    }
+    match e.kind() {
+        ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::NetworkDown
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::HostUnreachable => AcceptErrorAction::Skip,
+        _ => AcceptErrorAction::Stop,
+    }
+}
 
-        let rpc_system =
-            capnp_rpc::RpcSystem::new(Box::new(network), Some(vs_service.clone().client));
+/// Serve one VS-API connection: TLS handshake, then the capnp RPC system
+/// until the peer goes away. Every error here ends only this connection and
+/// is logged with the peer address.
+async fn serve_vsapi_connection(
+    asm: Arc<Assembly>,
+    acceptor: TlsAcceptor,
+    sock: tokio::net::TcpStream,
+    addr: SocketAddr,
+) {
+    if let Err(e) = sock.set_nodelay(true) {
+        warn!(target: API, "VSAPI connection from {addr}: cannot set TCP_NODELAY: {e}");
+    }
 
-        tokio::task::spawn_local(async move {
-            let err = rpc_system.await;
-            err
-        });
+    let tls = match acceptor.accept(sock).await {
+        Ok(tls) => tls,
+        Err(e) => {
+            warn!(target: API, "VSAPI connection from {addr}: TLS handshake failed: {e}");
+            return;
+        }
+    };
+    info!(target: API, "TLS connection from {addr}");
+    let (reader, writer) = tokio::io::split(tls);
+
+    let network = capnp_rpc::twoparty::VatNetwork::new(
+        tokio::io::BufReader::new(reader).compat(),
+        tokio::io::BufWriter::new(writer).compat_write(),
+        capnp_rpc::rpc_twoparty_capnp::Side::Server,
+        capnp::message::ReaderOptions::new(),
+    );
+
+    let vs_service: vsapi::visa_service::Client =
+        capnp_rpc::new_client(VisaServiceImpl { asm, remote: addr });
+
+    let rpc_system = capnp_rpc::RpcSystem::new(Box::new(network), Some(vs_service.client));
+    if let Err(e) = rpc_system.await {
+        debug!(target: API, "VSAPI connection from {addr} ended: {e}");
     }
 }
 
@@ -5705,5 +5785,45 @@ mod accept_loop_tests {
                 drop(stalled);
             })
             .await;
+    }
+
+    /// The accept-error policy: per-connection errors are skipped, file
+    /// descriptor and memory shortages are retried after a pause, and
+    /// anything else stops the loop.
+    #[test]
+    fn accept_error_action_sorts_errors() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::NetworkDown,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+        ] {
+            assert_eq!(
+                accept_error_action(&Error::from(kind)),
+                AcceptErrorAction::Skip,
+                "{kind:?}"
+            );
+        }
+        // EMFILE and ENFILE.
+        for errno in [24, 23] {
+            assert_eq!(
+                accept_error_action(&Error::from_raw_os_error(errno)),
+                AcceptErrorAction::PauseAndRetry,
+                "errno {errno}"
+            );
+        }
+        assert_eq!(
+            accept_error_action(&Error::from(ErrorKind::OutOfMemory)),
+            AcceptErrorAction::PauseAndRetry
+        );
+        for kind in [ErrorKind::InvalidInput, ErrorKind::Other] {
+            assert_eq!(
+                accept_error_action(&Error::from(kind)),
+                AcceptErrorAction::Stop,
+                "{kind:?}"
+            );
+        }
     }
 }
