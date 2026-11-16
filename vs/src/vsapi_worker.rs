@@ -5868,6 +5868,65 @@ mod accept_loop_tests {
         }
     }
 
+    /// zl-zipline#266, review round 2 (Copilot): Linux `accept(2)` passes
+    /// network errors that are already pending on the new connection to the
+    /// caller, and its man page says to treat them like EAGAIN and retry.
+    /// Each one is skipped; it must not stop the VS-API listener. The values
+    /// come from `libc`, so they are right on every Linux architecture (mips,
+    /// sparc and alpha number several of them differently).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accept_error_action_skips_pending_network_errnos() {
+        use std::io::Error;
+        for (name, errno) in [
+            ("ENETDOWN", libc::ENETDOWN),
+            ("EPROTO", libc::EPROTO),
+            ("ENOPROTOOPT", libc::ENOPROTOOPT),
+            ("EHOSTDOWN", libc::EHOSTDOWN),
+            ("ENONET", libc::ENONET),
+            ("EHOSTUNREACH", libc::EHOSTUNREACH),
+            ("EOPNOTSUPP", libc::EOPNOTSUPP),
+            ("ENETUNREACH", libc::ENETUNREACH),
+        ] {
+            assert_eq!(
+                accept_error_action(&Error::from_raw_os_error(errno)),
+                AcceptErrorAction::Skip,
+                "{name} ({errno})"
+            );
+        }
+    }
+
+    /// zl-zipline#266, review round 2 (Copilot): ENOBUFS from `accept` is a
+    /// passing shortage of socket buffer memory, like ENOMEM: pause and
+    /// retry, do not stop the listener.
+    #[cfg(unix)]
+    #[test]
+    fn accept_error_action_retries_enobufs() {
+        assert_eq!(
+            accept_error_action(&std::io::Error::from_raw_os_error(libc::ENOBUFS)),
+            AcceptErrorAction::PauseAndRetry
+        );
+    }
+
+    /// The errors that mean the listening socket itself is broken still
+    /// stop the loop: EBADF (not a socket descriptor), EINVAL (not
+    /// listening) and ENOTSOCK.
+    #[cfg(unix)]
+    #[test]
+    fn accept_error_action_stops_on_a_broken_listener() {
+        for (name, errno) in [
+            ("EBADF", libc::EBADF),
+            ("EINVAL", libc::EINVAL),
+            ("ENOTSOCK", libc::ENOTSOCK),
+        ] {
+            assert_eq!(
+                accept_error_action(&std::io::Error::from_raw_os_error(errno)),
+                AcceptErrorAction::Stop,
+                "{name} ({errno})"
+            );
+        }
+    }
+
     /// Review round 1 (Codex P1): a client that connects and never sends a
     /// ClientHello is dropped once the handshake deadline passes. Without a
     /// deadline each such socket would hold a file descriptor and a task for
