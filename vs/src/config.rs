@@ -154,6 +154,11 @@ pub struct VSConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct CoreSection {
     /// The visa service bind address - this is a constant baked into entire ZPR system only override for testing.
+    ///
+    /// The VS-API and admin listeners bind it at startup, before ValKey. If
+    /// it is not an address on a local interface (or a listener port is in
+    /// use), `vs` logs the address and the OS error and exits with status 1
+    /// (zl-zipline#266). A listener that stops later also stops `vs`.
     pub vs_addr: Option<IpAddr>,
 
     /// VSAPI port used by nodes to talk to the visa service VS API.
