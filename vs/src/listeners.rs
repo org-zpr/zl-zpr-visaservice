@@ -43,8 +43,6 @@ pub enum ListenerStage {
     Bind,
     /// Turning the bound socket into a listening socket (end of startup).
     Listen,
-    /// Serving: the accept loop ended (runtime).
-    Serve,
 }
 
 /// A listener failure: which listener, on which address, at which step, and
@@ -55,13 +53,6 @@ pub struct ListenerError {
     pub addr: SocketAddr,
     pub stage: ListenerStage,
     pub source: io::Error,
-}
-
-impl ListenerError {
-    /// The kind of the underlying OS error.
-    pub fn kind(&self) -> io::ErrorKind {
-        self.source.kind()
-    }
 }
 
 impl fmt::Display for ListenerError {
@@ -86,7 +77,6 @@ impl fmt::Display for ListenerError {
             ListenerStage::Listen => {
                 write!(f, "cannot listen on {role} socket {addr}: {source}")
             }
-            ListenerStage::Serve => write!(f, "{role} listener on {addr} stopped: {source}"),
         }
     }
 }
@@ -172,7 +162,7 @@ mod tests {
             let err = bind_reserved(ListenerRole::VsApi, addr)
                 .err()
                 .unwrap_or_else(|| panic!("binding {addr} must fail on a test host"));
-            assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable, "{err}");
+            assert_eq!(err.source.kind(), io::ErrorKind::AddrNotAvailable, "{err}");
             assert_eq!(err.stage, ListenerStage::Bind);
             let msg = err.to_string();
             assert!(msg.contains("VS-API"), "{msg}");
@@ -193,7 +183,7 @@ mod tests {
         let err = bind_reserved(ListenerRole::Admin, addr)
             .err()
             .expect("binding a port another socket listens on must fail");
-        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+        assert_eq!(err.source.kind(), io::ErrorKind::AddrInUse, "{err}");
         let msg = err.to_string();
         assert!(msg.contains("admin"), "{msg}");
         assert!(msg.contains("another process already listens"), "{msg}");

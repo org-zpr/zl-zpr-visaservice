@@ -97,13 +97,15 @@ impl AuthenticateUndo {
     }
 }
 
+/// Serve the capnp VS-API on `listener`, which `main` has already bound to
+/// `vs_addr` and put into the listening state (zl-zipline#266).
 pub async fn launch_capnp(
     asm: Arc<Assembly>,
-    listen: SocketAddr,
+    listener: tokio::net::TcpListener,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let listen = listener.local_addr()?;
     info!(target: API, "VSAPI service listening on {} (capnp)", listen);
     let acceptor = tls_acceptor(listen)?;
-    let listener = tokio::net::TcpListener::bind(listen).await?;
 
     loop {
         let (sock, addr) = listener.accept().await?;
@@ -136,8 +138,9 @@ pub async fn launch_capnp(
     }
 }
 
-pub async fn launch(asm: Arc<Assembly>, listen: SocketAddr) {
-    match launch_capnp(asm.clone(), listen).await {
+/// Run the VS-API on `listener` until it fails, and log the failure.
+pub async fn launch(asm: Arc<Assembly>, listener: tokio::net::TcpListener) {
+    match launch_capnp(asm.clone(), listener).await {
         Ok(()) => (),
         Err(e) => error!(target: API, "VSAPI capnp error: {}", e),
     };

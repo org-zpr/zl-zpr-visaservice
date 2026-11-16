@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -168,6 +168,25 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    // zl-zipline#266: bind the VS-API and admin sockets on `vs_addr` now,
+    // before identity, ValKey and the instance lock, so a `vs_addr` that is
+    // not on a local interface (or a port already taken) stops the process
+    // at once with the address and the OS error -- and holds no ValKey lock
+    // that would block a supervisor's restart. The sockets do not listen
+    // until hydration is done (see `start_listening` below), so clients get
+    // "connection refused" until then, as before.
+    let reserved = match listeners::ReservedListeners::bind(
+        cfg.get_vs_addr(),
+        cfg.core.vsapi_port.unwrap_or(config::VSAPI_PORT),
+        cfg.core.admin_port.unwrap_or(config::ADMIN_HTTPS_PORT),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            error!(target: MAIN, "{e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
     let identity = match initialize_identity(
         &cfg.core.identity,
         &cli.regen_identity,
@@ -254,7 +273,9 @@ async fn main() -> std::process::ExitCode {
     // un-renewed fuse (VALKEY_LOCK_TIMEOUT) through all of startup. This must be
     // a plain spawn (not spawn_local): LocalSet tasks aren't polled until
     // run_until, which is only reached after hydration completes.
-    js.spawn(db_worker::launch(db_handle.clone(), vslock_desc));
+    // The descriptor is kept so `main` can release the lock when it exits on a
+    // listener failure (zl-zipline#266).
+    js.spawn(db_worker::launch(db_handle.clone(), vslock_desc.clone()));
 
     let counters = Arc::new(Counters::default());
 
@@ -438,26 +459,28 @@ async fn main() -> std::process::ExitCode {
     js.spawn_local(event_mgr::launch(asm.clone(), event_rx));
 
     // The visa service's own ZPR address (`vs_addr`) is used both ways: the
-    // VS-API and admin listeners bind it here, and every outbound VSS
-    // connection binds it as its source (`vss_worker::connect_from`).
-    js.spawn_local(vsapi_worker::launch(
-        asm.clone(),
-        SocketAddr::new(
-            cfg.get_vs_addr(),
-            cfg.core.vsapi_port.unwrap_or(config::VSAPI_PORT),
-        ),
-    ));
+    // VS-API and admin listeners are bound to it at startup (above), and every
+    // outbound VSS connection binds it as its source (`vss_worker::connect_from`).
+    // Hydration is done: start listening on the reserved sockets now.
+    let (vsapi_listener, admin_listener) = match (
+        listeners::start_listening(listeners::ListenerRole::VsApi, reserved.vsapi),
+        listeners::start_listening(listeners::ListenerRole::Admin, reserved.admin),
+    ) {
+        (Ok(v), Ok(a)) => (v, a),
+        (Err(e), _) | (_, Err(e)) => {
+            error!(target: MAIN, "{e}");
+            release_instance_lock(asm.state_db.as_ref(), &vslock_desc).await;
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    js.spawn_local(vsapi_worker::launch(asm.clone(), vsapi_listener));
 
     {
         let admin_key = cfg.core.admin_key.clone();
         let admin_cert = cfg.core.admin_cert.clone();
-        let admin_listen = SocketAddr::new(
-            cfg.get_vs_addr(),
-            cfg.core.admin_port.unwrap_or(config::ADMIN_HTTPS_PORT),
-        );
         let admin_asm = asm.clone();
         js.spawn_local(async move {
-            start_admin_server(&admin_key, &admin_cert, admin_listen, &admin_asm).await;
+            start_admin_server(&admin_key, &admin_cert, admin_listener, &admin_asm).await;
         });
     }
 
@@ -493,6 +516,18 @@ async fn main() -> std::process::ExitCode {
 
     info!(target: MAIN, "exiting");
     std::process::ExitCode::SUCCESS
+}
+
+/// Release the visa service instance lock, best effort, before an error exit
+/// (zl-zipline#266). Without this the lock outlives the process until
+/// `VALKEY_LOCK_TIMEOUT`, and a supervisor's restart fails with "lock is
+/// currently held by another instance" until it expires. A failure is logged
+/// and otherwise ignored: the process exits either way.
+async fn release_instance_lock(db: &dyn DbConnection, desc: &LockDescriptor) {
+    match db.release_lock(desc).await {
+        Ok(_) => info!(target: MAIN, "released visa service lock"),
+        Err(e) => warn!(target: MAIN, "failed to release visa service lock: {e}"),
+    }
 }
 
 /// Load configuration from an explicit path, the default path, or fall back to defaults.
