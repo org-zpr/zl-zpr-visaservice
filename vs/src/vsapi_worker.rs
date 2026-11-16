@@ -579,6 +579,80 @@ fn repropose_links_to_peers(asm: &Arc<Assembly>, node: &IpAddr, cleared: Vec<IpA
     });
 }
 
+/// An end of the direct link between `reporter` and `peer` has newly reported it `down`
+/// (zl-zipline#268; ZODE_LINKS.md rules 10, 13 and 13a). Unless a re-proposal of this
+/// pair is already pending, mark one under `ops` and spawn [repropose_link_after_down] to
+/// send it after [config::LINK_REPROPOSE_DELAY]. Spawning does not wait, so this is safe
+/// under the guard.
+///
+/// A relay link is left alone: its endpoint redials its initial link itself (rule 11),
+/// and losing it ends the endpoint's VS-API session, whose rejoin proposes its links
+/// again ([repropose_links_to_peers]).
+fn schedule_link_repropose(asm: &Arc<Assembly>, ops: &TopoOps<'_>, reporter: IpAddr, peer: IpAddr) {
+    if crate::visa_bootstrap::is_relay(asm, &reporter)
+        || crate::visa_bootstrap::is_relay(asm, &peer)
+    {
+        debug!(target: API, "relay link {reporter} <-> {peer} reported down: not proposed again");
+        return;
+    }
+    if !asm.topo_mgr.mark_repropose(ops, &reporter, &peer) {
+        debug!(target: API, "link {reporter} <-> {peer} reported down: a re-proposal is already pending");
+        return;
+    }
+    info!(target: API, "link {reporter} <-> {peer} reported down: proposing it again in {:?}", config::LINK_REPROPOSE_DELAY);
+    tokio::spawn(repropose_link_after_down(
+        asm.clone(),
+        reporter,
+        peer,
+        config::LINK_REPROPOSE_DELAY,
+    ));
+}
+
+/// The delayed half of [schedule_link_repropose]: after `delay`, send `setTopology` to
+/// both ends of the direct link `a`-`b`, so its owner makes one more attempt (rules 6
+/// and 13). If that attempt fails, the owner reports `failed` and rule 13a stops any
+/// further proposal, so the retries are bounded: each re-proposal needs a new `down`,
+/// and a new `down` needs the link to have come up in between.
+///
+/// Under the topology guard it takes the pending mark, so a later `down` schedules
+/// anew, and decides whether the send is still wanted. It is not if the pair has been
+/// marked failed meanwhile, the link is up again (a session start re-proposed it, say),
+/// or policy no longer declares it. After dropping the guard, both ends need a live VSS
+/// worker: an end without one is rejoining, and its session start proposes its links
+/// again. The send waits on node RPCs, so it never runs under the guard ([TopoOps]).
+async fn repropose_link_after_down(asm: Arc<Assembly>, a: IpAddr, b: IpAddr, delay: Duration) {
+    tokio::time::sleep(delay).await;
+    let ops = asm.topo_mgr.ops().await;
+    asm.topo_mgr.take_repropose(&ops, &a, &b);
+    let psnap = asm.policy_mgr.get_current_snapshot();
+    let in_policy = psnap
+        .policy()
+        .get_peers_for_node(&a)
+        .unwrap_or_default()
+        .iter()
+        .any(|p| p.remote_zpr_addr == b);
+    let skip = if !in_policy {
+        Some("no longer in policy")
+    } else if asm.topo_mgr.is_failed_pair(&a, &b) {
+        Some("reported failed meanwhile")
+    } else if asm.topo_mgr.link_up(&a, &b) {
+        Some("up again")
+    } else {
+        None
+    };
+    drop(ops);
+    if let Some(why) = skip {
+        debug!(target: API, "link {a} <-> {b}: not proposed again after its down report: {why}");
+        return;
+    }
+    if !(asm.vss_mgr.has_live_worker(&a) && asm.vss_mgr.has_live_worker(&b)) {
+        debug!(target: API, "link {a} <-> {b}: not proposed again after its down report: an end has no live VSS worker");
+        return;
+    }
+    info!(target: API, "proposing link {a} <-> {b} again after a down report");
+    crate::event_mgr::send_topology_to(&asm, &psnap, &[a, b]).await;
+}
+
 /// How often a J5a issue that failed is tried again for the same session (see
 /// [start_session_core_visas]).
 const CORE_VISA_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -2099,7 +2173,9 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
     /// that goes down has the visas crossing it revoked, so their flows re-request and
     /// get a route around it. A link coming up affects new visas only. A `failed` entry
     /// marks the pair, which is then left out of both ends' topology until either end
-    /// reconnects (R13a); the report itself never sends topology.
+    /// reconnects (R13a), and never sends topology. A `down` entry newly listed for a
+    /// direct link schedules one delayed `setTopology` to both ends
+    /// ([repropose_link_after_down], zl-zipline#268), so the owner tries once more.
     ///
     /// Errors: `authRequired` on a dead handle; `paramError` for more entries than the
     /// node's policy-declared links, an empty peerCn, or a peerCn listed twice.
@@ -2189,17 +2265,23 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         // holds), and evaluates every CN against it. `get_current_snapshot` is a
         // lock-free load, so there is no lock-order concern.
         let current_policy = || self.asm.policy_mgr.get_current_snapshot();
-        let went_down = self.asm.topo_mgr.record_link_states(
+        let changes = self.asm.topo_mgr.record_link_states(
             &ops,
             &reporter,
             self.session.as_deref(),
             entries,
             &current_policy,
         );
+        // zl-zipline#268: propose each newly-down direct link again after a delay. The
+        // mark is set under the guard, so reports from both ends coalesce into one
+        // re-proposal; the delayed task sends outside it.
+        for peer in changes.newly_down {
+            schedule_link_repropose(&self.asm, &ops, reporter, peer);
+        }
         // Revoke the visas crossing every link that just went down. A visa whose
         // revocation write fails is quarantined and retried per visa (VisaMgr), so the
         // report itself succeeds either way.
-        for (a, b) in went_down {
+        for (a, b) in changes.went_down {
             let _ = revoke_visas_over_link(&self.asm, &a, &b).await;
         }
         drop(ops);
@@ -4426,6 +4508,327 @@ mod tests {
                     );
                     assert!(gets_topology(&mut a_vss).await, "A is C's policy peer");
                     assert!(gets_nothing(&mut b_vss).await);
+                })
+                .await;
+        }
+
+        // --- zl-zipline#268: a `down` direct link is proposed again, once, after a delay ---
+        //
+        // These tests run on paused time (`start_paused`): the runtime jumps the clock
+        // whenever every task is idle, so the production [config::LINK_REPROPOSE_DELAY]
+        // costs no wall time and each wait below is exact.
+
+        /// Node B's capnp handle, as [build_with] makes A's.
+        fn b_handle(asm: &Arc<Assembly>) -> vsapi::v_s_handle::Client {
+            capnp_rpc::new_client(VSHandleImpl::new(
+                asm.clone(),
+                make_node_actor_defexp(NODE_B, "node-b", "[fd5a:5052::102]:1234"),
+            ))
+        }
+
+        /// A and B both report their A-B link up, so the router routes over it.
+        async fn ab_reported_up(
+            asm: &Assembly,
+            a: &vsapi::v_s_handle::Client,
+            b: &vsapi::v_s_handle::Client,
+        ) {
+            assert_eq!(
+                send_report(a, &[entry("node-b", LinkState::Up)]).await,
+                Ok(())
+            );
+            assert_eq!(
+                send_report(b, &[entry("node-a", LinkState::Up)]).await,
+                Ok(())
+            );
+            assert!(
+                asm.topo_mgr
+                    .link_up(&NODE_A.parse().unwrap(), &NODE_B.parse().unwrap())
+            );
+        }
+
+        /// True if `rx` receives nothing for just under [config::LINK_REPROPOSE_DELAY],
+        /// then a `SetTopology` within a second after it.
+        async fn gets_topology_after_the_delay(
+            rx: &mut tokio::sync::mpsc::Receiver<crate::vss::VssCmd>,
+        ) -> bool {
+            let early = config::LINK_REPROPOSE_DELAY - Duration::from_millis(100);
+            if tokio::time::timeout(early, rx.recv()).await.is_ok() {
+                return false;
+            }
+            gets_topology(rx).await
+        }
+
+        /// True if nothing reaches `rx` for twice [config::LINK_REPROPOSE_DELAY].
+        async fn gets_nothing_past_the_delay(
+            rx: &mut tokio::sync::mpsc::Receiver<crate::vss::VssCmd>,
+        ) -> bool {
+            tokio::time::timeout(config::LINK_REPROPOSE_DELAY * 2, rx.recv())
+                .await
+                .is_err()
+        }
+
+        /// One end's `down` sends `setTopology` to both ends once the delay has passed,
+        /// and not before; the send happens with the topology guard free.
+        #[tokio::test(start_paused = true)]
+        async fn down_report_re_proposes_the_link_to_both_ends_after_the_delay() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, a) = build_with(true, R13A_PORT).await;
+                    let b = b_handle(&asm);
+                    ab_reported_up(&asm, &a, &b).await;
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+
+                    assert_eq!(
+                        send_report(&a, &[entry("node-b", LinkState::Down)]).await,
+                        Ok(())
+                    );
+
+                    assert!(gets_topology_after_the_delay(&mut a_vss).await, "A is told");
+                    assert!(gets_topology(&mut b_vss).await, "B is told");
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(1), asm.topo_mgr.ops())
+                            .await
+                            .is_ok(),
+                        "the send does not hold the topology guard"
+                    );
+                    assert!(gets_nothing_past_the_delay(&mut a_vss).await, "only once");
+                    assert!(gets_nothing_past_the_delay(&mut b_vss).await, "only once");
+                })
+                .await;
+        }
+
+        /// Repeated `down` snapshots from one end, and the other end's own `down`, while
+        /// a re-proposal is pending give one send per end.
+        #[tokio::test(start_paused = true)]
+        async fn down_reports_during_the_delay_are_coalesced() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, a) = build_with(true, R13A_PORT).await;
+                    let b = b_handle(&asm);
+                    ab_reported_up(&asm, &a, &b).await;
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+
+                    assert_eq!(
+                        send_report(&a, &[entry("node-b", LinkState::Down)]).await,
+                        Ok(())
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    assert_eq!(
+                        send_report(&a, &[entry("node-b", LinkState::Down)]).await,
+                        Ok(())
+                    );
+                    assert_eq!(
+                        send_report(&b, &[entry("node-a", LinkState::Down)]).await,
+                        Ok(())
+                    );
+
+                    // The first report's re-proposal is due 1 s before a full delay from now.
+                    assert!(
+                        matches!(
+                            tokio::time::timeout(config::LINK_REPROPOSE_DELAY, a_vss.recv()).await,
+                            Ok(Some(crate::vss::VssCmd::SetTopology(..)))
+                        ),
+                        "A is told"
+                    );
+                    assert!(gets_topology(&mut b_vss).await, "B is told");
+                    assert!(
+                        gets_nothing_past_the_delay(&mut a_vss).await,
+                        "one send to A"
+                    );
+                    assert!(
+                        gets_nothing_past_the_delay(&mut b_vss).await,
+                        "one send to B"
+                    );
+                })
+                .await;
+        }
+
+        /// The owner's attempt after the re-proposal fails: its `failed` report marks the
+        /// pair (R13a) and nothing more is sent. The retry is bounded.
+        #[tokio::test(start_paused = true)]
+        async fn failed_after_the_re_proposal_sends_nothing_more() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, a) = build_with(true, R13A_PORT).await;
+                    let b = b_handle(&asm);
+                    ab_reported_up(&asm, &a, &b).await;
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+                    assert_eq!(
+                        send_report(&a, &[entry("node-b", LinkState::Down)]).await,
+                        Ok(())
+                    );
+                    assert_eq!(
+                        send_report(&b, &[entry("node-a", LinkState::Down)]).await,
+                        Ok(())
+                    );
+                    assert!(gets_topology_after_the_delay(&mut a_vss).await);
+                    assert!(gets_topology(&mut b_vss).await);
+
+                    a_reports_b_failed(&asm, &a).await;
+
+                    assert!(gets_nothing_past_the_delay(&mut a_vss).await);
+                    assert!(gets_nothing_past_the_delay(&mut b_vss).await);
+                })
+                .await;
+        }
+
+        /// A pair marked failed while the re-proposal is pending (an attempt from some
+        /// other trigger failed) is not proposed again: rule 13a wins.
+        #[tokio::test(start_paused = true)]
+        async fn pair_failed_during_the_delay_is_not_re_proposed() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, a) = build_with(true, R13A_PORT).await;
+                    let b = b_handle(&asm);
+                    ab_reported_up(&asm, &a, &b).await;
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+                    assert_eq!(
+                        send_report(&a, &[entry("node-b", LinkState::Down)]).await,
+                        Ok(())
+                    );
+                    a_reports_b_failed(&asm, &a).await;
+
+                    assert!(gets_nothing_past_the_delay(&mut a_vss).await);
+                    assert!(gets_nothing_past_the_delay(&mut b_vss).await);
+                })
+                .await;
+        }
+
+        /// A link policy no longer declares when the delay ends is not proposed again.
+        #[tokio::test(start_paused = true)]
+        async fn link_removed_from_policy_during_the_delay_is_not_re_proposed() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, a) = build_with(true, R13A_PORT).await;
+                    let b = b_handle(&asm);
+                    ab_reported_up(&asm, &a, &b).await;
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+                    assert_eq!(
+                        send_report(&a, &[entry("node-b", LinkState::Down)]).await,
+                        Ok(())
+                    );
+
+                    // The new policy keeps only A-C.
+                    let (node_a, node_c): (IpAddr, IpAddr) =
+                        (NODE_A.parse().unwrap(), NODE_C.parse().unwrap());
+                    let without_ab = libeval::policy::Policy::new_from_policy_bytes(
+                        bytes::Bytes::from(policy_with_peerings_and_node_cns(
+                            &[make_peering(node_a, node_c, "link-ac", vec![])],
+                            &[(node_a, "node-a")],
+                        )),
+                    )
+                    .unwrap();
+                    asm.policy_mgr.set_current_snapshot_for_tests(
+                        &crate::policy_mgr::PolicySnapshot::for_tests(Arc::new(without_ab), vec![]),
+                    );
+
+                    assert!(gets_nothing_past_the_delay(&mut a_vss).await);
+                    assert!(gets_nothing_past_the_delay(&mut b_vss).await);
+                })
+                .await;
+        }
+
+        /// An end with no live VSS worker when the delay ends means no send to either
+        /// end: that end is rejoining, and its session start proposes its links again.
+        #[tokio::test(start_paused = true)]
+        async fn end_without_a_live_vss_worker_gets_no_re_proposal_nor_does_the_other() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, a) = build_with(true, R13A_PORT).await;
+                    let b = b_handle(&asm);
+                    ab_reported_up(&asm, &a, &b).await;
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let b_vss = capture_vss(&asm, NODE_B);
+                    assert_eq!(
+                        send_report(&a, &[entry("node-b", LinkState::Down)]).await,
+                        Ok(())
+                    );
+                    drop(b_vss); // B's worker is gone: its command channel is closed.
+
+                    assert!(gets_nothing_past_the_delay(&mut a_vss).await);
+                })
+                .await;
+        }
+
+        /// A link that is up again when the delay ends is left alone.
+        #[tokio::test(start_paused = true)]
+        async fn link_up_again_before_the_delay_ends_is_not_re_proposed() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, a) = build_with(true, R13A_PORT).await;
+                    let b = b_handle(&asm);
+                    ab_reported_up(&asm, &a, &b).await;
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+                    assert_eq!(
+                        send_report(&a, &[entry("node-b", LinkState::Down)]).await,
+                        Ok(())
+                    );
+                    ab_reported_up(&asm, &a, &b).await;
+
+                    assert!(gets_nothing_past_the_delay(&mut a_vss).await);
+                    assert!(gets_nothing_past_the_delay(&mut b_vss).await);
+                })
+                .await;
+        }
+
+        /// A relay link is not re-proposed: the endpoint redials its initial link itself
+        /// (rule 11), and its rejoin proposes its links again.
+        #[tokio::test(start_paused = true)]
+        async fn relay_link_down_is_not_re_proposed() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, a) = build_with(true, R13A_PORT).await;
+                    let b = b_handle(&asm);
+                    ab_reported_up(&asm, &a, &b).await;
+                    asm.actor_mgr
+                        .hack_set_vs_docking_node(&NODE_A.parse().unwrap())
+                        .await
+                        .unwrap();
+                    assert!(crate::visa_bootstrap::is_relay(
+                        &asm,
+                        &NODE_A.parse().unwrap()
+                    ));
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+                    assert_eq!(
+                        send_report(&b, &[entry("node-a", LinkState::Down)]).await,
+                        Ok(())
+                    );
+
+                    assert!(gets_nothing_past_the_delay(&mut a_vss).await);
+                    assert!(gets_nothing_past_the_delay(&mut b_vss).await);
+                })
+                .await;
+        }
+
+        /// Each time the link comes up and goes down again it earns one more re-proposal.
+        #[tokio::test(start_paused = true)]
+        async fn down_after_a_recovery_is_re_proposed_again() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, a) = build_with(true, R13A_PORT).await;
+                    let b = b_handle(&asm);
+                    ab_reported_up(&asm, &a, &b).await;
+                    let mut a_vss = capture_vss(&asm, NODE_A);
+                    let mut b_vss = capture_vss(&asm, NODE_B);
+                    for round in 0..2 {
+                        assert_eq!(
+                            send_report(&a, &[entry("node-b", LinkState::Down)]).await,
+                            Ok(())
+                        );
+                        assert!(
+                            gets_topology_after_the_delay(&mut a_vss).await,
+                            "round {round}: A is told"
+                        );
+                        assert!(gets_topology(&mut b_vss).await, "round {round}: B is told");
+                        ab_reported_up(&asm, &a, &b).await;
+                    }
                 })
                 .await;
         }
