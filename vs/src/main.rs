@@ -546,9 +546,52 @@ async fn main() -> std::process::ExitCode {
 /// currently held by another instance" until it expires. A failure is logged
 /// and otherwise ignored: the process exits either way.
 async fn release_instance_lock(db: &dyn DbConnection, desc: &LockDescriptor) {
-    match db.release_lock(desc).await {
-        Ok(_) => info!(target: MAIN, "released visa service lock"),
-        Err(e) => warn!(target: MAIN, "failed to release visa service lock: {e}"),
+    release_lock_within(db.release_lock(desc), LOCK_RELEASE_TIMEOUT).await;
+}
+
+/// How long an error exit waits for ValKey to answer the instance lock
+/// release (zl-zipline#266, review round 2).
+///
+/// The release is best effort, and the exit must not depend on it: if ValKey
+/// stays connected but stops answering, an unbounded wait would keep `vs`
+/// running, and its supervisor could not restart it. The redis crate's own
+/// response timeout (500 ms by default) usually ends the wait sooner, but a
+/// reconnect can take several seconds, and that bound is an implicit crate
+/// default, so the exit path sets its own. 5 s is ten times a normal reply
+/// and still short beside `VALKEY_LOCK_TIMEOUT` (90 s), the time a lock that
+/// was not released takes to expire.
+const LOCK_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The outcome of one attempt to release the instance lock.
+#[derive(Debug, PartialEq, Eq)]
+enum LockRelease {
+    /// ValKey answered: the lock is released (or was no longer ours).
+    Released,
+    /// ValKey answered with an error.
+    Failed,
+    /// ValKey did not answer within the deadline.
+    TimedOut,
+}
+
+/// Wait for `release` (a `release_lock` call) for at most `deadline`, and
+/// log the outcome: success at `info!`, an error or a timeout at `warn!` as
+/// a failed release. `deadline` is a parameter so that a test can pass any
+/// value; production passes [LOCK_RELEASE_TIMEOUT].
+async fn release_lock_within<F>(release: F, deadline: std::time::Duration) -> LockRelease
+where
+    F: std::future::Future<Output = db::DbResult<bool>>,
+{
+    // RED (zl-zipline#266, review round 2): the deadline is not applied yet.
+    let _ = deadline;
+    match release.await {
+        Ok(_) => {
+            info!(target: MAIN, "released visa service lock");
+            LockRelease::Released
+        }
+        Err(e) => {
+            warn!(target: MAIN, "failed to release visa service lock: {e}");
+            LockRelease::Failed
+        }
     }
 }
 
@@ -1066,5 +1109,49 @@ mod restore_tests {
             "the visa through C is revoked"
         );
         assert!(!revoked.contains(&a_to_b), "a visa not through C is kept");
+    }
+}
+
+/// zl-zipline#266, review round 2 (Copilot): the best-effort release of the
+/// instance lock on an error exit must not wait for ever on a ValKey that
+/// stays connected but stops answering.
+#[cfg(test)]
+mod lock_release_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A release that never gets an answer (ValKey connected but silent)
+    /// ends at the deadline as `TimedOut`, so `vs` goes on to exit.
+    #[tokio::test]
+    async fn release_that_never_answers_ends_at_the_deadline() {
+        let silent = std::future::pending::<db::DbResult<bool>>();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            release_lock_within(silent, Duration::from_millis(100)),
+        )
+        .await
+        .expect("the release must give up at its deadline, not hang");
+        assert_eq!(outcome, LockRelease::TimedOut);
+    }
+
+    /// A release that ValKey answers is reported as such, and an error
+    /// answer as a failed release; neither waits for the deadline.
+    #[tokio::test]
+    async fn answered_release_reports_its_outcome() {
+        let ok = release_lock_within(async { Ok(true) }, Duration::from_secs(60)).await;
+        assert_eq!(ok, LockRelease::Released);
+        let err = release_lock_within(
+            async { Err(redis::RedisError::from((redis::ErrorKind::Io, "gone"))) },
+            Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(err, LockRelease::Failed);
+    }
+
+    /// The production deadline stays well under the lock timeout, so a
+    /// release that times out never costs more than the expiry it avoids.
+    #[test]
+    fn lock_release_timeout_is_short_beside_the_lock_timeout() {
+        assert!(LOCK_RELEASE_TIMEOUT < config::VALKEY_LOCK_TIMEOUT / 10);
     }
 }
