@@ -5609,3 +5609,101 @@ mod tests {
         }
     }
 }
+
+/// zl-zipline#266 (Q2): one bad client must not end or stall the VS-API
+/// accept loop. Before the fix the TLS handshake ran inline in the loop and
+/// its error was returned with `?`, so one client that failed its handshake
+/// (a port scan, a client that aborted mid-handshake) stopped the VS-API for
+/// the life of the process, and one client that never finished its handshake
+/// blocked `accept` for everyone.
+#[cfg(test)]
+mod accept_loop_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// How long a good client gets to finish its TLS handshake.
+    const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// Start `launch_capnp` on a fresh 127.0.0.1 listener inside the current
+    /// LocalSet. Returns the address and the server task.
+    async fn start_vsapi() -> (
+        SocketAddr,
+        tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error>>>,
+    ) {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::task::spawn_local(launch_capnp(asm, listener));
+        (addr, server)
+    }
+
+    /// Connect to `addr` and complete a TLS handshake, within the deadline.
+    async fn tls_handshake(addr: SocketAddr) -> Result<(), String> {
+        let attempt = async {
+            let sock = tokio::net::TcpStream::connect(addr)
+                .await
+                .map_err(|e| format!("TCP connect: {e}"))?;
+            crate::vss_worker::tls_connect()
+                .connect(addr.ip().into(), sock)
+                .await
+                .map_err(|e| format!("TLS handshake: {e}"))?;
+            Ok(())
+        };
+        tokio::time::timeout(HANDSHAKE_DEADLINE, attempt)
+            .await
+            .unwrap_or_else(|_| Err(format!("no TLS handshake within {HANDSHAKE_DEADLINE:?}")))
+    }
+
+    /// A client that sends garbage instead of a ClientHello fails its
+    /// handshake; the next client still completes one, and the server task
+    /// is still running.
+    #[tokio::test]
+    async fn accept_loop_survives_a_failed_tls_handshake() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (addr, server) = start_vsapi().await;
+
+                let mut bad = tokio::net::TcpStream::connect(addr).await.unwrap();
+                bad.write_all(b"GET / HTTP/1.0\r\n\r\nthis is not a TLS ClientHello")
+                    .await
+                    .unwrap();
+                // Wait for the server to give up on this client (EOF or reset).
+                let mut buf = [0u8; 256];
+                let _ = tokio::time::timeout(HANDSHAKE_DEADLINE, async {
+                    while matches!(bad.read(&mut buf).await, Ok(n) if n > 0) {}
+                })
+                .await;
+                drop(bad);
+
+                tls_handshake(addr).await.unwrap_or_else(|e| {
+                    panic!("a good client must still be served after a bad handshake: {e}")
+                });
+                assert!(
+                    !server.is_finished(),
+                    "the VS-API accept loop must keep running after a bad handshake"
+                );
+            })
+            .await;
+    }
+
+    /// A client that connects and never sends a ClientHello does not block
+    /// the handshake of the next client.
+    #[tokio::test]
+    async fn accept_loop_not_blocked_by_a_stalled_handshake() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (addr, server) = start_vsapi().await;
+
+                let stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+                tls_handshake(addr).await.unwrap_or_else(|e| {
+                    panic!("a stalled client must not block the next handshake: {e}")
+                });
+                assert!(!server.is_finished());
+                drop(stalled);
+            })
+            .await;
+    }
+}
