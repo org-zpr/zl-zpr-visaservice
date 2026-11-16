@@ -469,19 +469,36 @@ async fn main() -> std::process::ExitCode {
         (Ok(v), Ok(a)) => (v, a),
         (Err(e), _) | (_, Err(e)) => {
             error!(target: MAIN, "{e}");
+            // Stop the lock renewal before the release, so it cannot take the
+            // lock again. The LocalSet must run for its tasks to be stopped.
+            local_set.run_until(js.shutdown()).await;
             release_instance_lock(asm.state_db.as_ref(), &vslock_desc).await;
             return std::process::ExitCode::FAILURE;
         }
     };
-    js.spawn_local(vsapi_worker::launch(asm.clone(), vsapi_listener));
+
+    // zl-zipline#266: the listener tasks are kept apart from `js`. If either
+    // one ends, the service stops (see `listeners::supervise` below).
+    let mut listener_tasks: Vec<listeners::ListenerTask> = Vec::new();
+    listener_tasks.push((
+        listeners::ListenerRole::VsApi,
+        tokio::task::spawn_local(vsapi_worker::launch(asm.clone(), vsapi_listener)),
+    ));
 
     {
         let admin_key = cfg.core.admin_key.clone();
         let admin_cert = cfg.core.admin_cert.clone();
         let admin_asm = asm.clone();
-        js.spawn_local(async move {
-            start_admin_server(&admin_key, &admin_cert, admin_listener, &admin_asm).await;
-        });
+        // The admin accept loop retries its errors and never returns; it
+        // ends only by a panic (for example an unreadable cert file), which
+        // `supervise` reports.
+        listener_tasks.push((
+            listeners::ListenerRole::Admin,
+            tokio::task::spawn_local(async move {
+                start_admin_server(&admin_key, &admin_cert, admin_listener, &admin_asm).await;
+                Ok(())
+            }),
+        ));
     }
 
     js.spawn_local(visareq_worker::launch_arena(
@@ -506,13 +523,18 @@ async fn main() -> std::process::ExitCode {
     // TODO: Setup/launch the workers for the visa service. Those that will do the actual work
     // of generating visas, and all the housekeeping.
 
-    local_set
-        .run_until(async {
-            while let Some(res) = js.join_next().await {
-                res.unwrap();
-            }
-        })
+    // Run until a listener ends (zl-zipline#266). A visa service without its
+    // VS-API or admin listener must not keep running: stop the other tasks,
+    // release the instance lock so a supervisor's restart is not refused,
+    // and exit with a failure status.
+    let listener_exit = local_set
+        .run_until(listeners::supervise(listener_tasks, &mut js, || {
+            release_instance_lock(asm.state_db.as_ref(), &vslock_desc)
+        }))
         .await;
+    if listener_exit.is_some() {
+        return std::process::ExitCode::FAILURE;
+    }
 
     info!(target: MAIN, "exiting");
     std::process::ExitCode::SUCCESS

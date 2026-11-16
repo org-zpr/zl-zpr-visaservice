@@ -29,6 +29,7 @@ use crate::counters::CounterType;
 use crate::error::ServiceError;
 use crate::event_mgr::VsEvent;
 use crate::link_state::validate_snapshot;
+use crate::listeners::{ListenerError, ListenerRole};
 use crate::logging::targets::API;
 use crate::login_nonce::MintError;
 use crate::net_mgr;
@@ -138,12 +139,27 @@ pub async fn launch_capnp(
     }
 }
 
-/// Run the VS-API on `listener` until it fails, and log the failure.
-pub async fn launch(asm: Arc<Assembly>, listener: tokio::net::TcpListener) {
-    match launch_capnp(asm.clone(), listener).await {
-        Ok(()) => (),
-        Err(e) => error!(target: API, "VSAPI capnp error: {}", e),
-    };
+/// Run the VS-API on `listener` until it stops (zl-zipline#266). It stops
+/// only on an error, which is returned so that `main` can stop the service.
+pub async fn launch(
+    asm: Arc<Assembly>,
+    listener: tokio::net::TcpListener,
+) -> Result<(), ListenerError> {
+    let addr = listener
+        .local_addr()
+        .map_err(|e| ListenerError::stopped(ListenerRole::VsApi, unknown_addr(), e))?;
+    launch_capnp(asm.clone(), listener).await.map_err(|e| {
+        ListenerError::stopped(
+            ListenerRole::VsApi,
+            addr,
+            std::io::Error::other(e.to_string()),
+        )
+    })
+}
+
+/// Placeholder address for an error on a listener whose address is unknown.
+fn unknown_addr() -> SocketAddr {
+    SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 0)
 }
 
 // This function creates a certificate, and the clients will not require verification of the

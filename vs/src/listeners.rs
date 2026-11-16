@@ -206,8 +206,64 @@ where
     R: FnOnce() -> Fut,
     Fut: Future<Output = ()>,
 {
-    let _ = (listeners, others, release);
-    todo!("zl-zipline#266: supervise")
+    if listeners.is_empty() {
+        while let Some(res) = others.join_next().await {
+            res.unwrap();
+        }
+        return None;
+    }
+
+    // Kept so the listeners that are still running can be stopped too.
+    let aborts: Vec<_> = listeners.iter().map(|(_, h)| h.abort_handle()).collect();
+    let mut any_listener = futures::future::select_all(
+        listeners
+            .into_iter()
+            .map(|(role, handle)| Box::pin(async move { (role, handle.await) })),
+    );
+
+    let (role, result) = loop {
+        tokio::select! {
+            ((role, result), _, _) = &mut any_listener => break (role, result),
+            // A finished task is not a reason to stop; a panicked one panics
+            // the caller, as `main`'s join loop always has. When `others` is
+            // empty this branch is disabled and only the listeners govern.
+            Some(res) = others.join_next() => res.unwrap(),
+        }
+    };
+
+    let exit = ListenerExit {
+        role,
+        reason: describe_listener_end(result),
+    };
+    error!(target: MAIN, "{exit}; the visa service stops");
+    for abort in aborts {
+        abort.abort();
+    }
+    // Stop the lock renewal (and everything else) BEFORE the release, so no
+    // renewal can take the lock again after it was released.
+    others.shutdown().await;
+    release().await;
+    Some(exit)
+}
+
+/// Say how a listener task ended: its error, a plain return, or a panic.
+fn describe_listener_end(
+    result: Result<Result<(), ListenerError>, tokio::task::JoinError>,
+) -> String {
+    match result {
+        Ok(Ok(())) => "it returned without an error".to_string(),
+        Ok(Err(e)) => e.to_string(),
+        Err(e) if e.is_panic() => {
+            let payload = e.into_panic();
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".to_string());
+            format!("its task panicked: {msg}")
+        }
+        Err(_) => "its task was cancelled".to_string(),
+    }
 }
 
 #[cfg(test)]
