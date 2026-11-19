@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
+use libeval::actor::Actor;
 use libeval::attribute::{ROLE_ADAPTER, key};
 
 mod actor_attributes;
@@ -465,9 +466,11 @@ async fn main() -> std::process::ExitCode {
     // visa service's own ZPR address (`vs_addr`) is used both ways: the
     // VS-API and admin listeners are bound to it at startup (above), and every
     // outbound VSS connection binds it as its source (`vss_worker::connect_from`).
+    let vs_addr = cfg.get_vs_addr();
     let listening = match listen_after_self_authorize(
         reserved,
-        self_authorize(asm.clone(), &cfg.get_vs_addr()),
+        authenticate_self(asm.clone(), vs_addr),
+        |actor| persist_self(asm.clone(), vs_addr, actor),
         SELF_AUTHORIZE_TIMEOUT,
     )
     .await
@@ -618,14 +621,26 @@ where
     }
 }
 
-/// The longest time startup waits for the visa service to authorize itself
-/// (zl-zipline#285). Self-authorization runs before the VS-API and admin
-/// sockets listen, so a hang there would otherwise leave a process that never
-/// listens and never exits. When the limit expires, `vs` releases its
+/// The longest time startup waits for the visa service to authenticate
+/// itself (zl-zipline#285). Self-authorization runs before the VS-API and
+/// admin sockets listen, so a hang there would otherwise leave a process that
+/// never listens and never exits. When the limit expires, `vs` releases its
 /// instance lock and exits with a failure status, so a supervisor can restart
 /// it. The trusted-service attribute queries inside self-authorization have
 /// their own per-request limit (a policy value, 5 s by default); 30 s is six
 /// times that default.
+///
+/// The limit covers only the authentication phase ([authenticate_self]):
+/// the trusted-service queries, which can hang on the network, and which
+/// write nothing to ValKey. It does NOT cover the persistence phase
+/// ([persist_self]), which writes the actor record to ValKey (PR #74 review,
+/// Codex P2). Those writes are not cancellation-safe: `ActorRepo` cleans up a
+/// partial write only when the write returns its own error, so a write that a
+/// time-out drops part-way leaves partial actor and index state behind. The
+/// persistence phase cannot hang without end either: every ValKey command
+/// goes through the redis `ConnectionManager`, whose default response
+/// time-out (500 ms per command) and bounded reconnect (1 s connect time-out,
+/// 6 retries) end each command with an error, and the error runs the cleanup.
 const SELF_AUTHORIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Why self-authorization did not succeed (zl-zipline#285).
@@ -649,22 +664,33 @@ impl std::fmt::Display for SelfAuthError {
     }
 }
 
-/// Wait for `self_auth` (the [self_authorize] future) for at most `deadline`
-/// (zl-zipline#285). An error becomes [SelfAuthError::Failed]; when the
-/// deadline expires first, the future is dropped and the result is
-/// [SelfAuthError::TimedOut]. `deadline` is a parameter so that a test can
-/// pass any value; production passes [SELF_AUTHORIZE_TIMEOUT].
-async fn self_authorize_within<F>(
-    self_auth: F,
+/// Run the two phases of self-authorization (zl-zipline#285): wait for
+/// `authenticate` (the [authenticate_self] future) for at most `deadline`,
+/// then hand its result to `persist` (the [persist_self] step) and run that
+/// to its end, with no deadline.
+///
+/// Only the authentication is bounded, because only it can hang on the
+/// network and it writes nothing; persistence must never be dropped
+/// part-way (see [SELF_AUTHORIZE_TIMEOUT]). An error from either phase
+/// becomes [SelfAuthError::Failed]. When the deadline expires during the
+/// authentication, that future is dropped, persistence never starts, and the
+/// result is [SelfAuthError::TimedOut]. `deadline` is a parameter so that a
+/// test can pass any value; production passes [SELF_AUTHORIZE_TIMEOUT].
+async fn self_authorize_within<A, T, P, PF>(
+    authenticate: A,
+    persist: P,
     deadline: std::time::Duration,
 ) -> Result<(), SelfAuthError>
 where
-    F: std::future::Future<Output = Result<(), ServiceError>>,
+    A: std::future::Future<Output = Result<T, ServiceError>>,
+    P: FnOnce(T) -> PF,
+    PF: std::future::Future<Output = Result<(), ServiceError>>,
 {
-    match tokio::time::timeout(deadline, self_auth).await {
-        Ok(res) => res.map_err(SelfAuthError::Failed),
-        Err(_) => Err(SelfAuthError::TimedOut(deadline)),
-    }
+    let authenticated = match tokio::time::timeout(deadline, authenticate).await {
+        Ok(res) => res.map_err(SelfAuthError::Failed)?,
+        Err(_) => return Err(SelfAuthError::TimedOut(deadline)),
+    };
+    persist(authenticated).await.map_err(SelfAuthError::Failed)
 }
 
 /// Why startup could not bring up the VS-API and admin listeners
@@ -710,20 +736,24 @@ fn display_local_addr(addr: std::io::Result<std::net::SocketAddr>) -> String {
 /// succeeds, a client gets "connection refused", and a supervisor that waits
 /// for the port does not start the next component too early.
 /// Self-authorization does not use either listener, so the order adds no
-/// dependency. `self_auth` is the [self_authorize] future, bounded by
-/// `deadline` (see [self_authorize_within]). On any error the reserved
-/// sockets are dropped, so the ports never listen.
-async fn listen_after_self_authorize<F>(
+/// dependency. `authenticate` and `persist` are the two phases of
+/// self-authorization; only `authenticate` is bounded by `deadline` (see
+/// [self_authorize_within]). On any error the reserved sockets are dropped,
+/// so the ports never listen.
+async fn listen_after_self_authorize<A, T, P, PF>(
     reserved: listeners::ReservedListeners,
-    self_auth: F,
+    authenticate: A,
+    persist: P,
     deadline: std::time::Duration,
 ) -> Result<Listening, StartupError>
 where
-    F: std::future::Future<Output = Result<(), ServiceError>>,
+    A: std::future::Future<Output = Result<T, ServiceError>>,
+    P: FnOnce(T) -> PF,
+    PF: std::future::Future<Output = Result<(), ServiceError>>,
 {
     // Self-authorize first. Until this returns Ok, the reserved sockets do
     // not listen, so a client gets "connection refused".
-    self_authorize_within(self_auth, deadline)
+    self_authorize_within(authenticate, persist, deadline)
         .await
         .map_err(StartupError::SelfAuth)?;
     let vsapi = listeners::start_listening(listeners::ListenerRole::VsApi, reserved.vsapi)
@@ -794,22 +824,39 @@ async fn create_actor_mgr(
 // One idea is to query our local ph (via ph-cli) and get the substrate address of
 // the docking node.  We can use that to find the node record.
 //
-async fn self_authorize(asm: Arc<Assembly>, vs_addr: &IpAddr) -> Result<(), ServiceError> {
-    let mut claims = Vec::new();
-    claims.push(Claim::new(key::ZPR_ADDR.into(), vs_addr.to_string()));
-    claims.push(Claim::new(key::CN.into(), config::VS_CN.into()));
-    claims.push(Claim::new(key::ROLE.into(), ROLE_ADAPTER.into()));
+// Self-authorization has two phases, so that startup can bound the first and
+// never cancel the second (PR #74 review, Codex P2; see SELF_AUTHORIZE_TIMEOUT):
+// [authenticate_self] and then [persist_self].
 
-    let actor = asm
-        .cc
-        .authenticate_visa_service(asm.clone(), claims)
-        .await?;
+/// Phase 1 of self-authorization: authenticate the visa service's own
+/// adapter actor at `vs_addr`, run it through the current policy,
+/// and return the actor. This queries the trusted services and reads the
+/// actor store, but writes nothing to ValKey, so dropping it part-way (at
+/// the startup deadline) leaves no partial state.
+async fn authenticate_self(asm: Arc<Assembly>, vs_addr: IpAddr) -> Result<Actor, ServiceError> {
+    let claims = vec![
+        Claim::new(key::ZPR_ADDR.into(), vs_addr.to_string()),
+        Claim::new(key::CN.into(), config::VS_CN.into()),
+        Claim::new(key::ROLE.into(), ROLE_ADAPTER.into()),
+    ];
+    asm.cc.authenticate_visa_service(asm.clone(), claims).await
+}
 
+/// Phase 2 of self-authorization: store the actor from [authenticate_self]
+/// as the visa service's adapter, replacing any record at its address, and
+/// queue the "actor joins" event for `vs_addr`. The store write is not
+/// cancellation-safe, so startup runs this to its end and never drops it.
+/// A failure to queue the event is logged and does not fail the step.
+async fn persist_self(
+    asm: Arc<Assembly>,
+    vs_addr: IpAddr,
+    actor: Actor,
+) -> Result<(), ServiceError> {
     asm.actor_mgr
         .hack_add_adapter_no_node(&actor, &asm.policy_service_names())
         .await?;
 
-    let evt = VsEvent::ActorJoins(vs_addr.clone());
+    let evt = VsEvent::ActorJoins(vs_addr);
     if let Err(e) = asm.event_mgr.record_event(evt).await {
         warn!(target: MAIN, "failed to record actor joins event for adapter {:?}: {}", actor.get_cn(), e);
     }
@@ -1314,6 +1361,13 @@ mod lock_release_tests {
     }
 }
 
+/// A persistence step that stores nothing and succeeds at once, for the
+/// self-authorization tests that look only at the authentication phase.
+#[cfg(test)]
+async fn persist_nothing(_: ()) -> Result<(), ServiceError> {
+    Ok(())
+}
+
 /// zl-zipline#285: self-authorization has a time limit, so a hang there
 /// cannot leave a visa service that never listens and never exits.
 #[cfg(test)]
@@ -1326,7 +1380,8 @@ mod self_authorize_within_tests {
     /// A self-authorization that succeeds is `Ok`.
     #[tokio::test]
     async fn successful_self_authorization_is_ok() {
-        let res = self_authorize_within(async { Ok(()) }, Duration::from_secs(60)).await;
+        let res =
+            self_authorize_within(async { Ok(()) }, persist_nothing, Duration::from_secs(60)).await;
         assert!(res.is_ok(), "{res:?}");
     }
 
@@ -1335,6 +1390,7 @@ mod self_authorize_within_tests {
     async fn failed_self_authorization_keeps_its_error() {
         let res = self_authorize_within(
             async { Err(ServiceError::AuthenticationFailed("no such actor".into())) },
+            persist_nothing,
             Duration::from_secs(60),
         )
         .await;
@@ -1356,7 +1412,7 @@ mod self_authorize_within_tests {
         let start = tokio::time::Instant::now();
         let res = tokio::time::timeout(
             Duration::from_secs(3),
-            self_authorize_within(std::future::pending(), limit),
+            self_authorize_within(std::future::pending(), persist_nothing, limit),
         )
         .await
         .expect("self-authorization must give up at its deadline, not hang");
@@ -1384,20 +1440,13 @@ mod self_authorize_within_tests {
             tokio::time::sleep(Duration::from_millis(40)).await;
             Ok::<(), ServiceError>(())
         };
-        let persist = async move {
+        let persist = |()| async move {
             tokio::time::sleep(Duration::from_millis(40)).await;
             done.store(true, Ordering::SeqCst);
             Ok::<(), ServiceError>(())
         };
         let start = tokio::time::Instant::now();
-        let res = self_authorize_within(
-            async move {
-                authenticate.await?;
-                persist.await
-            },
-            limit,
-        )
-        .await;
+        let res = self_authorize_within(authenticate, persist, limit).await;
         assert!(
             res.is_ok(),
             "persistence past the deadline must finish: {res:?}"
@@ -1416,15 +1465,13 @@ mod self_authorize_within_tests {
         let limit = Duration::from_millis(50);
         let persisted = Arc::new(AtomicBool::new(false));
         let done = persisted.clone();
-        let persist = async move {
+        let persist = |()| async move {
             done.store(true, Ordering::SeqCst);
             Ok::<(), ServiceError>(())
         };
         let res = self_authorize_within(
-            async move {
-                std::future::pending::<Result<(), ServiceError>>().await?;
-                persist.await
-            },
+            std::future::pending::<Result<(), ServiceError>>(),
+            persist,
             limit,
         )
         .await;
@@ -1436,6 +1483,23 @@ mod self_authorize_within_tests {
             !persisted.load(Ordering::SeqCst),
             "persistence must not start"
         );
+    }
+
+    /// A persistence step that fails is `Failed`, with its error kept, even
+    /// when it ends after the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn failed_persistence_keeps_its_error() {
+        let persist = |()| async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Err(ServiceError::Internal("store write failed".into()))
+        };
+        let res = self_authorize_within(async { Ok(()) }, persist, Duration::from_millis(50)).await;
+        match res {
+            Err(SelfAuthError::Failed(ServiceError::Internal(msg))) => {
+                assert_eq!(msg, "store write failed")
+            }
+            other => panic!("expected Failed(Internal), got {other:?}"),
+        }
     }
 
     /// The production limit is above the default trusted-service query limit
@@ -1493,6 +1557,7 @@ mod listen_after_self_authorize_tests {
         let startup = tokio::spawn(listen_after_self_authorize(
             reserved,
             self_auth,
+            persist_nothing,
             Duration::from_secs(60),
         ));
 
@@ -1526,7 +1591,12 @@ mod listen_after_self_authorize_tests {
             std::future::pending::<Result<(), ServiceError>>().await
         };
         let limit = Duration::from_millis(200);
-        let startup = tokio::spawn(listen_after_self_authorize(reserved, self_auth, limit));
+        let startup = tokio::spawn(listen_after_self_authorize(
+            reserved,
+            self_auth,
+            persist_nothing,
+            limit,
+        ));
 
         started_rx.await.expect("self-authorization must start");
         assert_refused(vsapi_addr, "VS-API").await;
@@ -1552,15 +1622,19 @@ mod listen_after_self_authorize_tests {
     #[tokio::test]
     async fn slow_persistence_still_leads_to_listening() {
         let (reserved, vsapi_addr, admin_addr) = reserve_loopback();
-        let self_auth = async {
-            // Authentication: immediate. Persistence: slower than the limit.
+        let authenticate = async { Ok::<(), ServiceError>(()) };
+        let persist = |()| async {
             tokio::time::sleep(Duration::from_millis(300)).await;
             Ok::<(), ServiceError>(())
         };
-        let listening =
-            listen_after_self_authorize(reserved, self_auth, Duration::from_millis(100))
-                .await
-                .expect("slow persistence must not time out startup");
+        let listening = listen_after_self_authorize(
+            reserved,
+            authenticate,
+            persist,
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("slow persistence must not time out startup");
         assert_eq!(listening.vsapi.local_addr().unwrap(), vsapi_addr);
         assert_eq!(listening.admin.local_addr().unwrap(), admin_addr);
     }
@@ -1573,6 +1647,7 @@ mod listen_after_self_authorize_tests {
         let res = listen_after_self_authorize(
             reserved,
             async { Err(ServiceError::AuthenticationFailed("denied".into())) },
+            persist_nothing,
             Duration::from_secs(60),
         )
         .await;
