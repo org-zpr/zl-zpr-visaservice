@@ -653,6 +653,61 @@ where
     }
 }
 
+/// Why startup could not bring up the VS-API and admin listeners
+/// (zl-zipline#285): self-authorization did not succeed, or a reserved
+/// socket could not listen.
+#[derive(Debug)]
+enum StartupError {
+    /// Self-authorization failed or did not finish within its limit.
+    SelfAuth(SelfAuthError),
+    /// A reserved socket could not listen.
+    Listen(listeners::ListenerError),
+}
+
+impl std::fmt::Display for StartupError {
+    /// The one line of the underlying error.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartupError::SelfAuth(e) => write!(f, "{e}"),
+            StartupError::Listen(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// The VS-API and admin listeners, both listening.
+struct Listening {
+    vsapi: tokio::net::TcpListener,
+    admin: tokio::net::TcpListener,
+}
+
+/// Self-authorize the visa service, then start listening on the reserved
+/// VS-API and admin sockets (zl-zipline#285).
+///
+/// This order makes a listening port mean "ready": until self-authorization
+/// succeeds, a client gets "connection refused", and a supervisor that waits
+/// for the port does not start the next component too early.
+/// Self-authorization does not use either listener, so the order adds no
+/// dependency. `self_auth` is the [self_authorize] future, bounded by
+/// `deadline` (see [self_authorize_within]). On any error the reserved
+/// sockets are dropped, so the ports never listen.
+async fn listen_after_self_authorize<F>(
+    reserved: listeners::ReservedListeners,
+    self_auth: F,
+    deadline: std::time::Duration,
+) -> Result<Listening, StartupError>
+where
+    F: std::future::Future<Output = Result<(), ServiceError>>,
+{
+    let vsapi = listeners::start_listening(listeners::ListenerRole::VsApi, reserved.vsapi)
+        .map_err(StartupError::Listen)?;
+    let admin = listeners::start_listening(listeners::ListenerRole::Admin, reserved.admin)
+        .map_err(StartupError::Listen)?;
+    self_authorize_within(self_auth, deadline)
+        .await
+        .map_err(StartupError::SelfAuth)?;
+    Ok(Listening { vsapi, admin })
+}
+
 /// Load configuration from an explicit path, the default path, or fall back to defaults.
 fn load_config(explicit: Option<&std::path::Path>) -> Result<VSConfig, ServiceError> {
     match explicit {
@@ -1274,5 +1329,125 @@ mod self_authorize_within_tests {
     fn self_authorize_timeout_is_between_query_limit_and_lock_timeout() {
         assert!(SELF_AUTHORIZE_TIMEOUT > Duration::from_secs(5));
         assert!(SELF_AUTHORIZE_TIMEOUT < config::VALKEY_LOCK_TIMEOUT);
+    }
+}
+
+/// zl-zipline#285: the VS-API and admin ports listen only after
+/// self-authorization succeeds, so a listening port means "ready".
+#[cfg(test)]
+mod listen_after_self_authorize_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    /// Reserve a VS-API and an admin socket on free loopback ports, and
+    /// return them with their addresses.
+    fn reserve_loopback() -> (listeners::ReservedListeners, SocketAddr, SocketAddr) {
+        let reserved = listeners::ReservedListeners::bind("127.0.0.1".parse().unwrap(), 0, 0)
+            .expect("loopback sockets must bind");
+        let vsapi_addr = reserved.vsapi.local_addr().unwrap();
+        let admin_addr = reserved.admin.local_addr().unwrap();
+        (reserved, vsapi_addr, admin_addr)
+    }
+
+    /// Assert that a TCP connect to `addr` is refused (`what` names the port
+    /// in the failure message).
+    async fn assert_refused(addr: SocketAddr, what: &str) {
+        let res = tokio::net::TcpStream::connect(addr).await;
+        assert_eq!(
+            res.err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::ConnectionRefused),
+            "the {what} port {addr} must refuse connections"
+        );
+    }
+
+    /// While self-authorization runs, both ports refuse connections. After
+    /// it succeeds, both ports accept them.
+    #[tokio::test]
+    async fn ports_listen_only_after_self_authorization_succeeds() {
+        let (reserved, vsapi_addr, admin_addr) = reserve_loopback();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let self_auth = async move {
+            let _ = started_tx.send(());
+            gate_rx.await.expect("the test opens the gate");
+            Ok(())
+        };
+        let startup = tokio::spawn(listen_after_self_authorize(
+            reserved,
+            self_auth,
+            Duration::from_secs(60),
+        ));
+
+        started_rx.await.expect("self-authorization must start");
+        assert_refused(vsapi_addr, "VS-API").await;
+        assert_refused(admin_addr, "admin").await;
+
+        gate_tx.send(()).unwrap();
+        let listening = startup
+            .await
+            .unwrap()
+            .expect("startup must succeed after self-authorization");
+        assert_eq!(listening.vsapi.local_addr().unwrap(), vsapi_addr);
+        assert_eq!(listening.admin.local_addr().unwrap(), admin_addr);
+        tokio::net::TcpStream::connect(vsapi_addr)
+            .await
+            .expect("the VS-API port must accept after self-authorization");
+        tokio::net::TcpStream::connect(admin_addr)
+            .await
+            .expect("the admin port must accept after self-authorization");
+    }
+
+    /// A self-authorization that never finishes ends at the limit with the
+    /// time-out error, and neither port listens, then or after.
+    #[tokio::test]
+    async fn self_authorization_time_out_leaves_ports_closed() {
+        let (reserved, vsapi_addr, admin_addr) = reserve_loopback();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let self_auth = async move {
+            let _ = started_tx.send(());
+            std::future::pending::<Result<(), ServiceError>>().await
+        };
+        let limit = Duration::from_millis(200);
+        let startup = tokio::spawn(listen_after_self_authorize(reserved, self_auth, limit));
+
+        started_rx.await.expect("self-authorization must start");
+        assert_refused(vsapi_addr, "VS-API").await;
+        assert_refused(admin_addr, "admin").await;
+
+        let res = tokio::time::timeout(Duration::from_secs(5), startup)
+            .await
+            .expect("startup must give up at the self-authorization limit")
+            .unwrap();
+        match res {
+            Err(StartupError::SelfAuth(SelfAuthError::TimedOut(d))) => assert_eq!(d, limit),
+            Err(other) => panic!("expected a self-authorization time-out, got {other}"),
+            Ok(_) => panic!("expected a self-authorization time-out, got Ok"),
+        }
+        assert_refused(vsapi_addr, "VS-API").await;
+        assert_refused(admin_addr, "admin").await;
+    }
+
+    /// A self-authorization that fails returns its error, and neither port
+    /// listens.
+    #[tokio::test]
+    async fn self_authorization_failure_leaves_ports_closed() {
+        let (reserved, vsapi_addr, admin_addr) = reserve_loopback();
+        let res = listen_after_self_authorize(
+            reserved,
+            async { Err(ServiceError::AuthenticationFailed("denied".into())) },
+            Duration::from_secs(60),
+        )
+        .await;
+        match res {
+            Err(StartupError::SelfAuth(SelfAuthError::Failed(e))) => {
+                assert!(e.to_string().contains("denied"), "{e}")
+            }
+            Err(other) => panic!("expected a self-authorization failure, got {other}"),
+            Ok(_) => panic!("expected a self-authorization failure, got Ok"),
+        }
+        assert_refused(vsapi_addr, "VS-API").await;
+        assert_refused(admin_addr, "admin").await;
     }
 }
