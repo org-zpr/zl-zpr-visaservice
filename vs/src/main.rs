@@ -604,6 +604,52 @@ where
     }
 }
 
+/// The longest time startup waits for the visa service to authorize itself
+/// (zl-zipline#285). Self-authorization runs before the VS-API and admin
+/// sockets listen, so a hang there would otherwise leave a process that never
+/// listens and never exits. When the limit expires, `vs` releases its
+/// instance lock and exits with a failure status, so a supervisor can restart
+/// it. The trusted-service attribute queries inside self-authorization have
+/// their own per-request limit (a policy value, 5 s by default); 30 s is six
+/// times that default.
+const SELF_AUTHORIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why self-authorization did not succeed (zl-zipline#285).
+#[derive(Debug)]
+enum SelfAuthError {
+    /// Self-authorization finished with an error.
+    Failed(ServiceError),
+    /// Self-authorization did not finish within the limit (the value).
+    TimedOut(std::time::Duration),
+}
+
+impl std::fmt::Display for SelfAuthError {
+    /// One line for the operator: the error, or the limit that expired.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SelfAuthError::Failed(e) => write!(f, "self-authorization failed: {e}"),
+            SelfAuthError::TimedOut(limit) => {
+                write!(f, "self-authorization did not finish within {limit:?}")
+            }
+        }
+    }
+}
+
+/// Wait for `self_auth` (the [self_authorize] future) for at most `deadline`
+/// (zl-zipline#285). An error becomes [SelfAuthError::Failed]; when the
+/// deadline expires first, the future is dropped and the result is
+/// [SelfAuthError::TimedOut]. `deadline` is a parameter so that a test can
+/// pass any value; production passes [SELF_AUTHORIZE_TIMEOUT].
+async fn self_authorize_within<F>(
+    self_auth: F,
+    deadline: std::time::Duration,
+) -> Result<(), SelfAuthError>
+where
+    F: std::future::Future<Output = Result<(), ServiceError>>,
+{
+    self_auth.await.map_err(SelfAuthError::Failed)
+}
+
 /// Load configuration from an explicit path, the default path, or fall back to defaults.
 fn load_config(explicit: Option<&std::path::Path>) -> Result<VSConfig, ServiceError> {
     match explicit {
@@ -1162,5 +1208,68 @@ mod lock_release_tests {
     #[test]
     fn lock_release_timeout_is_short_beside_the_lock_timeout() {
         assert!(LOCK_RELEASE_TIMEOUT < config::VALKEY_LOCK_TIMEOUT / 10);
+    }
+}
+
+/// zl-zipline#285: self-authorization has a time limit, so a hang there
+/// cannot leave a visa service that never listens and never exits.
+#[cfg(test)]
+mod self_authorize_within_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A self-authorization that succeeds is `Ok`.
+    #[tokio::test]
+    async fn successful_self_authorization_is_ok() {
+        let res = self_authorize_within(async { Ok(()) }, Duration::from_secs(60)).await;
+        assert!(res.is_ok(), "{res:?}");
+    }
+
+    /// A self-authorization that fails is `Failed`, and the error is kept.
+    #[tokio::test]
+    async fn failed_self_authorization_keeps_its_error() {
+        let res = self_authorize_within(
+            async { Err(ServiceError::AuthenticationFailed("no such actor".into())) },
+            Duration::from_secs(60),
+        )
+        .await;
+        match res {
+            Err(SelfAuthError::Failed(ServiceError::AuthenticationFailed(msg))) => {
+                assert_eq!(msg, "no such actor")
+            }
+            other => panic!("expected Failed(AuthenticationFailed), got {other:?}"),
+        }
+    }
+
+    /// A self-authorization that never finishes ends at the deadline as
+    /// `TimedOut`, which carries the limit. The tokio clock is paused, so the
+    /// test measures the 50 ms on that clock and does not sleep. The outer
+    /// limit only turns a hang into a test failure.
+    #[tokio::test(start_paused = true)]
+    async fn self_authorization_that_never_finishes_times_out() {
+        let limit = Duration::from_millis(50);
+        let start = tokio::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(3),
+            self_authorize_within(std::future::pending(), limit),
+        )
+        .await
+        .expect("self-authorization must give up at its deadline, not hang");
+        match res {
+            Err(SelfAuthError::TimedOut(d)) => assert_eq!(d, limit),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        assert_eq!(start.elapsed(), limit);
+        let msg = SelfAuthError::TimedOut(limit).to_string();
+        assert!(msg.contains("50ms"), "{msg}");
+    }
+
+    /// The production limit is above the default trusted-service query limit
+    /// (5 s), so one slow query does not stop the service, and under the
+    /// lock timeout, so the service exits before its lock would expire.
+    #[test]
+    fn self_authorize_timeout_is_between_query_limit_and_lock_timeout() {
+        assert!(SELF_AUTHORIZE_TIMEOUT > Duration::from_secs(5));
+        assert!(SELF_AUTHORIZE_TIMEOUT < config::VALKEY_LOCK_TIMEOUT);
     }
 }
