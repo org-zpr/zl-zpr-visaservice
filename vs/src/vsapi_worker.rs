@@ -1848,10 +1848,22 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
                 config::VSS_START_DELAY,
             )
         };
-        if let Err(e) = start_result {
-            warn!(target: API, "failed to start VSS worker for node {:?}: {}", self.node.get_cn(), e);
-        }
+        let started = match start_result {
+            Ok(_) => true,
+            Err(e) => {
+                warn!(target: API, "failed to start VSS worker for node {:?}: {}", self.node.get_cn(), e);
+                false
+            }
+        };
         drop(ops);
+
+        // A node with no policy address is known by the relay's observation only while
+        // it has a live VSS worker (`vss_worker::known_substrate_addr`), so the topology
+        // its session start sent its peers could not name it. Its worker is live now:
+        // propose its links to its peers again (zl-zipline#264).
+        if started {
+            repropose_links_to_peers(&self.asm, node_zpr_addr, Vec::new());
+        }
 
         Ok(())
     }
@@ -5034,6 +5046,83 @@ mod tests {
                         Some(moved),
                         "B's address as the relay observed it"
                     );
+                })
+                .await;
+        }
+
+        /// netns zode-link-test and hosted review (Copilot): a node with no policy
+        /// address is known only by its observation, and only while it has a live VSS
+        /// worker, so the topology its session start sends its peers cannot name it yet.
+        /// Its `registerVss` starts the worker, so it proposes the link to its peers
+        /// again, now at the observed address.
+        #[tokio::test]
+        async fn register_vss_re_proposes_the_link_at_the_observed_address() {
+            use crate::core_visas::tests::{RELAY, VSS_PORT, ZODE, build_net_with_policy};
+            use crate::test_helpers::policy_with_peerings_cns_and_tcp_services;
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (relay, zode): (IpAddr, IpAddr) =
+                        (RELAY.parse().unwrap(), ZODE.parse().unwrap());
+                    // A direct link with no policy address at either end.
+                    let mut peering = make_peering(relay, zode, "link-rz", vec![]);
+                    peering.substrate_a = None;
+                    peering.substrate_b = None;
+                    let (asm, _, _) =
+                        build_net_with_policy(policy_with_peerings_cns_and_tcp_services(
+                            &[peering],
+                            &[(relay, "relay"), (zode, "zode")],
+                            &[("vsapi", config::VSAPI_PORT), ("vss", VSS_PORT)],
+                        ))
+                        .await;
+                    let mut relay_vss = capture_vss(&asm, RELAY);
+                    let observed = SocketAddr::new("192.0.2.20".parse().unwrap(), R13A_PORT);
+                    asm.observed_substrate.insert(zode, observed);
+                    // The Zode's session has started; it has no VSS worker yet (a join).
+                    reopen(&asm, ZODE, "zode").await;
+                    let _ = tokio::time::timeout(Duration::from_secs(1), relay_vss.recv()).await;
+
+                    let node = asm
+                        .actor_mgr
+                        .get_actor_by_zpr_addr(&zode)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let handle: vsapi::v_s_handle::Client =
+                        capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), node));
+                    let mut req = handle.register_vss_request();
+                    {
+                        let mut sa = req.get().init_addr();
+                        zode.write_to(&mut sa.reborrow().init_addr());
+                        sa.set_port(VSS_PORT);
+                    }
+                    let resp = req.send().promise.await.unwrap();
+                    assert!(
+                        matches!(
+                            resp.get().unwrap().get_res().unwrap().which().unwrap(),
+                            vsapi::result::Which::Ok(_)
+                        ),
+                        "registerVss succeeds"
+                    );
+
+                    // The relay is also pushed the VSS visa's ingress copy; skip that.
+                    let topology = tokio::time::timeout(Duration::from_secs(1), async {
+                        loop {
+                            match relay_vss.recv().await {
+                                Some(crate::vss::VssCmd::SetTopology(psnap, _)) => return psnap,
+                                Some(_) => continue,
+                                None => std::future::pending().await,
+                            }
+                        }
+                    })
+                    .await;
+                    let Ok(psnap) = topology else {
+                        panic!("the Zode's registerVss sends the relay topology again");
+                    };
+                    let links = crate::vss_worker::proposed_links(&asm, &psnap, &relay)
+                        .await
+                        .unwrap();
+                    assert_eq!(links.len(), 1, "{links:?}");
+                    assert_eq!(links[0].peer.clone().map(SocketAddr::from), Some(observed));
                 })
                 .await;
         }
