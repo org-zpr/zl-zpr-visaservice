@@ -1434,7 +1434,7 @@ async fn add_revoke(
 
 /// Stringify a substrate address as a parseable `host:port`. IPv6 hosts get bracketed
 /// (`[fd5a:5052::1]:5000`); IPv4 and hostname forms are left plain. An address that policy
-/// does not give (`None`: the node reports its own, zl-zipline#225) is the empty string,
+/// does not give (`None`: the relay observes it, zl-zipline#264) is the empty string,
 /// which no parser of this API can mistake for an address.
 fn stringify_netaddr(addr: Option<&NetAddr>) -> String {
     match addr {

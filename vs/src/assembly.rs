@@ -35,6 +35,16 @@ pub struct Assembly {
     pub topo_mgr: TopologyMgr,
     pub ts_mgr: Arc<TrustedServicesMgr>,
     pub deny_log: DenyLog,
+    /// The relay's observation of each joiner's substrate address, by the joiner's ZPR
+    /// address: the source of the joiner's initial link, as the relay's socket saw it
+    /// (zl-zipline#264). Written when `requestBootstrapVisas` is granted
+    /// ([crate::visa_bootstrap::request_bootstrap_visas]), under the issuance and topology
+    /// locks; read by [crate::connection_control::substrate_addr_for].
+    ///
+    /// In memory only, overwritten by each request for that address, and bounded by the
+    /// relay's policy peers (the request refuses any other CN). A restart forgets it; the
+    /// node actor's persisted claim stands in until the next rejoin observes again.
+    pub observed_substrate: dashmap::DashMap<std::net::IpAddr, std::net::SocketAddr>,
 }
 
 impl Assembly {
@@ -187,6 +197,7 @@ pub mod tests {
             topo_mgr: TopologyMgr::new(LinkRepo::new(db_handle)),
             ts_mgr,
             deny_log: Default::default(),
+            observed_substrate: Default::default(),
         };
         asm.policy_mgr.bind_topology_lock(asm.topo_mgr.ops_lock());
         (asm, event_rx, db_handle_for_tests)

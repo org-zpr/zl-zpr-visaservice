@@ -885,21 +885,17 @@ pub(crate) async fn proposed_links(
 }
 
 /// The known substrate address of `node` (plan p37 rule 3): `policy_addr`, its
-/// DNS-resolved policy address, if policy declares one; else the `SUBSTRATE_ADDR`
-/// claim of its VS-API session, the stored node actor (a node with no stored node actor
-/// has no session; see `core_visas::require_current_session`). Nothing else: `None`
+/// DNS-resolved policy address, if policy declares one; else the `SUBSTRATE_ADDR` claim
+/// on its stored node actor ([crate::connection_control::substrate_claim]), but only
+/// while it has a live VS-API session, that is a live VSS worker. Nothing else: `None`
 /// means unknown.
 ///
-/// A rejoin (`visa_bootstrap::end_previous_join`) ends a session but keeps the node actor,
-/// so its claim stays known until the node's next `connect` or `open` replaces it.
-/// ponytail: in that window a direct peer may be proposed the old address; the dial fails
-/// and the pair falls to R13a, cleared by that next session start. Mark ended sessions on
-/// the actor if the window ever matters.
-///
-/// The claim was checked when it was recorded (`accept_reported_substrate`). Trusting it
-/// steers only where a peer dials; the link still needs the node's CA-signed
-/// certificate with the expected CN. Whether a Zode can misuse the address it reports
-/// is zl-zipline#264.
+/// The claim is policy's address or the relay's observation of the node's initial link,
+/// never the node's own word (`connection_control::substrate_addr_for`, zl-zipline#264).
+/// An observation goes stale once its node is gone: a Zode that vanished without
+/// rejoining may have lost that IP to someone else (DHCP or CGNAT reassignment), and
+/// peers must not be pointed at the new holder. A rejoin replaces the claim when the
+/// relay asks for the joiner's bootstrap visas, before its next session starts.
 async fn known_substrate_addr(
     asm: &Assembly,
     policy_addr: Option<SocketAddr>,
@@ -908,31 +904,13 @@ async fn known_substrate_addr(
     if policy_addr.is_some() {
         return Ok(policy_addr);
     }
-    let Some(actor) = asm.actor_mgr.get_actor_by_zpr_addr(node).await? else {
-        return Ok(None);
-    };
-    if !actor.is_node() {
+    if !asm.vss_mgr.has_live_worker(node) {
         return Ok(None);
     }
-    let Some(claim) = actor
-        .get_attribute(libeval::attribute::key::SUBSTRATE_ADDR)
-        .and_then(|attr| attr.get_single_value().ok())
-    else {
-        return Ok(None);
-    };
-    // A claim that names no place to dial is not a known address. It is not an error
-    // either: it would not change on a retry, and failing would withhold every link of
-    // the topology, the relay link too. Claims recorded by VS-API `connect`/`open` always
-    // parse; a bare IP comes from an adapter-path connect (`authorize_connect`).
-    match claim.parse::<SocketAddr>() {
-        Ok(addr) if crate::connection_control::require_dialable_substrate(addr).is_ok() => {
-            Ok(Some(addr))
-        }
-        _ => {
-            warn!(target: VSS, "node {node}: stored substrate address {claim:?} is not a dialable address; treated as unknown");
-            Ok(None)
-        }
-    }
+    Ok(match asm.actor_mgr.get_actor_by_zpr_addr(node).await? {
+        Some(actor) if actor.is_node() => crate::connection_control::substrate_claim(&actor),
+        _ => None,
+    })
 }
 
 /// The candidate `Link`s of `node_addr`'s topology message: one per resolved peer, each
@@ -1181,7 +1159,7 @@ mod tests {
 
         /// The relay: the visa service docks on it. Policy declares its address.
         const R: &str = "fd5a:5052:3000::1";
-        /// Endpoints with no address in policy: they report their own when they connect.
+        /// Endpoints with no address in policy: the relay observes theirs when they join.
         const A: &str = "fd5a:5052:3000::a";
         const B: &str = "fd5a:5052:3000::b";
         /// Nodes whose address policy declares.
@@ -1244,7 +1222,8 @@ mod tests {
             (Arc::new(asm), db)
         }
 
-        /// `node` starts a VS-API session that reported `substrate`.
+        /// `node` starts a VS-API session whose stored substrate address claim is
+        /// `substrate`, with a live VSS worker.
         async fn connect(asm: &Assembly, node: &str, substrate: &str) {
             asm.actor_mgr
                 .add_node(
@@ -1254,6 +1233,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            asm.vss_mgr.insert_test_handle(ip(node), tx);
+            std::mem::forget(rx);
+        }
+
+        /// `node`'s VS-API session ends without a rejoin: its VSS worker exits (its
+        /// command channel closes), and its node actor stays stored.
+        fn end_session(asm: &Assembly, node: &str) {
+            let (tx, _closed) = tokio::sync::mpsc::channel(1);
+            asm.vss_mgr.insert_test_handle(ip(node), tx);
         }
 
         /// `node`'s proposed links, by peer ZPR address: `peer -> Link.peer`.
@@ -1278,10 +1267,10 @@ mod tests {
             assert_eq!(relay.get(&ip(B)), Some(&None), "{relay:?}");
         }
 
-        /// Once the joiner connects, the relay's link to it names its reported address,
+        /// Once the joiner connects, the relay's link to it names its stored address,
         /// and the joiner's link to the relay names the relay's policy address.
         #[tokio::test]
-        async fn a_relay_link_names_the_joiners_reported_address_once_it_connects() {
+        async fn a_relay_link_names_the_joiners_stored_address_once_it_connects() {
             let (asm, _db) = build().await;
             connect(&asm, A, "192.0.2.10:7000").await;
             assert_eq!(
@@ -1307,10 +1296,10 @@ mod tests {
             assert!(b.contains_key(&ip(R)), "B's relay link stays: {b:?}");
         }
 
-        /// A direct link with both ends' reported addresses known is proposed to both
+        /// A direct link with both ends' stored addresses known is proposed to both
         /// ends, each naming the other's address.
         #[tokio::test]
-        async fn a_direct_link_with_both_ends_reported_names_the_other_end() {
+        async fn a_direct_link_with_both_ends_known_names_the_other_end() {
             let (asm, _db) = build().await;
             connect(&asm, A, "192.0.2.10:7000").await;
             connect(&asm, B, "198.51.100.20:7001").await;
@@ -1378,11 +1367,33 @@ mod tests {
             }
         }
 
+        /// No stale observations (zl-zipline#264): once a node's session ends without a
+        /// rejoin, its stored address is no longer known. Its peer may hold that IP now
+        /// (DHCP, CGNAT), so the direct link is left out and the relay link has no `peer`.
+        /// A policy address is unaffected.
+        #[tokio::test]
+        async fn a_stored_address_is_unknown_once_the_session_ends() {
+            let (asm, _db) = build().await;
+            connect(&asm, A, "192.0.2.10:7000").await;
+            connect(&asm, B, "198.51.100.20:7001").await;
+            connect(&asm, C, "192.0.2.99:1").await;
+            end_session(&asm, A);
+            end_session(&asm, C);
+            let b = links_of(&asm, B).await;
+            assert!(!b.contains_key(&ip(A)), "{b:?}");
+            assert_eq!(links_of(&asm, R).await.get(&ip(A)), Some(&None));
+            assert_eq!(
+                links_of(&asm, R).await.get(&ip(C)),
+                Some(&Some(sa("[fd5a:5052:3000::c]:7003")))
+            );
+        }
+
         /// A session lookup that fails is an error, never a guessed or missing address:
         /// the send fails and the topology stays unsynced, so the worker retries it.
         #[tokio::test]
         async fn a_failed_lookup_fails_the_topology() {
             let (asm, db) = build().await;
+            connect(&asm, A, "192.0.2.10:7000").await;
             db.set_exists_fault(FaultMode::Reject);
             let psnap = asm.policy_mgr.get_current_snapshot();
             assert!(proposed_links(&asm, &psnap, &ip(R)).await.is_err());

@@ -433,12 +433,10 @@ impl ConnectionControl {
     ///
     /// See https://github.com/org-zpr/zpr-visaservice/issues/205
     ///
-    /// `reported_substrate` is the substrate address the node advertised in its connect
-    /// params (the address peers dial). When policy topology also declares a substrate for
-    /// this node the two must agree; when it declares none (e.g. a single-node deploy with
-    /// no peerings) the reported value is used as-is. Either way the resolved value becomes
-    /// the node's `key::SUBSTRATE_ADDR` claim -- there is no longer a TCP-peer-address
-    /// fallback (see https://github.com/org-zpr/zpr-visaservice/issues/299).
+    /// The node's `key::SUBSTRATE_ADDR` claim (the address peers dial) is
+    /// [substrate_addr_for]: policy's, else the relay's observation, else the stored
+    /// claim. The node never supplies it (zl-zipline#264). With none, the node gets no
+    /// claim.
     ///
     pub async fn authenticate_node(
         &self,
@@ -448,7 +446,6 @@ impl ConnectionControl {
         cn: &str,
         challenge_response: &[u8],
         node_req_addr: IpAddr,
-        reported_substrate: SocketAddr,
         a2a_dh_pubkey: Option<&PublicKey>,
     ) -> Result<Actor, ServiceError> {
         // Massage this node authentication request into something that looks like a generic
@@ -456,11 +453,10 @@ impl ConnectionControl {
 
         let mut authd_claims: Vec<Attribute> = Vec::new();
 
-        // The node's substrate address: policy's, if it declares one (the report must
-        // match), else the reported one (plan §7 check 3, zl-zipline#255).
-        let substrate_addr = accept_reported_substrate(&asm, &node_req_addr, reported_substrate)?;
-        authd_claims
-            .push(Attribute::builder(key::SUBSTRATE_ADDR).value(substrate_addr.to_string()));
+        if let Some(substrate_addr) = substrate_addr_for(&asm, &node_req_addr).await? {
+            authd_claims
+                .push(Attribute::builder(key::SUBSTRATE_ADDR).value(substrate_addr.to_string()));
+        }
         match a2a_dh_pubkey.and_then(a2a_dh_pubkey_claim) {
             Some(attr) => authd_claims.push(attr),
             None => warn!(target: CC, "node {cn} sent no usable A2A DH public key"),
@@ -2464,6 +2460,9 @@ impl ConnectionControl {
                 // the pool: addresses are recycled, and a later actor at this address
                 // must not inherit them.
                 asm.ts_mgr.forget_actor_revisions(&zpr_addr);
+                // Its relay observation goes too: the node is gone, and its next join
+                // through the relay records a new one (zl-zipline#264).
+                asm.observed_substrate.remove(&zpr_addr);
             }
             Err(e) => {
                 // Caller can't do anything with this. So just log and continue.
@@ -2551,43 +2550,70 @@ pub fn substrate_addr_from_topology(
     None
 }
 
-/// The substrate address to record for the node at `node_addr`, which reported
-/// `reported` (the address its peers should dial). The one rule for every path that
-/// records it -- `authenticate_node` (`connect`) and `open` (zl-zipline#255):
+/// The substrate address to record for the node at `node_addr`: the one rule `connect`
+/// ([ConnectionControl::authenticate_node]) and `open` share (zl-zipline#264). The node
+/// itself never supplies it. In order:
 ///
-/// - a report that names no place to dial -- an unspecified IP or port 0 -- is a
-///   [ServiceError::Param] ([require_dialable_substrate]); there is no fallback;
-/// - policy declares an address for the node ([substrate_addr_from_topology]): the
-///   report must equal it, or this is a [ServiceError::Param];
-/// - policy declares none -- no peerings at all, or links whose end for this node has
-///   no address (a laptop endpoint that changes networks, zl-zipline#225) -- the
-///   reported address stands (plan §7 check 3).
+/// 1. policy's address, if policy declares one ([substrate_addr_from_topology]). The
+///    operator signs it, so it overrides an observation that is wrong (a NAT that does
+///    not keep the forwarded port for outbound traffic, a multi-homed server). A
+///    differing observation is logged, so an operator can spot that case;
+/// 2. else the relay's observation of the node's initial link
+///    ([Assembly::observed_substrate]);
+/// 3. else the claim already on the node's stored actor ([substrate_claim]). An earlier
+///    observation of the same initial link put it there: when the visa service refuses
+///    `open`, the Zode falls back to `connect` over that link without a new bootstrap
+///    request, and a visa service restart forgets the observations. A rejoin replaces
+///    the claim ([crate::visa_bootstrap::request_bootstrap_visas]);
+/// 4. else none: the node gets no claim and no direct links (rule 13b). That is what a
+///    relay or a lone node needs, so it is not an error.
 ///
-/// The address is then fixed for the session: it changes only by a new `connect` or
-/// `open`.
-///
-/// Trusting the report steers only where peers dial: a link still needs the peer's
-/// CA-signed certificate with the expected CN, so a wrong address yields a failed
-/// link, not an impersonation. Whether a Zode can misuse the address it reports is
-/// zl-zipline#264.
-pub fn accept_reported_substrate(
+/// Errors only if the actor lookup fails.
+pub async fn substrate_addr_for(
     asm: &Assembly,
     node_addr: &IpAddr,
-    reported: SocketAddr,
-) -> Result<SocketAddr, ServiceError> {
-    require_dialable_substrate(reported)?;
-    match substrate_addr_from_topology(&asm.policy_mgr.get_current_snapshot(), node_addr) {
-        Some(declared) if declared != reported => Err(ServiceError::Param(format!(
-            "substrate address mismatch: policy declares {declared}, node reported {reported}"
-        ))),
-        Some(declared) => Ok(declared),
-        None => Ok(reported),
+) -> Result<Option<SocketAddr>, ServiceError> {
+    let observed = asm.observed_substrate.get(node_addr).map(|entry| *entry);
+    if let Some(declared) =
+        substrate_addr_from_topology(&asm.policy_mgr.get_current_snapshot(), node_addr)
+    {
+        if let Some(observed) = observed.filter(|observed| *observed != declared) {
+            info!(target: CC, "node {node_addr}: policy declares substrate address {declared}; the relay observed {observed}");
+        }
+        return Ok(Some(declared));
+    }
+    if observed.is_some() {
+        return Ok(observed);
+    }
+    Ok(
+        match asm.actor_mgr.get_actor_by_zpr_addr(node_addr).await? {
+            Some(actor) if actor.is_node() => substrate_claim(&actor),
+            _ => None,
+        },
+    )
+}
+
+/// The dialable substrate address in `actor`'s `key::SUBSTRATE_ADDR` claim, or `None`.
+///
+/// A claim that names no place to dial is treated as no claim, with a warning: it would
+/// not change on a retry. Claims recorded by VS-API `connect`/`open` always parse; a bare
+/// IP comes from an adapter-path connect (`authorize_connect`).
+pub fn substrate_claim(actor: &Actor) -> Option<SocketAddr> {
+    let claim = actor
+        .get_attribute(key::SUBSTRATE_ADDR)
+        .and_then(|attr| attr.get_single_value().ok())?;
+    match claim.parse::<SocketAddr>() {
+        Ok(addr) if require_dialable_substrate(addr).is_ok() => Some(addr),
+        _ => {
+            warn!(target: CC, "node {:?}: stored substrate address {claim:?} is not a dialable address; treated as unknown", actor.get_zpr_addr());
+            None
+        }
     }
 }
 
-/// Refuse a reported substrate address that names no place to dial: an unspecified IP
-/// (`0.0.0.0`, `::`, or the IPv4-mapped `::ffff:0.0.0.0`) or port 0. The visa service
-/// cannot check that an address is reachable, but it can refuse one that never is.
+/// Refuse a substrate address that names no place to dial: an unspecified IP (`0.0.0.0`,
+/// `::`, or the IPv4-mapped `::ffff:0.0.0.0`) or port 0. The visa service cannot check
+/// that an address is reachable, but it can refuse one that never is.
 pub fn require_dialable_substrate(reported: SocketAddr) -> Result<(), ServiceError> {
     if reported.ip().to_canonical().is_unspecified() || reported.port() == 0 {
         return Err(ServiceError::Param(format!(
@@ -3003,7 +3029,6 @@ mod tests {
                 "unknown.zpr",
                 &[],
                 "fd5a:5052::1".parse().unwrap(),
-                "127.0.0.1:1234".parse().unwrap(),
                 None,
             )
             .await;
@@ -3033,7 +3058,6 @@ mod tests {
                 cn,
                 b"not-a-valid-rsa-sig",
                 "fd5a:5052::1".parse().unwrap(),
-                "127.0.0.1:1234".parse().unwrap(),
                 None,
             )
             .await;
@@ -3061,7 +3085,6 @@ mod tests {
                 cn,
                 &bad_sig,
                 "fd5a:5052::1".parse().unwrap(),
-                "127.0.0.1:1234".parse().unwrap(),
                 None,
             )
             .await;
@@ -3179,7 +3202,6 @@ mod tests {
                 cn,
                 &sig,
                 "fd5a:5052::1".parse().unwrap(),
-                "127.0.0.1:1234".parse().unwrap(),
                 None,
             )
             .await;
@@ -3264,7 +3286,6 @@ mod tests {
                 cn,
                 &sig,
                 "fd5a:5052::1".parse().unwrap(),
-                "127.0.0.1:1234".parse().unwrap(),
                 None,
             )
             .await
@@ -3294,10 +3315,31 @@ mod tests {
         );
     }
 
-    /// With no topology entry for the node, the reported substrate address is stored
-    /// as the node's `key::SUBSTRATE_ADDR` claim (no TCP-peer fallback exists anymore).
+    /// The `key::SUBSTRATE_ADDR` claim of a node at `node`, authenticated through
+    /// [ConnectionControl::authenticate_node] under `asm`'s policy as `cn`, whose key
+    /// `privkey` policy allows; `None` if it has none.
+    async fn substrate_claim_after_connect(
+        asm: Arc<Assembly>,
+        cn: &str,
+        privkey: &PKey<Private>,
+        node: IpAddr,
+    ) -> Option<String> {
+        let challenge = b"my-challenge";
+        let timestamp = unix_now();
+        let sig = sign_node_challenge(privkey, timestamp, cn, challenge);
+        let actor = make_cc("test-vs")
+            .authenticate_node(asm, challenge, timestamp, cn, &sig, node, None)
+            .await
+            .expect("authentication should succeed");
+        actor
+            .get_attribute(key::SUBSTRATE_ADDR)
+            .map(|attr| attr.get_value()[0].clone())
+    }
+
+    /// zl-zipline#264: with no policy address for the node, the relay's observation of
+    /// its initial link becomes its `key::SUBSTRATE_ADDR` claim.
     #[tokio::test]
-    async fn authenticate_node_no_topology_stores_reported_substrate() {
+    async fn authenticate_node_stores_the_relays_observation() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         let cn = "test-node.zpr";
         let (privkey, pubkey_der) = gen_rsa_test_keypair();
@@ -3305,69 +3347,37 @@ mod tests {
             .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
             .await
             .unwrap();
-        let cc = make_cc("test-vs");
-        let challenge = b"my-challenge";
-        let timestamp = unix_now();
-        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
-        let reported: SocketAddr = "192.0.2.10:7000".parse().unwrap();
+        let node: IpAddr = "fd5a:5052::1".parse().unwrap();
+        let observed: SocketAddr = "192.0.2.10:7000".parse().unwrap();
+        asm.observed_substrate.insert(node, observed);
 
-        let actor = cc
-            .authenticate_node(
-                asm,
-                challenge,
-                timestamp,
-                cn,
-                &sig,
-                "fd5a:5052::1".parse().unwrap(),
-                reported,
-                None,
-            )
-            .await
-            .expect("authentication should succeed");
-
-        let stored = actor
-            .get_attribute(key::SUBSTRATE_ADDR)
-            .expect("substrate addr claim must be present")
-            .get_value()[0]
-            .clone();
-        assert_eq!(stored, reported.to_string());
+        let claim = substrate_claim_after_connect(asm, cn, &privkey, node).await;
+        assert_eq!(claim, Some(observed.to_string()));
     }
 
-    /// When policy topology declares a substrate for the node and the node reports a
-    /// different one, authentication fails with a param error.
+    /// zl-zipline#264: with no policy address and no observation (a relay, which joins
+    /// through no one), the node authenticates with no `key::SUBSTRATE_ADDR` claim, and
+    /// its node record stores without one.
     #[tokio::test]
-    async fn authenticate_node_topology_mismatch_is_param_error() {
-        use crate::test_helpers::make_peering;
-
+    async fn authenticate_node_with_no_known_address_has_no_claim() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         let cn = "test-node.zpr";
         let (privkey, pubkey_der) = gen_rsa_test_keypair();
-        let a: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
-        let b: IpAddr = "fd5a:5052:90de:1::2".parse().unwrap();
-        // make_peering declares each node's own address (port 0) as its substrate.
-        let peering = make_peering(a, b, "link-ab", vec![]);
         asm.policy_mgr
-            .update_policy_from_container_bytes(make_policy_with_node_join_and_peering(
-                cn,
-                &pubkey_der,
-                &peering,
-            ))
+            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
             .await
             .unwrap();
-        let cc = make_cc("test-vs");
+        let node: IpAddr = "fd5a:5052::1".parse().unwrap();
         let challenge = b"my-challenge";
         let timestamp = unix_now();
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
-        let reported: SocketAddr = "192.0.2.10:7000".parse().unwrap(); // != policy's [b]:0
-
-        let result = cc
-            .authenticate_node(asm, challenge, timestamp, cn, &sig, b, reported, None)
-            .await;
-        assert!(
-            matches!(result, Err(ServiceError::Param(_))),
-            "expected param error, got {:?}",
-            result
-        );
+        let actor = make_cc("test-vs")
+            .authenticate_node(asm, challenge, timestamp, cn, &sig, node, None)
+            .await
+            .expect("a node with no known address authenticates");
+        assert!(actor.get_attribute(key::SUBSTRATE_ADDR).is_none());
+        let record = crate::db::Node::new_from_node_actor(&actor).expect("its node record stores");
+        assert_eq!(record.substrate_addr, None);
     }
 
     /// A peering of `a` and `b` whose policy substrate address for each node is its own
@@ -3385,211 +3395,92 @@ mod tests {
         peering
     }
 
-    /// Reported substrate addresses that name no place to dial (zl-zipline#255): an
-    /// unspecified IP, IPv4 or IPv6 (also the IPv4-mapped form), or port 0.
-    fn unusable_substrate_addrs() -> Vec<SocketAddr> {
-        [
-            "0.0.0.0:7000",
-            "[::]:7000",
-            "[::ffff:0.0.0.0]:7000",
-            "192.0.2.10:0",
-            "[fd5a:5052:90de:1::2]:0",
-        ]
-        .iter()
-        .map(|s| s.parse().unwrap())
-        .collect()
-    }
-
-    /// Plan §7 check 3 (zl-zipline#255): policy declares links for the node but no
-    /// substrate address for it (a laptop endpoint). The node's reported address is
-    /// accepted and becomes its `key::SUBSTRATE_ADDR` claim.
+    /// zl-zipline#264: policy's address wins over the relay's observation, and becomes the
+    /// node's claim.
     #[tokio::test]
-    async fn authenticate_node_declared_links_without_substrate_accepts_reported() {
-        use crate::test_helpers::make_peering;
-
-        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
-        let cn = "test-node.zpr";
-        let (privkey, pubkey_der) = gen_rsa_test_keypair();
-        let relay: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
-        let laptop: IpAddr = "fd5a:5052:90de:1::2".parse().unwrap();
-        let mut peering = make_peering(relay, laptop, "link-relay-laptop", vec![]);
-        peering.substrate_b = None; // the laptop reports its own
-        asm.policy_mgr
-            .update_policy_from_container_bytes(make_policy_with_node_join_and_peering(
-                cn,
-                &pubkey_der,
-                &peering,
-            ))
-            .await
-            .unwrap();
-        let cc = make_cc("test-vs");
-        let challenge = b"my-challenge";
-        let timestamp = unix_now();
-        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
-        let reported: SocketAddr = "192.0.2.10:7000".parse().unwrap();
-
-        let actor = cc
-            .authenticate_node(asm, challenge, timestamp, cn, &sig, laptop, reported, None)
-            .await
-            .expect("a node with links but no declared substrate authenticates");
-        let stored = actor
-            .get_attribute(key::SUBSTRATE_ADDR)
-            .expect("substrate addr claim must be present")
-            .get_value()[0]
-            .clone();
-        assert_eq!(stored, reported.to_string());
-    }
-
-    /// zl-zipline#255: `connect` refuses a reported substrate address that names no
-    /// place to dial (an unspecified IP or port 0) with a param error, both for a node
-    /// with links but no declared address and for a node with no peering at all.
-    #[tokio::test]
-    async fn authenticate_node_rejects_an_unusable_reported_substrate() {
-        use crate::test_helpers::make_peering;
-
-        let cn = "test-node.zpr";
-        let (privkey, pubkey_der) = gen_rsa_test_keypair();
-        let relay: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
-        let laptop: IpAddr = "fd5a:5052:90de:1::2".parse().unwrap();
-        let unpeered: IpAddr = "fd5a:5052:90de:1::9".parse().unwrap();
-        let mut peering = make_peering(relay, laptop, "link-relay-laptop", vec![]);
-        peering.substrate_b = None;
-        for node in [laptop, unpeered] {
-            for reported in unusable_substrate_addrs() {
-                let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
-                asm.policy_mgr
-                    .update_policy_from_container_bytes(make_policy_with_node_join_and_peering(
-                        cn,
-                        &pubkey_der,
-                        &peering,
-                    ))
-                    .await
-                    .unwrap();
-                let cc = make_cc("test-vs");
-                let challenge = b"my-challenge";
-                let timestamp = unix_now();
-                let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
-                let result = cc
-                    .authenticate_node(asm, challenge, timestamp, cn, &sig, node, reported, None)
-                    .await;
-                assert!(
-                    matches!(result, Err(ServiceError::Param(_))),
-                    "{node} reporting {reported}: expected param error, got {result:?}"
-                );
-            }
-        }
-    }
-
-    /// [accept_reported_substrate] is the one rule every path that records a node's
-    /// substrate address uses: policy's address when it declares one (the report must
-    /// match), the reported one otherwise.
-    #[tokio::test]
-    async fn accept_reported_substrate_follows_policy_when_it_declares_one() {
-        let asm = crate::assembly::tests::new_assembly_for_tests(None).await;
-        let (_privkey, pubkey_der) = gen_rsa_test_keypair();
-        let relay: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
-        let laptop: IpAddr = "fd5a:5052:90de:1::2".parse().unwrap();
-        let unpeered: IpAddr = "fd5a:5052:90de:1::9".parse().unwrap();
-        let mut peering = peering_with_substrate_port(relay, laptop, 7001);
-        peering.substrate_b = None;
-        asm.policy_mgr
-            .update_policy_from_container_bytes(make_policy_with_node_join_and_peering(
-                "test-node.zpr",
-                &pubkey_der,
-                &peering,
-            ))
-            .await
-            .unwrap();
-        let reported: SocketAddr = "192.0.2.10:7000".parse().unwrap();
-
-        // Declared: the relay's own address, port 7001.
-        let declared = SocketAddr::new(relay, 7001);
-        assert_eq!(
-            accept_reported_substrate(&asm, &relay, declared).unwrap(),
-            declared
-        );
-        assert!(matches!(
-            accept_reported_substrate(&asm, &relay, reported),
-            Err(ServiceError::Param(_))
-        ));
-        // Links but no declared address, and no peering at all: the report stands.
-        assert_eq!(
-            accept_reported_substrate(&asm, &laptop, reported).unwrap(),
-            reported
-        );
-        assert_eq!(
-            accept_reported_substrate(&asm, &unpeered, reported).unwrap(),
-            reported
-        );
-    }
-
-    /// zl-zipline#255: an unspecified IP or port 0 is a param error whatever policy
-    /// says about the node -- declared, links without an address, or no peering.
-    /// There is no fallback.
-    #[tokio::test]
-    async fn accept_reported_substrate_rejects_an_unspecified_ip_or_port_0() {
-        let asm = crate::assembly::tests::new_assembly_for_tests(None).await;
-        let (_privkey, pubkey_der) = gen_rsa_test_keypair();
-        let relay: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
-        let laptop: IpAddr = "fd5a:5052:90de:1::2".parse().unwrap();
-        let unpeered: IpAddr = "fd5a:5052:90de:1::9".parse().unwrap();
-        let mut peering = peering_with_substrate_port(relay, laptop, 7001);
-        peering.substrate_b = None;
-        asm.policy_mgr
-            .update_policy_from_container_bytes(make_policy_with_node_join_and_peering(
-                "test-node.zpr",
-                &pubkey_der,
-                &peering,
-            ))
-            .await
-            .unwrap();
-        for node in [relay, laptop, unpeered] {
-            for reported in unusable_substrate_addrs() {
-                let result = accept_reported_substrate(&asm, &node, reported);
-                assert!(
-                    matches!(result, Err(ServiceError::Param(_))),
-                    "{node} reporting {reported}: expected param error, got {result:?}"
-                );
-            }
-        }
-    }
-
-    /// When policy topology declares a substrate and the node reports the same value,
-    /// authentication succeeds and that value is stored.
-    #[tokio::test]
-    async fn authenticate_node_topology_match_succeeds() {
+    async fn authenticate_node_prefers_policy_over_the_observation() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         let cn = "test-node.zpr";
         let (privkey, pubkey_der) = gen_rsa_test_keypair();
         let a: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
         let b: IpAddr = "fd5a:5052:90de:1::2".parse().unwrap();
-        // A real port: a report of port 0 is refused whatever policy says (zl-zipline#255).
-        let peering = peering_with_substrate_port(a, b, 7001);
         asm.policy_mgr
             .update_policy_from_container_bytes(make_policy_with_node_join_and_peering(
                 cn,
+                &pubkey_der,
+                &peering_with_substrate_port(a, b, 7001),
+            ))
+            .await
+            .unwrap();
+        asm.observed_substrate
+            .insert(b, "192.0.2.10:7000".parse().unwrap());
+
+        let claim = substrate_claim_after_connect(asm, cn, &privkey, b).await;
+        assert_eq!(claim, Some(SocketAddr::new(b, 7001).to_string()));
+    }
+
+    /// [substrate_addr_for] is the one rule `connect` and `open` use (zl-zipline#264):
+    /// policy's address, else the relay's observation, else the claim on the stored node
+    /// actor, else none. Nothing the node sends plays a part.
+    #[tokio::test]
+    async fn substrate_addr_for_takes_policy_then_observation_then_the_stored_claim() {
+        let asm = crate::assembly::tests::new_assembly_for_tests(None).await;
+        let (_privkey, pubkey_der) = gen_rsa_test_keypair();
+        let relay: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
+        let laptop: IpAddr = "fd5a:5052:90de:1::2".parse().unwrap();
+        let unpeered: IpAddr = "fd5a:5052:90de:1::9".parse().unwrap();
+        let mut peering = peering_with_substrate_port(relay, laptop, 7001);
+        peering.substrate_b = None;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_and_peering(
+                "test-node.zpr",
                 &pubkey_der,
                 &peering,
             ))
             .await
             .unwrap();
-        let cc = make_cc("test-vs");
-        let challenge = b"my-challenge";
-        let timestamp = unix_now();
-        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
-        let reported = SocketAddr::new(b, 7001); // matches the declaration
-
-        let actor = cc
-            .authenticate_node(asm, challenge, timestamp, cn, &sig, b, reported, None)
+        let observed: SocketAddr = "192.0.2.10:7000".parse().unwrap();
+        let stored: SocketAddr = "198.51.100.20:7001".parse().unwrap();
+        asm.actor_mgr
+            .add_node(
+                &crate::test_helpers::make_node_actor_defexp(
+                    &unpeered.to_string(),
+                    "unpeered",
+                    &stored.to_string(),
+                ),
+                false,
+                &Default::default(),
+            )
             .await
-            .expect("authentication should succeed");
+            .unwrap();
 
-        let stored = actor
-            .get_attribute(key::SUBSTRATE_ADDR)
-            .expect("substrate addr claim must be present")
-            .get_value()[0]
-            .clone();
-        assert_eq!(stored, reported.to_string());
+        // Nothing observed: policy's address, the stored claim, or none.
+        assert_eq!(
+            substrate_addr_for(&asm, &relay).await.unwrap(),
+            Some(SocketAddr::new(relay, 7001))
+        );
+        assert_eq!(substrate_addr_for(&asm, &laptop).await.unwrap(), None);
+        assert_eq!(
+            substrate_addr_for(&asm, &unpeered).await.unwrap(),
+            Some(stored)
+        );
+
+        // Observed: policy's address still wins; otherwise the observation does.
+        for node in [relay, laptop, unpeered] {
+            asm.observed_substrate.insert(node, observed);
+        }
+        assert_eq!(
+            substrate_addr_for(&asm, &relay).await.unwrap(),
+            Some(SocketAddr::new(relay, 7001))
+        );
+        assert_eq!(
+            substrate_addr_for(&asm, &laptop).await.unwrap(),
+            Some(observed)
+        );
+        assert_eq!(
+            substrate_addr_for(&asm, &unpeered).await.unwrap(),
+            Some(observed)
+        );
     }
 
     #[tokio::test]
@@ -3614,7 +3505,6 @@ mod tests {
                 cn,
                 &sig,
                 "fd5a:5052::1".parse().unwrap(),
-                "127.0.0.1:1234".parse().unwrap(),
                 None,
             )
             .await
@@ -6159,7 +6049,6 @@ mod tests {
                 cn,
                 &sig,
                 "fd5a:5052::1".parse().unwrap(),
-                "127.0.0.1:1234".parse().unwrap(),
                 None,
             )
             .await
@@ -7203,16 +7092,7 @@ mod tests {
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
 
         let actor = cc
-            .authenticate_node(
-                asm,
-                challenge,
-                timestamp,
-                cn,
-                &sig,
-                addr,
-                "127.0.0.1:1234".parse().unwrap(),
-                None,
-            )
+            .authenticate_node(asm, challenge, timestamp, cn, &sig, addr, None)
             .await
             .expect("a node reconnect to its own live pinned address must authenticate");
 
@@ -7771,16 +7651,7 @@ mod tests {
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
 
         let result = cc
-            .authenticate_node(
-                asm.clone(),
-                challenge,
-                timestamp,
-                cn,
-                &sig,
-                addr,
-                "127.0.0.1:1234".parse().unwrap(),
-                None,
-            )
+            .authenticate_node(asm.clone(), challenge, timestamp, cn, &sig, addr, None)
             .await;
 
         assert!(
@@ -7817,16 +7688,7 @@ mod tests {
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
 
         let actor = cc
-            .authenticate_node(
-                asm,
-                challenge,
-                timestamp,
-                cn,
-                &sig,
-                addr,
-                "127.0.0.1:1234".parse().unwrap(),
-                None,
-            )
+            .authenticate_node(asm, challenge, timestamp, cn, &sig, addr, None)
             .await
             .expect("an out-of-pool pinned node address must authenticate");
 
@@ -7923,7 +7785,6 @@ mod tests {
                 cn,
                 &sig,
                 "fd5a:5052::1".parse().unwrap(),
-                "127.0.0.1:1234".parse().unwrap(),
                 None,
             )
             .await;
@@ -8448,7 +8309,6 @@ mod tests {
                 cn,
                 &sig,
                 ZODE_ADDR.parse().unwrap(),
-                "192.0.2.10:5000".parse().unwrap(),
                 None,
             )
             .await

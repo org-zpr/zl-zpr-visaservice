@@ -430,6 +430,7 @@ async fn main() -> std::process::ExitCode {
         topo_mgr: TopologyMgr::new(db::LinkRepo::new(db_handle)),
         ts_mgr,
         deny_log: Default::default(),
+        observed_substrate: Default::default(),
     });
     // Policy installs commit under the topology operation lock (TopoOps invariant).
     asm.policy_mgr.bind_topology_lock(asm.topo_mgr.ops_lock());
