@@ -31,7 +31,10 @@ pub struct Node {
     pub ctime: SystemTime,
     pub zpr_addr: IpAddr,
     pub cn: String,
-    pub substrate_addr: SocketAddr,
+    /// The node's substrate address claim: policy's, else the relay's observation
+    /// (zl-zipline#264). `None` when there is neither, as for a relay with no policy
+    /// address, which needs none.
+    pub substrate_addr: Option<SocketAddr>,
 }
 
 // Wrap a SocketAddr for easy serialization.
@@ -258,26 +261,23 @@ impl Node {
             }
         };
         let substrate_addr = match actor.get_attribute(key::SUBSTRATE_ADDR) {
-            Some(addr) => addr
-                .get_single_value()
-                .map_err(|e| {
-                    StoreError::InvalidData(format!(
-                        "failed to get single value for substrate address: {}",
-                        e
-                    ))
-                })?
-                .parse::<SocketAddr>()
-                .map_err(|e| {
-                    StoreError::InvalidData(format!(
-                        "failed to parse substrate address attribute as SocketAddr: {}",
-                        e
-                    ))
-                })?,
-            None => {
-                return Err(StoreError::MissingRequired(
-                    "node actor missing substrate address".into(),
-                ));
-            }
+            Some(addr) => Some(
+                addr.get_single_value()
+                    .map_err(|e| {
+                        StoreError::InvalidData(format!(
+                            "failed to get single value for substrate address: {}",
+                            e
+                        ))
+                    })?
+                    .parse::<SocketAddr>()
+                    .map_err(|e| {
+                        StoreError::InvalidData(format!(
+                            "failed to parse substrate address attribute as SocketAddr: {}",
+                            e
+                        ))
+                    })?,
+            ),
+            None => None,
         };
         Ok(Node {
             ctime: SystemTime::now(),
@@ -337,7 +337,7 @@ mod test {
             ctime: SystemTime::UNIX_EPOCH,
             zpr_addr: "fd5a:5052::1".parse().unwrap(),
             cn: "node-1".to_string(),
-            substrate_addr: "[fd5a:5052::100]:1234".parse().unwrap(),
+            substrate_addr: Some("[fd5a:5052::100]:1234".parse().unwrap()),
         }
     }
 
@@ -357,7 +357,7 @@ mod test {
         assert_eq!(node.zpr_addr, "fd5a:5052::1".parse::<IpAddr>().unwrap());
         assert_eq!(
             node.substrate_addr,
-            "[fd5a:5052::100]:1234".parse::<SocketAddr>().unwrap()
+            Some("[fd5a:5052::100]:1234".parse::<SocketAddr>().unwrap())
         );
     }
 
@@ -415,6 +415,8 @@ mod test {
         }
     }
 
+    /// A node with no substrate address claim (no policy address and no observation, as
+    /// for the relay) is a valid node with none (zl-zipline#264).
     #[test]
     fn test_new_from_node_actor_missing_substrate_addr() {
         let actor = make_actor(
@@ -426,11 +428,27 @@ mod test {
             Duration::from_secs(3600),
         );
 
-        let err = Node::new_from_node_actor(&actor).unwrap_err();
-        match err {
-            StoreError::MissingRequired(_) => {}
-            other => panic!("unexpected error: {:?}", other),
-        }
+        let node = Node::new_from_node_actor(&actor).unwrap();
+        assert_eq!(node.substrate_addr, None);
+    }
+
+    /// A node with no substrate address stores and loads as one.
+    #[tokio::test]
+    async fn test_node_repo_round_trips_a_node_without_substrate_addr() {
+        let db = Arc::new(FakeDb::new());
+        let repo = NodeRepo::new(db.clone());
+        let node = Node {
+            substrate_addr: None,
+            ..make_node()
+        };
+        repo.add_node(&node).await.unwrap();
+        let stored = db
+            .get(&node_key_for_node(&node.zpr_addr))
+            .await
+            .unwrap()
+            .unwrap();
+        let parsed: Node = serde_json::from_str(&stored).unwrap();
+        assert_eq!(parsed.substrate_addr, None);
     }
 
     #[test]
@@ -553,13 +571,13 @@ mod test {
             ctime: SystemTime::UNIX_EPOCH,
             zpr_addr: "fd5a:5052::10".parse().unwrap(),
             cn: "node-a".to_string(),
-            substrate_addr: "[fd5a:5052::100]:1234".parse().unwrap(),
+            substrate_addr: Some("[fd5a:5052::100]:1234".parse().unwrap()),
         };
         let node_b = Node {
             ctime: SystemTime::UNIX_EPOCH,
             zpr_addr: "fd5a:5052::11".parse().unwrap(),
             cn: "node-b".to_string(),
-            substrate_addr: "[fd5a:5052::101]:1234".parse().unwrap(),
+            substrate_addr: Some("[fd5a:5052::101]:1234".parse().unwrap()),
         };
 
         repo.add_node(&node_a).await.unwrap();

@@ -7,7 +7,8 @@
 //! policy-declared peering, which *is* the authorization (J3).
 //!
 //! **They are requested on demand** (J2, J8). The relay asks for them over its own VS-API
-//! session, with `requestBootstrapVisas(peerCn)`, when the joiner's initial link comes up.
+//! session, with `requestBootstrapVisas(peerCn, observedAddr)`, when the joiner's initial
+//! link comes up.
 //! Topology carries none, and nothing is minted ahead of time or from traffic. The narrow
 //! rule, checked by [request_bootstrap_visas]:
 //! - **Only the relay may ask**: the node the visa service docks on, one hop from it
@@ -23,10 +24,17 @@
 //! the proof that the joiner's previous link is gone (one link per peer, rule 5): whatever
 //! carried the previous join is torn down first ([end_previous_join]).
 //!
+//! **Every request carries the joiner's substrate address** (zl-zipline#264): the source of
+//! its initial link as the relay's socket saw it. That link completed keying with the
+//! verified CN, so the address is one the CN holder itself sends from and receives at. A
+//! granted request records it ([Assembly::observed_substrate]); it is the joiner's
+//! substrate address unless policy declares one
+//! ([crate::connection_control::substrate_addr_for]).
+//!
 //! The minting itself is `VisaMgr::mint_bootstrap_visa`, in [crate::visa_mgr] because it
 //! needs the visa store's internals.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use libeval::eval_result::Direction;
@@ -63,6 +71,8 @@ pub(crate) enum Refusal {
     NotRelay,
     /// The CN names no peer in the caller's topology (`notFound`, J3).
     UnknownPeer,
+    /// The observed address names no place to dial, or did not parse (`paramError`).
+    UndialableAddr(ServiceError),
     /// The teardown of the previous join or the mint failed (`internal`).
     Failed(ServiceError),
 }
@@ -135,16 +145,21 @@ pub(crate) fn bootstrap_visa_authorized(
 }
 
 /// `requestBootstrapVisas` (J2, J3, J6): `relay`, whose VS-API session is `relay_session`,
-/// asks for the bootstrap visas of the peer its topology names `peer_cn`.
+/// asks for the bootstrap visas of the peer its topology names `peer_cn`, which it
+/// observed at substrate address `observed`.
 ///
-/// Refused unless the session is still current, the caller is the relay and `peer_cn` names
-/// a peer in its topology (see [Refusal]). Otherwise the joiner's previous join is torn
-/// down ([end_previous_join]) and both directions of its VS-API flow are minted, and the
-/// answer holds the joiner's copies (`peer`) and the relay's (`relay`), forward first.
+/// Refused unless the session is still current, the caller is the relay, `peer_cn` names
+/// a peer in its topology and `observed` is dialable, checked in that order (see
+/// [Refusal]). Otherwise the observation is recorded ([Assembly::observed_substrate], with
+/// an IPv4-mapped IPv6 address as plain IPv4: the relay's socket may be dual-stack, and an
+/// IPv4-only peer cannot dial the mapped form), the joiner's previous join is torn down
+/// ([end_previous_join]) and both directions of its VS-API flow are minted. The answer
+/// holds the joiner's copies (`peer`) and the relay's (`relay`), forward first.
 ///
 /// `peer_cn` is the raw bytes off the wire, decoded only once the session and relay checks
 /// have passed (g94 q3): a caller that may not ask is refused the same way whatever it
-/// sent, and bytes that are not UTF-8 name no peer.
+/// sent, and bytes that are not UTF-8 name no peer. Likewise `observed` is `None` when it
+/// did not parse, and is refused only after those checks.
 ///
 /// The checks, the teardown and the mint run as one step under the issuance lock and the
 /// topology lock, so they are atomic against connect, disconnect, core-visa issuance and
@@ -156,6 +171,7 @@ pub(crate) async fn request_bootstrap_visas(
     relay: &IpAddr,
     relay_session: Option<&str>,
     peer_cn: &[u8],
+    observed: Option<SocketAddr>,
 ) -> Result<BootstrapVisas, Refusal> {
     // Lock order: issuance lock, then topology lock (see core_visas::lock_issuance).
     let issuing = core_visas::lock_issuance().await;
@@ -176,6 +192,18 @@ pub(crate) async fn request_bootstrap_visas(
     let Some(peer) = topology_peer_addr(asm, &psnap, relay, peer_cn) else {
         return Err(Refusal::UnknownPeer);
     };
+    let Some(observed) = observed else {
+        return Err(Refusal::UndialableAddr(ServiceError::Param(
+            "observedAddr is not a valid socket address".into(),
+        )));
+    };
+    let observed = SocketAddr::new(observed.ip().to_canonical(), observed.port());
+    crate::connection_control::require_dialable_substrate(observed)
+        .map_err(Refusal::UndialableAddr)?;
+    // Granted: record the observation before the teardown, which rewrites the joiner's
+    // stored claim from it.
+    info!(target: API, "relay {relay}: joiner {peer_cn} at {peer} observed at {observed}");
+    asm.observed_substrate.insert(peer, observed);
     // Any VSS worker the joiner has belongs to its previous join, which this request proves
     // is over. It is stopped whatever happens below, once both locks are released.
     let old_vss = asm.vss_mgr.get_handle(&peer);
@@ -205,7 +233,10 @@ pub(crate) async fn request_bootstrap_visas(
 ///   service ([core_visas::revoke_previous_join]).
 /// - If the peer still has a VS-API session (its node actor is stored), the session is
 ///   ended: a new session id is stamped on the actor, so every handle of the old session
-///   fails its liveness check (the caller stops its VSS worker). Its link-state reports
+///   fails its liveness check (the caller stops its VSS worker). In the same write its
+///   substrate address claim is brought up to date
+///   ([crate::connection_control::substrate_addr_for]), so the new join's address is
+///   known before its next `connect` or `open` (zl-zipline#264). Its link-state reports
 ///   are forgotten, so its links are down until it reports again (R14), and the visas
 ///   crossing a link that went down are revoked. Every other visa installed on the peer is
 ///   marked pending install, so it
@@ -226,6 +257,10 @@ async fn end_previous_join(
         match asm.actor_mgr.get_actor_by_zpr_addr(peer).await? {
             Some(mut actor) if actor.is_node() => {
                 crate::vsapi_worker::stamp_new_session(&mut actor);
+                if let Some(addr) = crate::connection_control::substrate_addr_for(asm, peer).await?
+                {
+                    crate::vsapi_worker::set_substrate_claim(&mut actor, addr);
+                }
                 asm.actor_mgr
                     .update_actor(&actor, &asm.policy_service_names())
                     .await?;

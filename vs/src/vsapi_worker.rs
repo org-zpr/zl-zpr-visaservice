@@ -363,7 +363,6 @@ struct VSGateImpl {
     remote: SocketAddr,
     remote_cn: String,
     req_zpr_addr: IpAddr,
-    req_substrate_addr: SocketAddr,
 
     // This is set in `challenge` call and read in the `authenticate` call.
     // Safe to use here since the capn proto rpc is confined to a single thread.
@@ -393,7 +392,6 @@ impl VSGateImpl {
         remote: SocketAddr,
         remote_cn: String,
         req_zpr_addr: IpAddr,
-        req_substrate_addr: SocketAddr,
         a2a_dh_pubkey: Option<PublicKey>,
         reconnect: bool,
     ) -> Self {
@@ -403,7 +401,6 @@ impl VSGateImpl {
             remote_cn,
             challenge_data: Cell::new([0u8; 32]),
             req_zpr_addr,
-            req_substrate_addr,
             a2a_dh_pubkey,
             reconnect,
         }
@@ -431,6 +428,19 @@ pub(crate) fn stamp_new_session(actor: &mut Actor) {
                 .value(format!("{generation}-{}", uuid::Uuid::new_v4())),
         )
         .expect("session attribute is unvalidated and cannot fail");
+}
+
+/// Set `actor`'s substrate address claim to `addr` (the address its peers dial), logging a
+/// change. `addr` is [crate::connection_control::substrate_addr_for]'s answer, never the
+/// node's own word (zl-zipline#264). The caller persists the actor.
+pub(crate) fn set_substrate_claim(actor: &mut Actor, addr: SocketAddr) {
+    let stored = crate::connection_control::substrate_claim(actor);
+    if stored != Some(addr) {
+        info!(target: API, "node {:?} substrate address {stored:?} -> {addr}", actor.get_cn());
+    }
+    actor
+        .add_attribute(Attribute::builder(key::SUBSTRATE_ADDR).value(addr.to_string()))
+        .expect("substrate address attribute is unvalidated and cannot fail");
 }
 
 impl VSHandleImpl {
@@ -595,7 +605,6 @@ impl VSHandleImpl {
 async fn resume_node_actor_for_open(
     asm: &Assembly,
     node_zpr_addr: IpAddr,
-    reported_substrate: SocketAddr,
     cn: &str,
 ) -> Result<Actor, (vsapi::ErrorCode, String)> {
     let internal = || {
@@ -621,26 +630,13 @@ async fn resume_node_actor_for_open(
         ));
     }
 
-    // The same substrate rule as `connect`: an unusable report is refused, and
-    // policy's address wins if it declares one (the report must match), else the
-    // reported one stands (zl-zipline#255).
-    let reported_substrate = crate::connection_control::accept_reported_substrate(
-        asm,
-        &node_zpr_addr,
-        reported_substrate,
-    )
-    .map_err(|e| (vsapi::ErrorCode::ParamError, e.to_string()))?;
-
-    // A soft reconnect may carry a changed dock address; keep the stored claim current.
-    let stored = existing_actor
-        .get_attribute(key::SUBSTRATE_ADDR)
-        .and_then(|a| a.get_value().first().cloned());
-    if stored.as_deref() != Some(reported_substrate.to_string().as_str()) {
-        info!(target: API, "node {} substrate address {} -> {} on open", cn, stored.unwrap_or_default(), reported_substrate);
-        if let Err(e) = existing_actor.add_attribute(
-            Attribute::builder(key::SUBSTRATE_ADDR).value(reported_substrate.to_string()),
-        ) {
-            error!(target: API, "failed to update substrate addr claim for {}: {}", cn, e);
+    // The same substrate rule as `connect` (zl-zipline#264): a rejoin through the relay
+    // may have moved the node, so keep the stored claim current.
+    match crate::connection_control::substrate_addr_for(asm, &node_zpr_addr).await {
+        Ok(Some(addr)) => set_substrate_claim(&mut existing_actor, addr),
+        Ok(None) => {}
+        Err(e) => {
+            error!(target: API, "failed to look up the substrate address of {}: {}", cn, e);
             return Err(internal());
         }
     }
@@ -729,8 +725,8 @@ async fn add_node_serialized(
 /// A VS-API session of `node` has just started (`authenticate`, or `open` for a
 /// reconnect), so its peers may now be able to make a link to it they could not before:
 /// a direct link is proposed only when both ends' addresses are known, and the node's
-/// reported address has just become known, or changed (ZODE_LINKS.md rule 13b,
-/// zl-zipline#255). `cleared` are the other ends of the failed pairs the session start
+/// address (policy's, or the relay's observation) has just become known, or changed
+/// (ZODE_LINKS.md rule 13b, zl-zipline#255). `cleared` are the other ends of the failed pairs the session start
 /// cleared under the topology guard (R13a: it counts as "something about the pair
 /// changed"; [TopologyMgr::clear_failed_pairs_for]).
 ///
@@ -1042,58 +1038,18 @@ fn ipaddr_from_capnp(addr: vsapi::ip_addr::Reader) -> Result<std::net::IpAddr, c
     }
 }
 
-/// Parse and validate a substrate address param value. Unparseable, unspecified-IP
-/// (e.g. 0.0.0.0) and port-0 values are rejected -- the VS cannot verify reachability
-/// of an advertised address, but it can reject values that are structurally unusable.
-fn parse_substrate_addr_str(s: &str) -> Result<SocketAddr, ServiceError> {
-    let sa: SocketAddr = s.parse().map_err(|_| {
-        ServiceError::Param(format!(
-            "param {} is not a valid socket address: '{s}'",
-            pname::SUBSTRATE_ADDR
-        ))
-    })?;
-    // Refused here, at the wire, before any work; accept_reported_substrate applies
-    // the same check again where the address is recorded.
-    crate::connection_control::require_dialable_substrate(sa)?;
-    Ok(sa)
-}
-
-/// Find and parse the required `substrate_addr` param. Used by `open`, which (unlike
-/// `connect`) requires no other params. See
-/// https://github.com/org-zpr/zpr-visaservice/issues/299
-fn parse_substrate_addr_param(params: &[Param]) -> Result<SocketAddr, ServiceError> {
-    for pp in params {
-        if pp.name.as_str() == pname::SUBSTRATE_ADDR {
-            return match &pp.value {
-                ParamValue::StrParam(s) => parse_substrate_addr_str(s),
-                _ => Err(ServiceError::Param(format!(
-                    "param {} has invalid type",
-                    pname::SUBSTRATE_ADDR
-                ))),
-            };
-        }
-    }
-    Err(ServiceError::Param("SUBSTRATE_ADDR param missing".into()))
-}
-
 impl VisaServiceImpl {
-    /// Helper for the connect routine -- returns the two connect params we require, zpr_addr
-    /// and substrate_addr, plus the node's A2A DH public key if it sent one. Older code used
-    /// to pass in the AAA_PREFIX here but now we send that over the VSS.
+    /// Helper for the connect routine -- returns the one connect param we require,
+    /// zpr_addr, plus the node's A2A DH public key if it sent one.
     ///
-    /// During this transition period we will error out if node passes use AAA_PREFIX.
-    ///
-    /// `substrate_addr` is the node's advertised substrate address (the address peers dial),
-    /// sent as a string param and parsed as a `SocketAddr`. Unparseable, unspecified-IP
-    /// (e.g. 0.0.0.0) and port-0 values are rejected -- the VS cannot verify reachability,
-    /// but it can reject values that are structurally unusable.
-    /// See https://github.com/org-zpr/zpr-visaservice/issues/299
+    /// Any other param is refused, as ph refuses an unknown config key. That includes a
+    /// leftover `substrate_addr`: a node's substrate address is never its own word
+    /// (zl-zipline#264, [crate::connection_control::substrate_addr_for]).
     fn parse_my_connect_params(
         &self,
         params: &[Param],
-    ) -> Result<(IpAddr, SocketAddr, Option<PublicKey>), ServiceError> {
+    ) -> Result<(IpAddr, Option<PublicKey>), ServiceError> {
         let mut node_zpr_addr = None;
-        let mut node_substrate_addr = None;
         let mut a2a_dh_pubkey = None;
 
         for pp in params {
@@ -1108,25 +1064,6 @@ impl VisaServiceImpl {
                     }
                 },
 
-                pname::SUBSTRATE_ADDR => match &pp.value {
-                    ParamValue::StrParam(s) => {
-                        node_substrate_addr = Some(parse_substrate_addr_str(s)?);
-                    }
-                    _ => {
-                        return Err(ServiceError::Param(format!(
-                            "param {} has invalid type",
-                            pname::SUBSTRATE_ADDR
-                        )));
-                    }
-                },
-
-                pname::AAA_PREFIX => {
-                    return Err(ServiceError::Param(format!(
-                        "param {} must not be sent to VS",
-                        pname::AAA_PREFIX
-                    )));
-                }
-
                 pname::A2A_DH_PUBKEY => match &pp.value {
                     ParamValue::X25519PubKey(pubkey) => {
                         a2a_dh_pubkey = Some(PublicKey::new(pubkey.as_bytes()));
@@ -1139,17 +1076,16 @@ impl VisaServiceImpl {
                     }
                 },
 
-                name => info!(target: API, "ignored connect param {}", name),
+                name => {
+                    return Err(ServiceError::Param(format!("unknown connect param {name}")));
+                }
             }
         }
 
         let Some(node_zpr_addr) = node_zpr_addr else {
             return Err(ServiceError::Param("ZPR_ADDR param missing".into()));
         };
-        let Some(node_substrate_addr) = node_substrate_addr else {
-            return Err(ServiceError::Param("SUBSTRATE_ADDR param missing".into()));
-        };
-        Ok((node_zpr_addr, node_substrate_addr, a2a_dh_pubkey))
+        Ok((node_zpr_addr, a2a_dh_pubkey))
     }
 
     /// Helper to handle errors during connect call.
@@ -1185,7 +1121,7 @@ impl VisaServiceImpl {
 
 impl vsapi::visa_service::Server for VisaServiceImpl {
     // Node connection request to the Visa Service.
-    // The node must pass its ZPR_ADDR and SUBSTRATE_ADDR as connect params.
+    // The node must pass its ZPR_ADDR as a connect param, and nothing unknown.
     async fn connect(
         self: Rc<Self>,
         params: vsapi::visa_service::ConnectParams,
@@ -1218,17 +1154,16 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             }
         };
 
-        let (node_zpr_addr, node_substrate_addr, a2a_dh_pubkey) =
-            match self.parse_my_connect_params(&parsed_params) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    return self.ok_with_connect_error(
-                        results,
-                        vsapi::ErrorCode::ParamError,
-                        format!("{e}").as_str(),
-                    );
-                }
-            };
+        let (node_zpr_addr, a2a_dh_pubkey) = match self.parse_my_connect_params(&parsed_params) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return self.ok_with_connect_error(
+                    results,
+                    vsapi::ErrorCode::ParamError,
+                    format!("{e}").as_str(),
+                );
+            }
+        };
 
         info!(target: API, "node {} requests zpr addr {} (CONNECT_TYPE={:?})", vs_connect_request.cn, node_zpr_addr, vs_connect_request.ctype);
 
@@ -1297,7 +1232,6 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             self.remote,
             vs_connect_request.cn,
             node_zpr_addr,
-            node_substrate_addr,
             a2a_dh_pubkey,
             vs_connect_request.ctype == ConnectType::Reconnect,
         ));
@@ -1326,27 +1260,20 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             }
         };
 
-        // The one param `open` requires is the node's advertised substrate address; the
-        // same policy-mismatch check as `connect` applies. `zpr_addr` remains
-        // optional/ignored here -- the node should be using its real ZPR address already
-        // authenticated/granted during authorize_connect.
-        // See https://github.com/org-zpr/zpr-visaservice/issues/299
-
-        let reported_substrate = match vs_connect_request
+        // `open` takes no params: the node is the source of this VS-API connection, already
+        // authenticated, and its substrate address is never its own word (zl-zipline#264).
+        // Any param is refused, as `connect` refuses an unknown one.
+        if let Some(param) = vs_connect_request
             .params
             .as_deref()
-            .ok_or_else(|| ServiceError::Param("connect params missing".into()))
-            .and_then(parse_substrate_addr_param)
+            .and_then(<[Param]>::first)
         {
-            Ok(sa) => sa,
-            Err(e) => {
-                return self.ok_with_open_error(
-                    results,
-                    vsapi::ErrorCode::ParamError,
-                    format!("{e}").as_str(),
-                );
-            }
-        };
+            return self.ok_with_open_error(
+                results,
+                vsapi::ErrorCode::ParamError,
+                &format!("unknown open param {}", param.name),
+            );
+        }
 
         let node_zpr_addr = self.remote.ip();
         info!(target: API, "node {} requests open from addr {} (CONNECT_TYPE={:?})", vs_connect_request.cn, node_zpr_addr, vs_connect_request.ctype);
@@ -1362,7 +1289,6 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         let existing_actor = match resume_node_actor_for_open(
             &self.asm,
             node_zpr_addr,
-            reported_substrate,
             &vs_connect_request.cn,
         )
         .await
@@ -1489,7 +1415,6 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                 &self.remote_cn,
                 challenge_response,
                 self.req_zpr_addr,
-                self.req_substrate_addr,
                 self.a2a_dh_pubkey.as_ref(),
             )
             .await
@@ -2670,7 +2595,8 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
     ///
     /// Errors (vs.capnp): `authRequired` on a dead handle; `invalidOperation` when the
     /// caller is not the relay, whatever its `peerCn`; `notFound` when `peerCn` names no
-    /// peer in the caller's topology (or is not valid UTF-8); `internal` when the visas
+    /// peer in the caller's topology (or is not valid UTF-8); `paramError` when
+    /// `observedAddr` names no place to dial (or does not parse); `internal` when the visas
     /// could not be minted.
     async fn request_bootstrap_visas(
         self: Rc<Self>,
@@ -2699,12 +2625,20 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         let peer_cn = params.get()?.get_peer_cn()?.as_bytes();
         // For logging only: the decoded CN is never used for a decision here.
         let peer_cn_for_log = String::from_utf8_lossy(peer_cn);
+        // Like `peer_cn`, refused only after the relay check if it does not parse.
+        let observed = params
+            .get()?
+            .get_observed_addr()
+            .ok()
+            .and_then(|reader| zpr::vsapi_types::SockAddr::try_from(reader).ok())
+            .map(SocketAddr::from);
 
         let refusal = match crate::visa_bootstrap::request_bootstrap_visas(
             &self.asm,
             &relay,
             self.session.as_deref(),
             peer_cn,
+            observed,
         )
         .await
         {
@@ -2728,6 +2662,13 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
                 vsapi::ErrorCode::NotFound,
                 "peerCn is not a peer in the caller's topology",
             ),
+            Refusal::UndialableAddr(e) => {
+                warn!(target: API, "request_bootstrap_visas from {relay} for {peer_cn_for_log:?}: {e}");
+                (
+                    vsapi::ErrorCode::ParamError,
+                    "observedAddr names no place to dial",
+                )
+            }
             Refusal::Failed(e) => {
                 error!(target: API, "request_bootstrap_visas from {relay} for {peer_cn_for_log:?}: {e}");
                 (vsapi::ErrorCode::Internal, "failed to mint bootstrap visas")
@@ -3099,12 +3040,35 @@ mod tests {
         );
     }
 
+    /// zl-zipline#264: `connect` takes `zpr_addr` and `a2a_dh_pubkey`, and refuses any
+    /// other param with a param error. That includes a leftover `substrate_addr`: a
+    /// node's substrate address is never its own word.
+    #[tokio::test]
+    async fn connect_refuses_an_unknown_param() {
+        let vs = VisaServiceImpl {
+            asm: Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await),
+            remote: "[fd5a:5052::1]:1234".parse().unwrap(),
+        };
+        let zpr_addr = || Param::new_ip(pname::ZPR_ADDR.into(), "fd5a:5052::1".parse().unwrap());
+        assert!(vs.parse_my_connect_params(&[zpr_addr()]).is_ok());
+        for name in ["substrate_addr", pname::AAA_PREFIX, "no_such_param"] {
+            let extra = Param::new_str(name.into(), "192.0.2.66:7000".into());
+            assert!(
+                matches!(
+                    vs.parse_my_connect_params(&[zpr_addr(), extra]),
+                    Err(ServiceError::Param(_))
+                ),
+                "{name}"
+            );
+        }
+    }
+
     /// J5a on `open` (a session reconnect): the node gets two new VSAPI visas, forward
     /// and reverse, for its own session. `authenticate` calls the same
     /// [start_session_core_visas].
     #[tokio::test]
     async fn open_issues_the_node_new_vsapi_visas() {
-        use crate::core_visas::tests::{ZODE, build_net};
+        use crate::core_visas::tests::build_net;
 
         let (asm, _relay, zode) = build_net().await;
         let before = asm.visa_mgr.get_visa_ids_for_actors(&[zode]).await.unwrap();
@@ -3119,10 +3083,6 @@ mod tests {
             let mut r = req.get().init_req();
             r.set_cn("zode");
             r.set_ctype(vsapi::VSConnT::Reconnect);
-            let mut p = r.init_params(1).get(0);
-            p.set_ptype(vsapi::ParamT::String);
-            p.set_name(pname::SUBSTRATE_ADDR);
-            p.set_value_text(format!("[{ZODE}]:5000"));
         }
         let resp = req.send().promise.await.unwrap();
         assert!(matches!(
@@ -4239,8 +4199,7 @@ mod tests {
         }
 
         /// As [build_with_cns]; a non-zero `substrate_port` gives every node the substrate
-        /// address `[<its ZPR address>]:<substrate_port>` in policy, so the node can
-        /// `open` (which refuses port 0 and checks the address against policy).
+        /// address `[<its ZPR address>]:<substrate_port>` in policy.
         async fn build_with(
             cns: bool,
             substrate_port: u16,
@@ -4386,10 +4345,6 @@ mod tests {
                         let mut r = req.get().init_req();
                         r.set_cn("node-a");
                         r.set_ctype(vsapi::VSConnT::Reconnect);
-                        let mut p = r.init_params(1).get(0);
-                        p.set_ptype(vsapi::ParamT::String);
-                        p.set_name(pname::SUBSTRATE_ADDR);
-                        p.set_value_text("[fd5a:5052::101]:1234");
                     }
                     let held = asm.topo_mgr.ops().await;
                     let open =
@@ -4575,10 +4530,6 @@ mod tests {
                 let mut r = req.get().init_req();
                 r.set_cn(cn);
                 r.set_ctype(vsapi::VSConnT::Reconnect);
-                let mut p = r.init_params(1).get(0);
-                p.set_ptype(vsapi::ParamT::String);
-                p.set_name(pname::SUBSTRATE_ADDR);
-                p.set_value_text(format!("[{node}]:{R13A_PORT}"));
             }
             let resp = req.send().promise.await.unwrap();
             assert!(
@@ -5044,8 +4995,8 @@ mod tests {
 
         /// The re-proposal carries what the peer needs to propose the link: here a
         /// policy that declares no address for A or B, so the A-B link is direct and
-        /// needs both reported addresses. After B opens with a new address, the
-        /// topology sent to A names the link to B at that address.
+        /// needs both ends' stored addresses. After the relay observes B at a new address
+        /// and B opens, the topology sent to A names the link to B at that address.
         #[tokio::test]
         async fn a_peer_is_re_proposed_the_link_at_the_new_address_on_open() {
             tokio::task::LocalSet::new()
@@ -5064,6 +5015,9 @@ mod tests {
                         .await
                         .unwrap();
                     let mut a_vss = capture_vss(&asm, NODE_A);
+                    let _b_vss = capture_vss(&asm, NODE_B);
+                    let moved = SocketAddr::new("192.0.2.20".parse().unwrap(), R13A_PORT);
+                    asm.observed_substrate.insert(b, moved);
                     reopen(&asm, NODE_B, "node-b").await;
                     let Ok(Some(crate::vss::VssCmd::SetTopology(psnap, _))) =
                         tokio::time::timeout(Duration::from_secs(1), a_vss.recv()).await
@@ -5077,8 +5031,8 @@ mod tests {
                     assert_eq!(links[0].zpr_addr, b);
                     assert_eq!(
                         links[0].peer.clone().map(SocketAddr::from),
-                        Some(SocketAddr::new(b, R13A_PORT)),
-                        "B's address as it reported it on open"
+                        Some(moved),
+                        "B's address as the relay observed it"
                     );
                 })
                 .await;
@@ -5318,15 +5272,10 @@ mod tests {
             let task = tokio::spawn({
                 let asm = asm.clone();
                 async move {
-                    resume_node_actor_for_open(
-                        &asm,
-                        NODE.parse().unwrap(),
-                        "[fd5a:5052:3000::101]:1234".parse().unwrap(),
-                        "zode",
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|(code, msg)| format!("{code:?}: {msg}"))
+                    resume_node_actor_for_open(&asm, NODE.parse().unwrap(), "zode")
+                        .await
+                        .map(|_| ())
+                        .map_err(|(code, msg)| format!("{code:?}: {msg}"))
                 }
             });
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -5340,67 +5289,94 @@ mod tests {
                 .expect("open's state update completes once the lock is free");
         }
 
-        /// `open` applies the same substrate rule as `connect` (zl-zipline#255): with a
-        /// policy that declares links for the node but no address for it, a changed
-        /// reported address is accepted and stored; where policy declares one, a
-        /// different report is a `paramError`.
+        /// `open` applies the same substrate rule as `connect` (zl-zipline#264): with no
+        /// policy address for the node, the relay's observation replaces the stored claim;
+        /// with none, the stored claim stands; where policy declares one, policy's address
+        /// wins over an observation.
         #[tokio::test]
-        async fn test_open_applies_the_reported_substrate_rule() {
+        async fn test_open_applies_the_substrate_rule() {
             let (asm, node, relay) = open_substrate_asm().await;
-            let moved: std::net::SocketAddr = "192.0.2.10:7000".parse().unwrap();
-            let actor = resume_node_actor_for_open(&asm, node, moved, "zode")
-                .await
-                .map_err(|(code, msg)| format!("{code:?}: {msg}"))
-                .expect("a reported address stands when policy declares none");
-            assert_eq!(
+            let claim = |actor: &Actor| {
                 actor
                     .get_attribute(key::SUBSTRATE_ADDR)
                     .unwrap()
-                    .get_value()[0],
-                moved.to_string()
-            );
+                    .get_value()[0]
+                    .clone()
+            };
+            let open = |addr| {
+                let asm = asm.clone();
+                async move {
+                    resume_node_actor_for_open(&asm, addr, "zode")
+                        .await
+                        .map_err(|(code, msg)| format!("{code:?}: {msg}"))
+                        .expect("open succeeds")
+                }
+            };
 
-            // The relay's address is declared ([relay]:7001): another report is refused.
-            let err = resume_node_actor_for_open(&asm, relay, moved, "relay")
-                .await
-                .expect_err("a report that contradicts policy is refused");
-            assert!(matches!(err.0, vsapi::ErrorCode::ParamError), "{err:?}");
-        }
+            // Nothing observed: the stored claim stands.
+            assert_eq!(claim(&open(node).await), "[fd5a:5052:3000::101]:1234");
 
-        /// zl-zipline#255: `open` refuses a reported substrate address that names no
-        /// place to dial (an unspecified IP or port 0) with `paramError`, and leaves
-        /// the stored claim as it was.
-        #[tokio::test]
-        async fn test_open_rejects_an_unusable_reported_substrate() {
-            let (asm, node, _relay) = open_substrate_asm().await;
-            for reported in [
-                "0.0.0.0:7000",
-                "[::]:7000",
-                "[::ffff:0.0.0.0]:7000",
-                "192.0.2.10:0",
-            ] {
-                let reported: std::net::SocketAddr = reported.parse().unwrap();
-                let err = resume_node_actor_for_open(&asm, node, reported, "zode")
-                    .await
-                    .expect_err("an unusable report is refused");
-                assert!(
-                    matches!(err.0, vsapi::ErrorCode::ParamError),
-                    "{reported}: {err:?}"
-                );
-            }
+            // Observed: the observation replaces it, and is persisted.
+            let moved: std::net::SocketAddr = "192.0.2.10:7000".parse().unwrap();
+            asm.observed_substrate.insert(node, moved);
+            assert_eq!(claim(&open(node).await), moved.to_string());
             let stored = asm
                 .actor_mgr
                 .get_actor_by_zpr_addr(&node)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(
-                stored
-                    .get_attribute(key::SUBSTRATE_ADDR)
-                    .unwrap()
-                    .get_value()[0],
-                "[fd5a:5052:3000::101]:1234"
-            );
+            assert_eq!(claim(&stored), moved.to_string());
+
+            // The relay's address is declared ([relay]:7001): an observation does not move it.
+            asm.observed_substrate.insert(relay, moved);
+            assert_eq!(claim(&open(relay).await), "[fd5a:5052:3000::9]:7001");
+        }
+
+        /// zl-zipline#264: `open` takes no params. A leftover `substrate_addr` (or any
+        /// other param) is a `paramError`, and the stored claim is left as it was.
+        #[tokio::test]
+        async fn test_open_refuses_any_param() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, node, _relay) = open_substrate_asm().await;
+                    let vs: vsapi::visa_service::Client = capnp_rpc::new_client(VisaServiceImpl {
+                        asm: asm.clone(),
+                        remote: SocketAddr::new(node, 1234),
+                    });
+                    let mut req = vs.open_request();
+                    {
+                        let mut r = req.get().init_req();
+                        r.set_cn("zode");
+                        r.set_ctype(vsapi::VSConnT::Reconnect);
+                        let mut p = r.init_params(1).get(0);
+                        p.set_ptype(vsapi::ParamT::String);
+                        p.set_name("substrate_addr");
+                        p.set_value_text("192.0.2.66:7000");
+                    }
+                    let resp = req.send().promise.await.unwrap();
+                    match resp.get().unwrap().get_resp().unwrap().which().unwrap() {
+                        vsapi::result::Which::Error(err) => assert_eq!(
+                            err.unwrap().get_code().unwrap(),
+                            vsapi::ErrorCode::ParamError
+                        ),
+                        vsapi::result::Which::Ok(_) => panic!("open with a param must fail"),
+                    }
+                    let stored = asm
+                        .actor_mgr
+                        .get_actor_by_zpr_addr(&node)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        stored
+                            .get_attribute(key::SUBSTRATE_ADDR)
+                            .unwrap()
+                            .get_value()[0],
+                        "[fd5a:5052:3000::101]:1234"
+                    );
+                })
+                .await;
         }
 
         /// An assembly for the `open` substrate tests: policy links a relay
@@ -5534,11 +5510,27 @@ mod tests {
         /// does not peer with the relay. Both nodes are connected, and the built-in VSAPI and
         /// VSS rules hold (see `core_visas::tests::build_net`). Returns (asm, relay, joiner).
         async fn join_net() -> (Arc<Assembly>, IpAddr, IpAddr) {
+            join_net_where(|_| {}).await
+        }
+
+        /// As [join_net], with policy declaring no substrate address for the joiner, so its
+        /// address is the relay's observation (zl-zipline#264).
+        async fn join_net_unaddressed_joiner() -> (Arc<Assembly>, IpAddr, IpAddr) {
+            join_net_where(|peering| peering.substrate_b = None).await
+        }
+
+        /// As [join_net], with `tweak` applied to the relay-joiner peering (the joiner is
+        /// its `node_b`).
+        async fn join_net_where(
+            tweak: impl FnOnce(&mut zpr::policy_types::Peering),
+        ) -> (Arc<Assembly>, IpAddr, IpAddr) {
             let relay: IpAddr = RELAY.parse().unwrap();
             let zode: IpAddr = ZODE.parse().unwrap();
             let other: IpAddr = OTHER.parse().unwrap();
+            let mut peering = make_peering(relay, zode, "link-rz", vec![]);
+            tweak(&mut peering);
             build_net_with_policy(policy_with_peerings_cns_and_tcp_services(
-                &[make_peering(relay, zode, "link-rz", vec![])],
+                &[peering],
                 &[
                     (relay, "relay.zpr"),
                     (zode, "zode.zpr"),
@@ -5564,21 +5556,33 @@ mod tests {
             capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), actor.unwrap()))
         }
 
-        /// One `requestBootstrapVisas(peer_cn)` call: the decoded answer or the error code.
+        /// The joiner's substrate address as the relay observes it, unless a test says
+        /// otherwise.
+        const OBSERVED: &str = "192.0.2.10:5000";
+
+        /// One `requestBootstrapVisas(peer_cn, OBSERVED)` call: the decoded answer or the
+        /// error code.
         async fn request(
             handle: &vsapi::v_s_handle::Client,
             peer_cn: &str,
         ) -> Result<BootstrapVisas, vsapi::ErrorCode> {
-            request_raw(handle, peer_cn.as_bytes()).await
+            request_raw(handle, peer_cn.as_bytes(), OBSERVED.parse().unwrap()).await
         }
 
-        /// As [request], with `peer_cn` sent as raw bytes, which need not be valid UTF-8.
+        /// As [request], with `peer_cn` sent as raw bytes, which need not be valid UTF-8,
+        /// and the relay's observation `observed`.
         async fn request_raw(
             handle: &vsapi::v_s_handle::Client,
             peer_cn: &[u8],
+            observed: SocketAddr,
         ) -> Result<BootstrapVisas, vsapi::ErrorCode> {
             let mut req = handle.request_bootstrap_visas_request();
             req.get().set_peer_cn(capnp::text::Reader::from(peer_cn));
+            zpr::vsapi_types::SockAddr {
+                addr: observed.ip(),
+                port: observed.port(),
+            }
+            .write_to(&mut req.get().init_observed_addr());
             let resp = req.send().promise.await.unwrap();
             let res = resp.get().unwrap().get_res().unwrap();
             match res.which().unwrap() {
@@ -5838,16 +5842,24 @@ mod tests {
                     let (asm, relay, zode) = join_net().await;
                     let not_utf8: &[u8] = &[0xff, 0xfe, b'z'];
                     assert_eq!(
-                        request_raw(&handle_for(&asm, &zode).await, not_utf8)
-                            .await
-                            .unwrap_err(),
+                        request_raw(
+                            &handle_for(&asm, &zode).await,
+                            not_utf8,
+                            OBSERVED.parse().unwrap()
+                        )
+                        .await
+                        .unwrap_err(),
                         vsapi::ErrorCode::InvalidOperation,
                         "a non-relay caller is refused before its CN is read"
                     );
                     assert_eq!(
-                        request_raw(&handle_for(&asm, &relay).await, not_utf8)
-                            .await
-                            .unwrap_err(),
+                        request_raw(
+                            &handle_for(&asm, &relay).await,
+                            not_utf8,
+                            OBSERVED.parse().unwrap()
+                        )
+                        .await
+                        .unwrap_err(),
                         vsapi::ErrorCode::NotFound,
                         "the relay's unreadable CN names no peer"
                     );
@@ -6176,6 +6188,161 @@ mod tests {
                             );
                         }
                     }
+                })
+                .await;
+        }
+
+        // --- The relay's observation of the joiner (zl-zipline#264) ---
+
+        /// A granted request records the relay's observation, and it is the joiner's
+        /// substrate address when it connects (policy declares none for it).
+        #[tokio::test]
+        async fn a_granted_request_records_the_observation() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, zode) = join_net_unaddressed_joiner().await;
+                    asm.actor_mgr.remove_node(&zode).await.unwrap();
+                    asm.actor_mgr.remove_actor_by_zpr_addr(&zode).await.unwrap();
+                    request(&handle_for(&asm, &relay).await, "zode.zpr")
+                        .await
+                        .expect("granted");
+                    let observed: SocketAddr = OBSERVED.parse().unwrap();
+                    assert_eq!(
+                        asm.observed_substrate.get(&zode).map(|e| *e),
+                        Some(observed)
+                    );
+                    assert_eq!(
+                        crate::connection_control::substrate_addr_for(&asm, &zode)
+                            .await
+                            .unwrap(),
+                        Some(observed)
+                    );
+                })
+                .await;
+        }
+
+        /// A rejoin's request brings the joiner's stored claim up to date at once, before
+        /// its next `connect` or `open`.
+        #[tokio::test]
+        async fn a_rejoin_updates_the_stored_claim() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, zode) = join_net_unaddressed_joiner().await;
+                    let moved: SocketAddr = "198.51.100.7:6000".parse().unwrap();
+                    request_raw(&handle_for(&asm, &relay).await, b"zode.zpr", moved)
+                        .await
+                        .expect("granted");
+                    let stored = asm
+                        .actor_mgr
+                        .get_actor_by_zpr_addr(&zode)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        stored
+                            .get_attribute(key::SUBSTRATE_ADDR)
+                            .unwrap()
+                            .get_value()[0],
+                        moved.to_string()
+                    );
+                })
+                .await;
+        }
+
+        /// An IPv4-mapped observation (a dual-stack relay socket) is recorded as plain IPv4,
+        /// which an IPv4-only peer can dial.
+        #[tokio::test]
+        async fn an_ipv4_mapped_observation_is_recorded_as_ipv4() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, zode) = join_net_unaddressed_joiner().await;
+                    let mapped: SocketAddr = "[::ffff:192.0.2.10]:5000".parse().unwrap();
+                    request_raw(&handle_for(&asm, &relay).await, b"zode.zpr", mapped)
+                        .await
+                        .expect("granted");
+                    assert_eq!(
+                        asm.observed_substrate.get(&zode).map(|e| *e),
+                        Some("192.0.2.10:5000".parse().unwrap())
+                    );
+                })
+                .await;
+        }
+
+        /// An observation that names no place to dial is `paramError` (vs.capnp): nothing is
+        /// recorded, nothing is minted, and the joiner's session is not ended.
+        #[tokio::test]
+        async fn an_undialable_observation_is_param_error() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, zode) = join_net_unaddressed_joiner().await;
+                    let before = asm
+                        .actor_mgr
+                        .get_actor_by_zpr_addr(&zode)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    for observed in [
+                        "0.0.0.0:7000",
+                        "[::]:7000",
+                        "[::ffff:0.0.0.0]:7000",
+                        "192.0.2.10:0",
+                    ] {
+                        let observed: SocketAddr = observed.parse().unwrap();
+                        assert_eq!(
+                            request_raw(&handle_for(&asm, &relay).await, b"zode.zpr", observed)
+                                .await
+                                .unwrap_err(),
+                            vsapi::ErrorCode::ParamError,
+                            "{observed}"
+                        );
+                    }
+                    assert!(asm.observed_substrate.is_empty());
+                    let after = asm
+                        .actor_mgr
+                        .get_actor_by_zpr_addr(&zode)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        after.get_attribute(key::SESSION),
+                        before.get_attribute(key::SESSION)
+                    );
+                    assert_eq!(
+                        after.get_attribute(key::SUBSTRATE_ADDR),
+                        before.get_attribute(key::SUBSTRATE_ADDR)
+                    );
+                    assert!(
+                        asm.visa_mgr
+                            .get_visa_ids_for_actors(&[relay, zode])
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                })
+                .await;
+        }
+
+        /// The observation is checked last of the refusals (vs.capnp error order): a caller
+        /// that is not the relay gets `invalidOperation`, and the relay naming no peer gets
+        /// `notFound`, whatever address they sent.
+        #[tokio::test]
+        async fn an_undialable_observation_is_checked_after_the_caller_and_the_cn() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, zode) = join_net_unaddressed_joiner().await;
+                    let undialable: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                    assert_eq!(
+                        request_raw(&handle_for(&asm, &zode).await, b"relay.zpr", undialable)
+                            .await
+                            .unwrap_err(),
+                        vsapi::ErrorCode::InvalidOperation
+                    );
+                    assert_eq!(
+                        request_raw(&handle_for(&asm, &relay).await, b"other.zpr", undialable)
+                            .await
+                            .unwrap_err(),
+                        vsapi::ErrorCode::NotFound
+                    );
                 })
                 .await;
         }
