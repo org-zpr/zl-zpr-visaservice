@@ -715,18 +715,22 @@ async fn add_node_serialized(
     {
         return Err(policy_moved_error());
     }
-    if !reconnect && let Some(addr) = node_actor.get_zpr_addr() {
-        reset_node_state(asm, ops, addr).await?;
-    }
     // The substrate claim was resolved before authentication. Resolve it again here,
     // under the topology guard the relay's bootstrap request also holds when it records
     // an observation, so a rejoin observed meanwhile is not overwritten by the address
-    // read before (zl-zipline#264).
+    // read before, and a claim nothing vouches for any more (the node was disconnected
+    // meanwhile) is dropped, not persisted (zl-zipline#264).
     let mut node_actor = node_actor.clone();
-    if let Some(addr) = node_actor.get_zpr_addr().copied()
-        && let Some(substrate) = crate::connection_control::substrate_addr_for(asm, &addr).await?
-    {
-        set_substrate_claim(&mut node_actor, substrate);
+    if let Some(addr) = node_actor.get_zpr_addr().copied() {
+        match crate::connection_control::substrate_addr_for(asm, &addr).await? {
+            Some(substrate) => set_substrate_claim(&mut node_actor, substrate),
+            None => {
+                node_actor.remove_attribute(key::SUBSTRATE_ADDR);
+            }
+        }
+    }
+    if !reconnect && let Some(addr) = node_actor.get_zpr_addr() {
+        reset_node_state(asm, ops, addr).await?;
     }
     asm.actor_mgr
         .add_node(&node_actor, reconnect, &asm.policy_service_names())
@@ -5787,6 +5791,37 @@ mod tests {
                 crate::connection_control::substrate_claim(&stored),
                 Some(moved)
             );
+        }
+
+        /// Hosted review (Copilot): if the node was disconnected between preparation and
+        /// commit (its actor and observation are gone), nothing vouches for the prepared
+        /// claim any more, so the commit drops it rather than persist it.
+        #[tokio::test]
+        async fn the_commit_drops_a_claim_nothing_vouches_for_any_more() {
+            let (asm, _relay, zode) = crate::core_visas::tests::build_net().await;
+            let prepared = asm
+                .actor_mgr
+                .get_actor_by_zpr_addr(&zode)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(crate::connection_control::substrate_claim(&prepared).is_some());
+            asm.actor_mgr.remove_actor_by_zpr_addr(&zode).await.unwrap();
+
+            // A fresh (`Reset`) connect: there is no stored actor to update.
+            let ops = asm.topo_mgr.ops().await;
+            add_node_serialized(&asm, &ops, &prepared, false)
+                .await
+                .unwrap();
+            drop(ops);
+
+            let stored = asm
+                .actor_mgr
+                .get_actor_by_zpr_addr(&zode)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(crate::connection_control::substrate_claim(&stored), None);
         }
 
         /// Local review (Codex): a `ping` that restarts a Zode's missing VSS worker makes
