@@ -33,6 +33,11 @@
 //! an end newly reports a direct link `down` ([LinkStateTable::newly_down]), the visa
 //! service proposes the link to both ends again after a short delay, once. Further `down`
 //! reports for the pair are coalesced into that one re-proposal until it is sent.
+//!
+//! And which node has a **departure check pending** (zl-zipline#284): when a node is left
+//! with no up link, the visa service checks after a grace whether it is gone. A link of the
+//! node coming up drops the pending check, so a link that came back and went down again
+//! starts a new grace.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -60,6 +65,14 @@ pub struct LinkStateTable {
     /// again (zl-zipline#268), each stored as [pair_key]. Coalesces every further `down`
     /// for the pair until the delayed re-proposal takes the mark.
     pending_repropose: HashSet<(IpAddr, IpAddr)>,
+    /// Node -> the token and VS-API session of its pending departure check
+    /// (zl-zipline#284). A further loss in the same session is covered by the pending
+    /// check and does not extend its grace; a link coming up drops the entry
+    /// ([Self::link_is_up]), so the check finds it gone and does nothing, and the
+    /// next loss starts a new grace.
+    pending_departure: HashMap<IpAddr, (u64, Option<String>)>,
+    /// The last departure-check token handed out ([Self::mark_departure]).
+    last_departure_token: u64,
 }
 
 /// The key of the unordered pair {a, b} in [LinkStateTable::failed_pairs] and
@@ -154,6 +167,42 @@ impl LinkStateTable {
     /// [Self::mark_repropose]. Returns false if there was none.
     pub fn take_repropose(&mut self, a: IpAddr, b: IpAddr) -> bool {
         self.pending_repropose.remove(&pair_key(a, b))
+    }
+
+    /// Record that `node`, in VS-API session `session`, has no up link left
+    /// (zl-zipline#284). Returns the token its departure check must present to
+    /// [Self::take_departure], or None if a check for the same session is already
+    /// pending: that one covers this loss too, and its grace is not extended.
+    pub fn mark_departure(&mut self, node: IpAddr, session: Option<&str>) -> Option<u64> {
+        if let Some((_, pending)) = self.pending_departure.get(&node)
+            && pending.as_deref() == session
+        {
+            return None;
+        }
+        self.last_departure_token += 1;
+        let token = self.last_departure_token;
+        self.pending_departure
+            .insert(node, (token, session.map(str::to_string)));
+        Some(token)
+    }
+
+    /// Take `node`'s pending departure check if `token` is still the pending one
+    /// ([Self::mark_departure]). Returns false if a link of the node came up meanwhile,
+    /// a check for a newer session replaced it, or it was taken already.
+    pub fn take_departure(&mut self, node: IpAddr, token: u64) -> bool {
+        if self.pending_departure.get(&node).map(|(t, _)| *t) != Some(token) {
+            return false;
+        }
+        self.pending_departure.remove(&node);
+        true
+    }
+
+    /// The link between `a` and `b` is up: drop both ends' pending departure checks,
+    /// if any. Called wherever a router link is set up: a report's refresh, an install,
+    /// and the policy pass.
+    pub fn link_is_up(&mut self, a: &IpAddr, b: &IpAddr) {
+        self.pending_departure.remove(a);
+        self.pending_departure.remove(b);
     }
 
     /// True if the link between `a` and `b` is marked failed (in either order).
@@ -427,6 +476,31 @@ mod tests {
         assert!(t.take_repropose(ip(B), ip(A)), "taken");
         assert!(!t.take_repropose(ip(A), ip(B)), "nothing left to take");
         assert!(t.mark_repropose(ip(A), ip(B)), "can be marked again");
+    }
+
+    #[test]
+    fn a_departure_check_is_coalesced_per_session_and_dropped_on_recovery() {
+        let mut t = LinkStateTable::new();
+        let first = t.mark_departure(ip(A), Some("s1")).expect("first loss");
+        assert_eq!(
+            t.mark_departure(ip(A), Some("s1")),
+            None,
+            "same session: covered"
+        );
+        let other = t.mark_departure(ip(B), Some("s1")).expect("per node");
+        let newer = t.mark_departure(ip(A), Some("s2")).expect("a new session");
+        assert!(
+            !t.take_departure(ip(A), first),
+            "replaced by the newer session's"
+        );
+        assert!(t.take_departure(ip(A), newer), "the pending one is taken");
+        assert!(!t.take_departure(ip(A), newer), "taken only once");
+        t.link_is_up(&ip(B), &ip(C));
+        assert!(!t.take_departure(ip(B), other), "dropped by a recovery");
+        assert!(
+            t.mark_departure(ip(B), Some("s1")).is_some(),
+            "a new loss after it"
+        );
     }
 
     // --- R13a: failed pairs ---

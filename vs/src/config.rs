@@ -114,6 +114,24 @@ pub const LOGIN_POLICY_CHANGED_RETRY_SECS: u32 = 1;
 /// - Much longer only keeps the pair on the relay for no benefit.
 pub const LINK_REPROPOSE_DELAY: Duration = Duration::from_secs(5);
 
+/// How long every link of a Zode must stay down, after one of them is reported `down`,
+/// before the visa service treats the Zode as departed and removes it: its actor (and
+/// with it the services it provides), its router node, its VSS worker, its visas and its
+/// managed address (zl-zipline#284; ZODE_LINKS.md "Loss").
+///
+/// Why 10 s (operator, pd gate g193 q3):
+/// - A crashed Zode is noticed only once its peers' keep-alive gives up (about 9-12 s).
+///   With this grace and a DNS cache period of 30 s on top, a crashed service stops
+///   resolving within about 52 s, inside the 60 s the DNS demo allows. A 15 s grace would
+///   leave about 3 s of slack, a 5 s grace about 13 s.
+/// - Too short costs little: a Zode removed while still alive (a long partition) rejoins
+///   as `reset` on its own, losing only what any node `authenticate` drops anyway.
+/// - Too long only keeps a departed Zode visible to DNS and the admin API for longer.
+///
+/// A Zode that rejoins within the grace is kept: a rejoin always starts a new VS-API
+/// session, and the check removes only the session it was scheduled for.
+pub const ZODE_DEPARTURE_GRACE: Duration = Duration::from_secs(10);
+
 pub const MAX_VISA_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
 /// A visa must be valid for at least this long to be worth issuing. Below this the node
