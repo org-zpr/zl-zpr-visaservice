@@ -4136,12 +4136,17 @@ mod tests {
                 .run_until(async {
                     let (asm, mut event_rx, handle) = build_two_node_asm().await;
                     let node_a_addr: std::net::IpAddr = NODE_A.parse().unwrap();
+                    asm.observed_substrate
+                        .insert(node_a_addr, "192.0.2.20:5000".parse().unwrap());
 
                     assert_eq!(
                         send_notify_disconnect(&handle, None).await,
                         Ok(()),
                         "a node must be able to disconnect itself (fallback path)"
                     );
+                    // zl-zipline#264 with #284: a gone node's observation is forgotten;
+                    // only its next join through the relay records a new one.
+                    assert!(!asm.observed_substrate.contains_key(&node_a_addr));
                     assert!(
                         asm.actor_mgr
                             .get_actor_by_zpr_addr(&node_a_addr)

@@ -2460,6 +2460,9 @@ impl ConnectionControl {
                 // the pool: addresses are recycled, and a later actor at this address
                 // must not inherit them.
                 asm.ts_mgr.forget_actor_revisions(&zpr_addr);
+                // Its relay observation goes too: the node is gone, and its next join
+                // through the relay records a new one (zl-zipline#264).
+                asm.observed_substrate.remove(&zpr_addr);
             }
             Err(e) => {
                 // Caller can't do anything with this. So just log and continue.
