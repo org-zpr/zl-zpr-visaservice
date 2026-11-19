@@ -173,8 +173,9 @@ async fn main() -> std::process::ExitCode {
     // not on a local interface (or a port already taken) stops the process
     // at once with the address and the OS error -- and holds no ValKey lock
     // that would block a supervisor's restart. The sockets do not listen
-    // until hydration is done (see `start_listening` below), so clients get
-    // "connection refused" until then, as before.
+    // until self-authorization succeeds (zl-zipline#285, see
+    // `listen_after_self_authorize` below), so clients get "connection
+    // refused" until the visa service is ready.
     let reserved = match listeners::ReservedListeners::bind(
         cfg.get_vs_addr(),
         cfg.core.vsapi_port.unwrap_or(config::VSAPI_PORT),
@@ -458,37 +459,48 @@ async fn main() -> std::process::ExitCode {
     js.spawn_local(signal_worker::launch(asm.clone()));
     js.spawn_local(event_mgr::launch(asm.clone(), event_rx));
 
-    // The visa service's own ZPR address (`vs_addr`) is used both ways: the
+    // zl-zipline#285: hydration is done. Perform the initial
+    // self-authorization, with a time limit, and only then start listening
+    // on the reserved sockets, so a listening port means "ready". The
+    // visa service's own ZPR address (`vs_addr`) is used both ways: the
     // VS-API and admin listeners are bound to it at startup (above), and every
     // outbound VSS connection binds it as its source (`vss_worker::connect_from`).
-    // Hydration is done: start listening on the reserved sockets now.
-    let (vsapi_listener, admin_listener) = match (
-        listeners::start_listening(listeners::ListenerRole::VsApi, reserved.vsapi),
-        listeners::start_listening(listeners::ListenerRole::Admin, reserved.admin),
-    ) {
-        (Ok(v), Ok(a)) => (v, a),
-        (Err(e), _) | (_, Err(e)) => {
-            error!(target: MAIN, "{e}");
+    let listening = match listen_after_self_authorize(
+        reserved,
+        self_authorize(asm.clone(), &cfg.get_vs_addr()),
+        SELF_AUTHORIZE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(l) => l,
+        Err(e) => {
             // Stop the lock renewal before the release, so it cannot take the
             // lock again. The LocalSet must run for its tasks to be stopped.
-            local_set.run_until(js.shutdown()).await;
-            release_instance_lock(asm.state_db.as_ref(), &vslock_desc).await;
+            exit_after_startup_error(
+                &e,
+                || local_set.run_until(js.shutdown()),
+                || release_instance_lock(asm.state_db.as_ref(), &vslock_desc),
+            )
+            .await;
             return std::process::ExitCode::FAILURE;
         }
     };
+    let vsapi_addr = listening.vsapi.local_addr();
+    let admin_addr = listening.admin.local_addr();
 
     // zl-zipline#266: the listener tasks are kept apart from `js`. If either
     // one ends, the service stops (see `listeners::supervise` below).
     let mut listener_tasks: Vec<listeners::ListenerTask> = Vec::new();
     listener_tasks.push((
         listeners::ListenerRole::VsApi,
-        tokio::task::spawn_local(vsapi_worker::launch(asm.clone(), vsapi_listener)),
+        tokio::task::spawn_local(vsapi_worker::launch(asm.clone(), listening.vsapi)),
     ));
 
     {
         let admin_key = cfg.core.admin_key.clone();
         let admin_cert = cfg.core.admin_cert.clone();
         let admin_asm = asm.clone();
+        let admin_listener = listening.admin;
         // The admin accept loop retries its errors and never returns; it
         // ends only by a panic (for example an unreadable cert file), which
         // `supervise` reports.
@@ -514,11 +526,13 @@ async fn main() -> std::process::ExitCode {
     let _auth_sweeper =
         auth_sweep::spawn_auth_expiry_sweeper(asm.clone(), config::MIN_VISA_LIFETIME);
 
-    // perform initial self-authorization
-    if let Err(e) = self_authorize(asm.clone(), &cfg.get_vs_addr()).await {
-        error!(target: MAIN, "self-authorization failed: {}", e);
-        return std::process::ExitCode::FAILURE;
-    }
+    // zl-zipline#285, Q3: one line that says the visa service is ready.
+    info!(
+        target: MAIN,
+        "vs ready: VS-API on {}, admin on {}",
+        display_local_addr(vsapi_addr),
+        display_local_addr(admin_addr)
+    );
 
     // TODO: Setup/launch the workers for the visa service. Those that will do the actual work
     // of generating visas, and all the housekeeping.
@@ -680,6 +694,15 @@ struct Listening {
     admin: tokio::net::TcpListener,
 }
 
+/// Format a listener's local address for a log line. A listening socket
+/// always has one; if the OS cannot report it, the error is shown instead.
+fn display_local_addr(addr: std::io::Result<std::net::SocketAddr>) -> String {
+    match addr {
+        Ok(a) => a.to_string(),
+        Err(e) => format!("<unknown address: {e}>"),
+    }
+}
+
 /// Self-authorize the visa service, then start listening on the reserved
 /// VS-API and admin sockets (zl-zipline#285).
 ///
@@ -726,6 +749,8 @@ where
     RF: std::future::Future<Output = ()>,
 {
     error!(target: MAIN, "{err}; the visa service stops");
+    shutdown().await;
+    release().await;
 }
 
 /// Load configuration from an explicit path, the default path, or fall back to defaults.
