@@ -647,7 +647,10 @@ async fn self_authorize_within<F>(
 where
     F: std::future::Future<Output = Result<(), ServiceError>>,
 {
-    self_auth.await.map_err(SelfAuthError::Failed)
+    match tokio::time::timeout(deadline, self_auth).await {
+        Ok(res) => res.map_err(SelfAuthError::Failed),
+        Err(_) => Err(SelfAuthError::TimedOut(deadline)),
+    }
 }
 
 /// Load configuration from an explicit path, the default path, or fall back to defaults.
