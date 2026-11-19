@@ -366,7 +366,7 @@ impl TopologyMgr {
         let mut table = self.link_state.lock().unwrap();
         table.remove_node(node);
         let snapshot = current_policy();
-        self.refresh_links_locked(&table, node, &Self::policy_cn_lookup(&snapshot))
+        self.refresh_links_locked(&mut table, node, &Self::policy_cn_lookup(&snapshot))
     }
 
     /// Re-evaluate every router link incident to `node`. Returns the links that went from
@@ -379,14 +379,14 @@ impl TopologyMgr {
         node: &IpAddr,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
     ) -> Vec<(IpAddr, IpAddr)> {
-        let table = self.link_state.lock().unwrap();
-        self.refresh_links_locked(&table, node, cn_of)
+        let mut table = self.link_state.lock().unwrap();
+        self.refresh_links_locked(&mut table, node, cn_of)
     }
 
     /// As [Self::refresh_links_for_node], with the table already locked by the caller.
     fn refresh_links_locked(
         &self,
-        table: &LinkStateTable,
+        table: &mut LinkStateTable,
         node: &IpAddr,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
     ) -> Vec<(IpAddr, IpAddr)> {
@@ -451,6 +451,29 @@ impl TopologyMgr {
     /// there was none.
     pub fn take_repropose(&self, _ops: &TopoOps<'_>, a: &IpAddr, b: &IpAddr) -> bool {
         self.link_state.lock().unwrap().take_repropose(*a, *b)
+    }
+
+    /// Record that `node`, in VS-API session `session`, has no up link left
+    /// (zl-zipline#284). Returns the token its departure check presents to
+    /// [Self::take_departure], or None if a check for that session is already pending
+    /// (`LinkStateTable::mark_departure`).
+    pub fn mark_departure(
+        &self,
+        _ops: &TopoOps<'_>,
+        node: &IpAddr,
+        session: Option<&str>,
+    ) -> Option<u64> {
+        self.link_state
+            .lock()
+            .unwrap()
+            .mark_departure(*node, session)
+    }
+
+    /// Take `node`'s pending departure check if `token` is still the pending one
+    /// ([Self::mark_departure]). Returns false if a link of the node came up meanwhile,
+    /// or a newer session's check replaced it.
+    pub fn take_departure(&self, _ops: &TopoOps<'_>, node: &IpAddr, token: u64) -> bool {
+        self.link_state.lock().unwrap().take_departure(*node, token)
     }
 
     /// Make the router's transit set the one `snapshot`'s policy declares
@@ -534,7 +557,7 @@ impl TopologyMgr {
     /// link is a no-op.
     fn refresh_link(
         &self,
-        table: &LinkStateTable,
+        table: &mut LinkStateTable,
         a: &IpAddr,
         b: &IpAddr,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
@@ -546,6 +569,9 @@ impl TopologyMgr {
         let changed = self.router.set_link_up(&link.id, usable);
         if changed {
             info!(target: TOPO, "link {} between {} and {} is now {}", link.id.0, a, b, if usable { "up" } else { "down" });
+        }
+        if changed && usable {
+            table.link_is_up(a, b); // zl-zipline#284
         }
         changed && !usable
     }
@@ -569,8 +595,11 @@ impl TopologyMgr {
         // refreshes the links it can see: it either runs before (and this read sees
         // its snapshot) or after (and its refresh sees this link). Lock order is
         // table, then router; no path takes them the other way round.
-        let table = self.link_state.lock().unwrap();
+        let mut table = self.link_state.lock().unwrap();
         let up = Self::usable_in(&table, a, b, cn_of);
+        if up {
+            table.link_is_up(a, b); // zl-zipline#284
+        }
         self.router.add_link_with_state(
             a.clone(),
             b.clone(),
@@ -967,7 +996,7 @@ impl TopologyMgr {
         // rebuilt link gets the flag its reports call for, inside the atomic batch.
         // The table stays locked until the batch is applied, for the same reason as
         // in install_router_link: a concurrent report cannot slip in between.
-        let table = self.link_state.lock().unwrap();
+        let mut table = self.link_state.lock().unwrap();
         let current = current_policy();
         let flag_cn_of = Self::policy_cn_lookup(&current);
         // A removed link that is up now (read under the lock: a report may have brought
@@ -1012,7 +1041,15 @@ impl TopologyMgr {
                 }
             }
         }
+        let up_links: Vec<(IpAddr, IpAddr)> = additions
+            .iter()
+            .filter(|l| l.up)
+            .map(|l| (l.a, l.b))
+            .collect();
         self.router.apply_link_batch(&removal_ids, additions)?;
+        for (a, b) in &up_links {
+            table.link_is_up(a, b); // zl-zipline#284
+        }
         drop(table);
 
         // Detect + report orphans. An orphan node is a legitimate state and stays in the
@@ -2146,6 +2183,35 @@ mod tests {
         );
         assert!(report.links_down.is_empty(), "it was never up");
         report_both_up_and_check(&topo, a, b);
+    }
+
+    #[tokio::test]
+    async fn test_revalidate_installing_an_up_link_drops_pending_departure_checks() {
+        // zl-zipline#284 (PR #72 review): a link the policy pass installs up is a
+        // recovery like a report's, so both ends' pending departure checks are dropped.
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr = make_policy_mgr_with_cns(db.clone(), a, b).await;
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        report_both_up(&topo, a, b); // no router link yet: only the table learns it
+        let ops = topo.ops_now();
+        let check_a = topo.mark_departure(&ops, &a, Some("s")).unwrap();
+        let check_b = topo.mark_departure(&ops, &b, Some("s")).unwrap();
+
+        let report = topo
+            .revalidate_against_policy(&ops, &policy_mgr.get_current_snapshot(), &[a, b], &|| {
+                policy_mgr.get_current_snapshot()
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.links_repaired, 1);
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+        assert!(!topo.take_departure(&ops, &a, check_a), "A's check dropped");
+        assert!(!topo.take_departure(&ops, &b, check_b), "B's check dropped");
     }
 
     #[tokio::test]
