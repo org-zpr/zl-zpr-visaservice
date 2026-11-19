@@ -5831,21 +5831,22 @@ mod tests {
         async fn a_ping_that_restarts_the_vss_worker_re_proposes_the_link() {
             tokio::task::LocalSet::new()
                 .run_until(async {
-                    let (asm, mut relay_vss, handle, observed) = unaddressed_zode_session().await;
+                    let (asm, mut relay_vss, handle, _) = unaddressed_zode_session().await;
                     let zode: IpAddr = crate::core_visas::tests::ZODE.parse().unwrap();
                     let vss = SocketAddr::new(zode, crate::core_visas::tests::VSS_PORT);
                     asm.actor_mgr.set_node_vss(&zode, &vss).await.unwrap();
 
                     handle.ping_request().send().promise.await.unwrap();
 
-                    let links = next_relay_links(
+                    // Only that the relay is told: the restarted worker is a real one with
+                    // no VSS listener behind it, so it may exit at any moment, and with it
+                    // the address (the registerVss test checks the address).
+                    next_relay_links(
                         &asm,
                         &mut relay_vss,
                         "the ping that restarted the worker sends the relay topology again",
                     )
                     .await;
-                    assert_eq!(links.len(), 1, "{links:?}");
-                    assert_eq!(links[0].peer.clone().map(SocketAddr::from), Some(observed));
                 })
                 .await;
         }
