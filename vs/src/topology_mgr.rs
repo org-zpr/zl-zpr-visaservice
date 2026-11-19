@@ -453,6 +453,18 @@ impl TopologyMgr {
         self.link_state.lock().unwrap().take_repropose(*a, *b)
     }
 
+    /// Record that `node` has just lost its last up link (zl-zipline#284); returns the
+    /// token its departure check presents to [Self::take_departure].
+    pub fn mark_departure(&self, _ops: &TopoOps<'_>, node: &IpAddr) -> u64 {
+        self.link_state.lock().unwrap().mark_departure(*node)
+    }
+
+    /// Take `node`'s pending departure check if `token` is still the latest
+    /// ([Self::mark_departure]). Returns false if a later loss superseded it.
+    pub fn take_departure(&self, _ops: &TopoOps<'_>, node: &IpAddr, token: u64) -> bool {
+        self.link_state.lock().unwrap().take_departure(*node, token)
+    }
+
     /// Make the router's transit set the one `snapshot`'s policy declares
     /// (`Policy.transitNodes`, zl-zipline#255): only those nodes may be an interior hop
     /// of a route. Takes the caller's [TopoOps] because it is a topology write.
