@@ -842,21 +842,26 @@ async fn repropose_link_after_down(asm: Arc<Assembly>, a: IpAddr, b: IpAddr, del
     crate::event_mgr::send_topology_to(&asm, &psnap, &[a, b]).await;
 }
 
-/// A link of `node` has just gone down (zl-zipline#284): unless `node` is the relay, has
-/// no stored node actor, or still has a link up, read its current VS-API session under
-/// `ops` and spawn [remove_if_departed] to remove it if every link of it is still down
-/// [config::ZODE_DEPARTURE_GRACE] later, for the same session.
+/// A link of `node` has just gone down, or a peer has newly reported it `down`
+/// (zl-zipline#284): unless `node` is the relay, has no stored node actor, or still has a
+/// link up, read its current VS-API session under `ops` and spawn [remove_if_departed] to
+/// remove it if it is still in that session with every link down
+/// [config::ZODE_DEPARTURE_GRACE] later.
 ///
-/// Only the loss of a node's last up link schedules a check, and only the latest such
-/// check counts ([TopologyMgr::mark_departure]), so the grace starts when the last link
-/// goes down: a check from an earlier loss, since followed by a recovery and a new loss,
-/// does nothing. A check that finds the actor gone, or its session replaced, does nothing
-/// either.
+/// One check per outage ([TopologyMgr::mark_departure]): a further loss in the same
+/// session is covered by the pending check and does not extend its grace, and a link of
+/// the node coming up drops the pending check, so the next loss starts a new grace. A
+/// peer's newly reported `down` counts as a loss too, so a Zode whose link never came up
+/// (it left before its first `up`) is removed as well.
 ///
 /// The relay is never removed: the visa service docks on it, and its own departure ends
 /// the visa service's reach anyway.
 ///
-/// ponytail: only link-down reports schedule checks, so the actor of a Zode that departs
+/// A link lost without a report -- its peer's rejoin teardown, a policy change -- starts
+/// no check: that is no evidence the node left, and its surviving peers report it `down`
+/// if it did.
+///
+/// ponytail: only link-state reports schedule checks, so the actor of a Zode that departs
 /// while the visa service is down is restored at startup and stays. Add a startup sweep
 /// if that ever matters.
 async fn schedule_departure_check(asm: &Arc<Assembly>, ops: &TopoOps<'_>, node: IpAddr) {
@@ -874,8 +879,10 @@ async fn schedule_departure_check(asm: &Arc<Assembly>, ops: &TopoOps<'_>, node: 
     let session = actor
         .get_attribute(key::SESSION)
         .and_then(|a| a.get_single_value().ok().map(str::to_string));
-    debug!(target: API, "Zode {node}: a link went down; checking for departure in {:?}", config::ZODE_DEPARTURE_GRACE);
-    let token = asm.topo_mgr.mark_departure(ops, &node);
+    let Some(token) = asm.topo_mgr.mark_departure(ops, &node, session.as_deref()) else {
+        return; // the pending check for this session covers this loss
+    };
+    debug!(target: API, "Zode {node}: no link up; checking for departure in {:?}", config::ZODE_DEPARTURE_GRACE);
     tokio::spawn(remove_if_departed(
         asm.clone(),
         node,
@@ -893,12 +900,12 @@ fn has_a_link_up(asm: &Assembly, node: &IpAddr) -> bool {
         .any(|peer| asm.topo_mgr.link_up(node, peer))
 }
 
-/// The delayed half of [schedule_departure_check]: after `grace`, remove `node` if this
-/// is still its latest check (`token`), it is still the same VS-API session (`session`),
+/// The delayed half of [schedule_departure_check]: after `grace`, remove `node` if its
+/// check (`token`) is still pending, it is still the same VS-API session (`session`),
 /// and none of its router links is up.
 ///
-/// The token check drops a check whose loss was followed by a recovery and a new loss:
-/// the newer check runs a full grace after it. The session check keeps a Zode that
+/// The token check drops a check whose outage ended (a link came up) or whose node's
+/// newer session has a check of its own. The session check keeps a Zode that
 /// rejoined meanwhile (a rejoin always stamps a new session, before the Zode is back) and
 /// leaves alone one that is already gone. The link check keeps a Zode one of whose links
 /// is up again: a link is up only while both ends report it up, and a departed Zode's
@@ -918,7 +925,7 @@ async fn remove_if_departed(
     tokio::time::sleep(grace).await;
     let ops = asm.topo_mgr.ops().await;
     if !asm.topo_mgr.take_departure(&ops, &node, token) {
-        debug!(target: API, "Zode {node}: a later loss of its links restarted the grace");
+        debug!(target: API, "Zode {node}: a link came up meanwhile, or a newer check is pending");
         return;
     }
     if crate::core_visas::require_current_session(&asm, &node, session.as_deref())
@@ -2566,19 +2573,21 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         // zl-zipline#268: propose each newly-down direct link again after a delay. The
         // mark is set under the guard, so reports from both ends coalesce into one
         // re-proposal; the delayed task sends outside it.
-        for peer in changes.newly_down {
-            schedule_link_repropose(&self.asm, &ops, reporter, peer);
+        for peer in &changes.newly_down {
+            schedule_link_repropose(&self.asm, &ops, reporter, *peer);
         }
         // Revoke the visas crossing every link that just went down. A visa whose
         // revocation write fails is quarantined and retried per visa (VisaMgr), so the
-        // report itself succeeds either way. zl-zipline#284: each end of such a link may
-        // have departed; its session is read here, under the guard, and checked again
-        // after a grace.
-        for (a, b) in changes.went_down {
-            let _ = revoke_visas_over_link(&self.asm, &a, &b).await;
-            for end in [a, b] {
-                schedule_departure_check(&self.asm, &ops, end).await;
-            }
+        // report itself succeeds either way.
+        for (a, b) in &changes.went_down {
+            let _ = revoke_visas_over_link(&self.asm, a, b).await;
+        }
+        // zl-zipline#284: each end of a link that went down, and each peer newly reported
+        // `down`, may have departed. Its session is read here, under the guard, and
+        // checked again after a grace.
+        let lost = changes.went_down.iter().flat_map(|(a, b)| [*a, *b]);
+        for node in lost.chain(changes.newly_down.iter().copied()) {
+            schedule_departure_check(&self.asm, &ops, node).await;
         }
         drop(ops);
 
@@ -5462,6 +5471,71 @@ mod tests {
                         has_actor(&asm, NODE_B).await,
                         "kept until a grace after the second loss"
                     );
+                    tokio::time::sleep(EPS * 2).await;
+                    assert_removed(&asm, NODE_B).await;
+                })
+                .await;
+        }
+
+        /// B's link goes down, comes back, then disappears without a down report (its
+        /// peer leaves the router, as a rejoin's teardown does): the recovery dropped
+        /// the pending check, so B is not removed a moment after its new loss (PR #72
+        /// review).
+        #[tokio::test(start_paused = true)]
+        async fn a_recovery_drops_the_pending_check() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, a) = build_with(true, R13A_PORT).await;
+                    make_relay(&asm, NODE_A).await;
+                    new_session(&asm, NODE_B).await;
+                    let b = handle_for(&asm, NODE_B).await;
+                    ab_reported_up(&asm, &a, &b).await;
+                    assert_eq!(
+                        send_report(&a, &[entry("node-b", LinkState::Down)]).await,
+                        Ok(())
+                    );
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    ab_reported_up(&asm, &a, &b).await;
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    {
+                        let ops = asm.topo_mgr.ops().await;
+                        asm.topo_mgr
+                            .remove_node(&ops, &NODE_A.parse().unwrap())
+                            .await;
+                    }
+
+                    tokio::time::sleep(config::ZODE_DEPARTURE_GRACE).await;
+                    assert!(has_actor(&asm, NODE_B).await, "no check after the recovery");
+                })
+                .await;
+        }
+
+        /// B authenticated but its link never came up, so the relay's `down` for it is
+        /// no up-to-down change of the router link; it still starts B's grace (PR #72
+        /// review).
+        #[tokio::test(start_paused = true)]
+        async fn a_zode_whose_link_never_came_up_is_removed() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, a) = build_with(true, R13A_PORT).await;
+                    make_relay(&asm, NODE_A).await;
+                    // Only A reports, so the A-B link goes down (the fixture installs it
+                    // up). The check this schedules is for B's session before it
+                    // authenticates, so it keeps the B below.
+                    assert_eq!(
+                        send_report(&a, &[entry("node-b", LinkState::Up)]).await,
+                        Ok(())
+                    );
+                    new_session(&asm, NODE_B).await;
+                    tokio::time::sleep(config::ZODE_DEPARTURE_GRACE * 2).await;
+                    assert!(has_actor(&asm, NODE_B).await, "nothing has said B left");
+
+                    assert_eq!(
+                        send_report(&a, &[entry("node-b", LinkState::Down)]).await,
+                        Ok(())
+                    );
+                    tokio::time::sleep(config::ZODE_DEPARTURE_GRACE - EPS).await;
+                    assert!(has_actor(&asm, NODE_B).await, "kept within the grace");
                     tokio::time::sleep(EPS * 2).await;
                     assert_removed(&asm, NODE_B).await;
                 })

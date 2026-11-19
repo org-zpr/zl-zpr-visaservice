@@ -366,7 +366,7 @@ impl TopologyMgr {
         let mut table = self.link_state.lock().unwrap();
         table.remove_node(node);
         let snapshot = current_policy();
-        self.refresh_links_locked(&table, node, &Self::policy_cn_lookup(&snapshot))
+        self.refresh_links_locked(&mut table, node, &Self::policy_cn_lookup(&snapshot))
     }
 
     /// Re-evaluate every router link incident to `node`. Returns the links that went from
@@ -379,14 +379,14 @@ impl TopologyMgr {
         node: &IpAddr,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
     ) -> Vec<(IpAddr, IpAddr)> {
-        let table = self.link_state.lock().unwrap();
-        self.refresh_links_locked(&table, node, cn_of)
+        let mut table = self.link_state.lock().unwrap();
+        self.refresh_links_locked(&mut table, node, cn_of)
     }
 
     /// As [Self::refresh_links_for_node], with the table already locked by the caller.
     fn refresh_links_locked(
         &self,
-        table: &LinkStateTable,
+        table: &mut LinkStateTable,
         node: &IpAddr,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
     ) -> Vec<(IpAddr, IpAddr)> {
@@ -453,14 +453,25 @@ impl TopologyMgr {
         self.link_state.lock().unwrap().take_repropose(*a, *b)
     }
 
-    /// Record that `node` has just lost its last up link (zl-zipline#284); returns the
-    /// token its departure check presents to [Self::take_departure].
-    pub fn mark_departure(&self, _ops: &TopoOps<'_>, node: &IpAddr) -> u64 {
-        self.link_state.lock().unwrap().mark_departure(*node)
+    /// Record that `node`, in VS-API session `session`, has no up link left
+    /// (zl-zipline#284). Returns the token its departure check presents to
+    /// [Self::take_departure], or None if a check for that session is already pending
+    /// (`LinkStateTable::mark_departure`).
+    pub fn mark_departure(
+        &self,
+        _ops: &TopoOps<'_>,
+        node: &IpAddr,
+        session: Option<&str>,
+    ) -> Option<u64> {
+        self.link_state
+            .lock()
+            .unwrap()
+            .mark_departure(*node, session)
     }
 
-    /// Take `node`'s pending departure check if `token` is still the latest
-    /// ([Self::mark_departure]). Returns false if a later loss superseded it.
+    /// Take `node`'s pending departure check if `token` is still the pending one
+    /// ([Self::mark_departure]). Returns false if a link of the node came up meanwhile,
+    /// or a newer session's check replaced it.
     pub fn take_departure(&self, _ops: &TopoOps<'_>, node: &IpAddr, token: u64) -> bool {
         self.link_state.lock().unwrap().take_departure(*node, token)
     }
@@ -546,7 +557,7 @@ impl TopologyMgr {
     /// link is a no-op.
     fn refresh_link(
         &self,
-        table: &LinkStateTable,
+        table: &mut LinkStateTable,
         a: &IpAddr,
         b: &IpAddr,
         cn_of: &dyn Fn(&IpAddr) -> Option<String>,
@@ -558,6 +569,11 @@ impl TopologyMgr {
         let changed = self.router.set_link_up(&link.id, usable);
         if changed {
             info!(target: TOPO, "link {} between {} and {} is now {}", link.id.0, a, b, if usable { "up" } else { "down" });
+        }
+        if changed && usable {
+            // zl-zipline#284: both ends have a link up again.
+            table.clear_departure(a);
+            table.clear_departure(b);
         }
         changed && !usable
     }
@@ -581,8 +597,13 @@ impl TopologyMgr {
         // refreshes the links it can see: it either runs before (and this read sees
         // its snapshot) or after (and its refresh sees this link). Lock order is
         // table, then router; no path takes them the other way round.
-        let table = self.link_state.lock().unwrap();
+        let mut table = self.link_state.lock().unwrap();
         let up = Self::usable_in(&table, a, b, cn_of);
+        if up {
+            // zl-zipline#284: both ends have a link up.
+            table.clear_departure(a);
+            table.clear_departure(b);
+        }
         self.router.add_link_with_state(
             a.clone(),
             b.clone(),
