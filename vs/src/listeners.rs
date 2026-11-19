@@ -6,8 +6,9 @@
 //! ValKey or takes the instance lock, so a `vs_addr` that is not on a local
 //! interface stops the process at once with a clear message instead of
 //! leaving a visa service that runs with no VS-API. The bound sockets do not
-//! listen until the service has hydrated its state, so a client still gets
-//! "connection refused" during startup, as before.
+//! listen until the service has hydrated its state and self-authorization
+//! has succeeded (zl-zipline#285), so a client gets "connection refused"
+//! during startup, and a listening port means the service is ready.
 
 use std::fmt;
 use std::future::Future;
@@ -310,8 +311,8 @@ mod tests {
 
     /// zl-zipline#266: a reserved socket refuses connections until
     /// [start_listening] runs, and accepts them after. This is what keeps the
-    /// startup behaviour unchanged for clients: "connection refused" while
-    /// the visa service hydrates.
+    /// startup behaviour unchanged for clients: "connection refused" until
+    /// the visa service is ready (after self-authorization, zl-zipline#285).
     #[tokio::test]
     async fn bind_reserved_then_listen_accepts() {
         let sock = bind_reserved(ListenerRole::VsApi, "127.0.0.1:0".parse().unwrap()).unwrap();
