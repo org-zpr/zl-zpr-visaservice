@@ -698,13 +698,15 @@ async fn listen_after_self_authorize<F>(
 where
     F: std::future::Future<Output = Result<(), ServiceError>>,
 {
+    // Self-authorize first. Until this returns Ok, the reserved sockets do
+    // not listen, so a client gets "connection refused".
+    self_authorize_within(self_auth, deadline)
+        .await
+        .map_err(StartupError::SelfAuth)?;
     let vsapi = listeners::start_listening(listeners::ListenerRole::VsApi, reserved.vsapi)
         .map_err(StartupError::Listen)?;
     let admin = listeners::start_listening(listeners::ListenerRole::Admin, reserved.admin)
         .map_err(StartupError::Listen)?;
-    self_authorize_within(self_auth, deadline)
-        .await
-        .map_err(StartupError::SelfAuth)?;
     Ok(Listening { vsapi, admin })
 }
 
