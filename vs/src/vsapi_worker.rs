@@ -5333,6 +5333,41 @@ mod tests {
             assert_eq!(claim(&open(relay).await), "[fd5a:5052:3000::9]:7001");
         }
 
+        /// zl-zipline#264: `open` with no params succeeds, whether the request has no
+        /// param list at all (what core sends, `params: None`) or an empty one.
+        #[tokio::test]
+        async fn test_open_accepts_no_params() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, node, _relay) = open_substrate_asm().await;
+                    for empty_list in [false, true] {
+                        let vs: vsapi::visa_service::Client =
+                            capnp_rpc::new_client(VisaServiceImpl {
+                                asm: asm.clone(),
+                                remote: SocketAddr::new(node, 1234),
+                            });
+                        let mut req = vs.open_request();
+                        {
+                            let mut r = req.get().init_req();
+                            r.set_cn("zode");
+                            r.set_ctype(vsapi::VSConnT::Reconnect);
+                            if empty_list {
+                                r.init_params(0);
+                            }
+                        }
+                        let resp = req.send().promise.await.unwrap();
+                        assert!(
+                            matches!(
+                                resp.get().unwrap().get_resp().unwrap().which().unwrap(),
+                                vsapi::result::Which::Ok(_)
+                            ),
+                            "open with no params (empty list: {empty_list}) must succeed"
+                        );
+                    }
+                })
+                .await;
+        }
+
         /// zl-zipline#264: `open` takes no params. A leftover `substrate_addr` (or any
         /// other param) is a `paramError`, and the stored claim is left as it was.
         #[tokio::test]
