@@ -710,6 +710,24 @@ where
     Ok(Listening { vsapi, admin })
 }
 
+/// The error exit of startup when the listeners cannot come up
+/// (zl-zipline#285): self-authorization failed or timed out, or a reserved
+/// socket could not listen. Log `err`, run `shutdown` (which stops every
+/// task in `main`'s join set, the lock renewal among them), and only then
+/// run `release` (which releases the ValKey instance lock). The order
+/// matters: a renewal after the release would take the lock again, and a
+/// lock that is not released blocks a supervisor's restart until it
+/// expires. The caller then exits with a failure status.
+async fn exit_after_startup_error<S, SF, R, RF>(err: &StartupError, shutdown: S, release: R)
+where
+    S: FnOnce() -> SF,
+    SF: std::future::Future<Output = ()>,
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = ()>,
+{
+    error!(target: MAIN, "{err}; the visa service stops");
+}
+
 /// Load configuration from an explicit path, the default path, or fall back to defaults.
 fn load_config(explicit: Option<&std::path::Path>) -> Result<VSConfig, ServiceError> {
     match explicit {
@@ -1451,5 +1469,61 @@ mod listen_after_self_authorize_tests {
         }
         assert_refused(vsapi_addr, "VS-API").await;
         assert_refused(admin_addr, "admin").await;
+    }
+}
+
+/// zl-zipline#285, Q2: both self-authorization exits (failure and time-out)
+/// stop the other tasks first and then release the instance lock, as the
+/// listener-failure exit does.
+#[cfg(test)]
+mod startup_exit_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Run [exit_after_startup_error] for `err` with fakes that record the
+    /// order in which the shutdown and the release run.
+    async fn exit_steps(err: StartupError) -> Vec<&'static str> {
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let (s1, s2) = (steps.clone(), steps.clone());
+        exit_after_startup_error(
+            &err,
+            || async move { s1.lock().unwrap().push("shutdown") },
+            || async move { s2.lock().unwrap().push("release") },
+        )
+        .await;
+        let recorded = steps.lock().unwrap().clone();
+        recorded
+    }
+
+    /// A self-authorization failure shuts the tasks down, then releases the
+    /// lock.
+    #[tokio::test]
+    async fn failed_self_authorization_shuts_down_then_releases_the_lock() {
+        let err = StartupError::SelfAuth(SelfAuthError::Failed(
+            ServiceError::AuthenticationFailed("denied".into()),
+        ));
+        assert_eq!(exit_steps(err).await, vec!["shutdown", "release"]);
+    }
+
+    /// A self-authorization time-out shuts the tasks down, then releases the
+    /// lock.
+    #[tokio::test]
+    async fn timed_out_self_authorization_shuts_down_then_releases_the_lock() {
+        let err = StartupError::SelfAuth(SelfAuthError::TimedOut(Duration::from_secs(30)));
+        assert_eq!(exit_steps(err).await, vec!["shutdown", "release"]);
+    }
+
+    /// A reserved socket that cannot listen takes the same exit.
+    #[tokio::test]
+    async fn listen_failure_shuts_down_then_releases_the_lock() {
+        let err = StartupError::Listen(listeners::ListenerError {
+            role: listeners::ListenerRole::Admin,
+            addr: "127.0.0.1:5003".parse().unwrap(),
+            stage: listeners::ListenerStage::Listen,
+            source: std::io::Error::other("listen failed"),
+        });
+        assert_eq!(exit_steps(err).await, vec!["shutdown", "release"]);
     }
 }
