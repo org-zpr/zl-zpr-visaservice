@@ -571,9 +571,7 @@ impl TopologyMgr {
             info!(target: TOPO, "link {} between {} and {} is now {}", link.id.0, a, b, if usable { "up" } else { "down" });
         }
         if changed && usable {
-            // zl-zipline#284: both ends have a link up again.
-            table.clear_departure(a);
-            table.clear_departure(b);
+            table.link_is_up(a, b); // zl-zipline#284
         }
         changed && !usable
     }
@@ -600,9 +598,7 @@ impl TopologyMgr {
         let mut table = self.link_state.lock().unwrap();
         let up = Self::usable_in(&table, a, b, cn_of);
         if up {
-            // zl-zipline#284: both ends have a link up.
-            table.clear_departure(a);
-            table.clear_departure(b);
+            table.link_is_up(a, b); // zl-zipline#284
         }
         self.router.add_link_with_state(
             a.clone(),
@@ -1000,7 +996,7 @@ impl TopologyMgr {
         // rebuilt link gets the flag its reports call for, inside the atomic batch.
         // The table stays locked until the batch is applied, for the same reason as
         // in install_router_link: a concurrent report cannot slip in between.
-        let table = self.link_state.lock().unwrap();
+        let mut table = self.link_state.lock().unwrap();
         let current = current_policy();
         let flag_cn_of = Self::policy_cn_lookup(&current);
         // A removed link that is up now (read under the lock: a report may have brought
@@ -1045,7 +1041,15 @@ impl TopologyMgr {
                 }
             }
         }
+        let up_links: Vec<(IpAddr, IpAddr)> = additions
+            .iter()
+            .filter(|l| l.up)
+            .map(|l| (l.a, l.b))
+            .collect();
         self.router.apply_link_batch(&removal_ids, additions)?;
+        for (a, b) in &up_links {
+            table.link_is_up(a, b); // zl-zipline#284
+        }
         drop(table);
 
         // Detect + report orphans. An orphan node is a legitimate state and stays in the
@@ -2179,6 +2183,35 @@ mod tests {
         );
         assert!(report.links_down.is_empty(), "it was never up");
         report_both_up_and_check(&topo, a, b);
+    }
+
+    #[tokio::test]
+    async fn test_revalidate_installing_an_up_link_drops_pending_departure_checks() {
+        // zl-zipline#284 (PR #72 review): a link the policy pass installs up is a
+        // recovery like a report's, so both ends' pending departure checks are dropped.
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr = make_policy_mgr_with_cns(db.clone(), a, b).await;
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        report_both_up(&topo, a, b); // no router link yet: only the table learns it
+        let ops = topo.ops_now();
+        let check_a = topo.mark_departure(&ops, &a, Some("s")).unwrap();
+        let check_b = topo.mark_departure(&ops, &b, Some("s")).unwrap();
+
+        let report = topo
+            .revalidate_against_policy(&ops, &policy_mgr.get_current_snapshot(), &[a, b], &|| {
+                policy_mgr.get_current_snapshot()
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.links_repaired, 1);
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+        assert!(!topo.take_departure(&ops, &a, check_a), "A's check dropped");
+        assert!(!topo.take_departure(&ops, &b, check_b), "B's check dropped");
     }
 
     #[tokio::test]

@@ -68,7 +68,7 @@ pub struct LinkStateTable {
     /// Node -> the token and VS-API session of its pending departure check
     /// (zl-zipline#284). A further loss in the same session is covered by the pending
     /// check and does not extend its grace; a link coming up drops the entry
-    /// ([Self::clear_departure]), so the check finds it gone and does nothing, and the
+    /// ([Self::link_is_up]), so the check finds it gone and does nothing, and the
     /// next loss starts a new grace.
     pending_departure: HashMap<IpAddr, (u64, Option<String>)>,
     /// The last departure-check token handed out ([Self::mark_departure]).
@@ -197,9 +197,12 @@ impl LinkStateTable {
         true
     }
 
-    /// A link of `node` has come up: drop its pending departure check, if any.
-    pub fn clear_departure(&mut self, node: &IpAddr) {
-        self.pending_departure.remove(node);
+    /// The link between `a` and `b` is up: drop both ends' pending departure checks,
+    /// if any. Called wherever a router link is set up: a report's refresh, an install,
+    /// and the policy pass.
+    pub fn link_is_up(&mut self, a: &IpAddr, b: &IpAddr) {
+        self.pending_departure.remove(a);
+        self.pending_departure.remove(b);
     }
 
     /// True if the link between `a` and `b` is marked failed (in either order).
@@ -492,7 +495,7 @@ mod tests {
         );
         assert!(t.take_departure(ip(A), newer), "the pending one is taken");
         assert!(!t.take_departure(ip(A), newer), "taken only once");
-        t.clear_departure(&ip(B));
+        t.link_is_up(&ip(B), &ip(C));
         assert!(!t.take_departure(ip(B), other), "dropped by a recovery");
         assert!(
             t.mark_departure(ip(B), Some("s1")).is_some(),
