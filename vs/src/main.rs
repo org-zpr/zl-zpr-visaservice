@@ -1319,6 +1319,8 @@ mod lock_release_tests {
 #[cfg(test)]
 mod self_authorize_within_tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     /// A self-authorization that succeeds is `Ok`.
@@ -1365,6 +1367,75 @@ mod self_authorize_within_tests {
         assert_eq!(start.elapsed(), limit);
         let msg = SelfAuthError::TimedOut(limit).to_string();
         assert!(msg.contains("50ms"), "{msg}");
+    }
+
+    /// Codex review P2: the deadline must not cancel the persistence phase.
+    /// Authentication finishes inside the limit (40 ms of 50 ms), and
+    /// persistence then needs 40 ms more, past the limit. Persistence must
+    /// run to its end, because a dropped ValKey write skips its own cleanup
+    /// and leaves partial actor state. The tokio clock is paused, so the
+    /// test measures on that clock and does not sleep.
+    #[tokio::test(start_paused = true)]
+    async fn deadline_does_not_cancel_persistence() {
+        let limit = Duration::from_millis(50);
+        let persisted = Arc::new(AtomicBool::new(false));
+        let done = persisted.clone();
+        let authenticate = async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Ok::<(), ServiceError>(())
+        };
+        let persist = async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            done.store(true, Ordering::SeqCst);
+            Ok::<(), ServiceError>(())
+        };
+        let start = tokio::time::Instant::now();
+        let res = self_authorize_within(
+            async move {
+                authenticate.await?;
+                persist.await
+            },
+            limit,
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "persistence past the deadline must finish: {res:?}"
+        );
+        assert!(
+            persisted.load(Ordering::SeqCst),
+            "persistence must run to its end"
+        );
+        assert_eq!(start.elapsed(), Duration::from_millis(80));
+    }
+
+    /// An authentication that never finishes still ends at the deadline as
+    /// `TimedOut`, and persistence never starts.
+    #[tokio::test(start_paused = true)]
+    async fn authentication_hang_times_out_before_persistence() {
+        let limit = Duration::from_millis(50);
+        let persisted = Arc::new(AtomicBool::new(false));
+        let done = persisted.clone();
+        let persist = async move {
+            done.store(true, Ordering::SeqCst);
+            Ok::<(), ServiceError>(())
+        };
+        let res = self_authorize_within(
+            async move {
+                std::future::pending::<Result<(), ServiceError>>().await?;
+                persist.await
+            },
+            limit,
+        )
+        .await;
+        match res {
+            Err(SelfAuthError::TimedOut(d)) => assert_eq!(d, limit),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        assert!(
+            !persisted.load(Ordering::SeqCst),
+            "persistence must not start"
+        );
     }
 
     /// The production limit is above the default trusted-service query limit
@@ -1472,6 +1543,26 @@ mod listen_after_self_authorize_tests {
         }
         assert_refused(vsapi_addr, "VS-API").await;
         assert_refused(admin_addr, "admin").await;
+    }
+
+    /// Codex review P2: a persistence phase that ends after the limit does
+    /// not stop startup. Authentication finishes at once; persistence then
+    /// takes 300 ms against a 100 ms limit. Startup must wait for it and
+    /// then listen on both ports.
+    #[tokio::test]
+    async fn slow_persistence_still_leads_to_listening() {
+        let (reserved, vsapi_addr, admin_addr) = reserve_loopback();
+        let self_auth = async {
+            // Authentication: immediate. Persistence: slower than the limit.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok::<(), ServiceError>(())
+        };
+        let listening =
+            listen_after_self_authorize(reserved, self_auth, Duration::from_millis(100))
+                .await
+                .expect("slow persistence must not time out startup");
+        assert_eq!(listening.vsapi.local_addr().unwrap(), vsapi_addr);
+        assert_eq!(listening.admin.local_addr().unwrap(), admin_addr);
     }
 
     /// A self-authorization that fails returns its error, and neither port
