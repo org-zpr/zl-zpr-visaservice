@@ -354,9 +354,14 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // later sweep re-checks it: a grant is not yet checked atomically against
     // concurrent revocation (zl-zipline#248).
     //
+    // The sweep is the one a login or logout runs (zl-zipline#265): it retries a sweep
+    // that left visas undecided and then queues an attribute-change reconcile, and it
+    // judges against the policy current when it runs, skipping verdicts a newer
+    // install would overrule.
+    //
     // ponytail: a second full sweep on every install; re-check only the visas to and
     // from nodes whose services changed if sweeps get costly.
-    revalidate_visas(asm, &psnap, SweepReason::AttributeChange).await;
+    crate::connection_control::ConnectionControl::sweep_visas_after_attribute_change(asm).await;
 
     Ok(())
 }
