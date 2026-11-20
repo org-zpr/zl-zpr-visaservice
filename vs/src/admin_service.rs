@@ -39,9 +39,8 @@ use crate::admin_apikeys::Permission;
 use crate::apikey::ApiKey;
 use crate::assembly::Assembly;
 use crate::counters::CounterType;
-use crate::db::Role;
+use crate::db::{ObligationKind, Role};
 use crate::error::ServiceError;
-use crate::event_mgr::VsEvent;
 use crate::logging::targets::ADMIN;
 use crate::policy_mgr::DEFAULT_POLICY_ID;
 use crate::visa_mgr::VisaMgr;
@@ -355,11 +354,9 @@ async fn install_policy(
     {
         Ok(vinst) => {
             info!(target: ADMIN, "policy updated successfully, new vinst={vinst}");
-            // fire event!
-            let evt = VsEvent::PolicyUpdated(vinst);
-            if let Err(e) = rstate.asm.event_mgr.record_event(evt).await {
-                warn!(target: ADMIN, "failed to record policy updated event: {}", e);
-            }
+            // The install recorded its revocation obligation before it committed
+            // (zl-zipline#289); start the reconciler pass that satisfies it.
+            rstate.asm.event_mgr.kick_reconcile();
         }
         Err(e) => {
             error!(target: ADMIN, "failed to update policy: {}", e);
@@ -1021,21 +1018,39 @@ async fn flush_service_cache(
     debug!(target: ADMIN, "DELETE /admin/services/{}/cache", svc_id);
 
     // Clone the Arcs and drop the read guard before awaiting the flush.
-    let (ts_mgr, event_mgr) = {
+    let (ts_mgr, event_mgr, revocations) = {
         let rstate = state.read().await;
-        (rstate.asm.ts_mgr.clone(), rstate.asm.event_mgr.clone())
+        (
+            rstate.asm.ts_mgr.clone(),
+            rstate.asm.event_mgr.clone(),
+            rstate.asm.revocations.clone(),
+        )
     };
+    if !ts_mgr.has_source(&svc_id) {
+        return StatusCode::NOT_FOUND;
+    }
 
-    match ts_mgr.flush_one(&svc_id).await {
+    // The reloaded data can make live visas unacceptable: record the obligation
+    // durably before the reload, and hold its guard across it (zl-zipline#289). A
+    // failed record fails the request: nothing would re-check the visas.
+    let obligation = match revocations
+        .begin(ObligationKind::Attributes, Vec::new())
+        .await
+    {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!(target: ADMIN, "could not record the revocation obligation for flushing {}: {}", svc_id, e);
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+    let flushed = ts_mgr.flush_one(&svc_id).await;
+    drop(obligation);
+    // Kick whatever the outcome: a failed reload may have changed part of the data.
+    event_mgr.kick_reconcile();
+
+    match flushed {
         Ok(()) => {
-            // The flush itself is done. If the event cannot be queued we lose only the
-            // sweep of existing visas -- new visa decisions are still protected by the
-            // per-actor revision check. The event carries no source id (the reconcile
-            // is unscoped), so name the source here where it is known.
-            info!(target: ADMIN, "flushed trusted service {}, queueing revalidation", svc_id);
-            if let Err(e) = event_mgr.record_event(VsEvent::TrustedServiceChange).await {
-                error!(target: ADMIN, "flushed trusted service {} but could not queue revalidation: {}", svc_id, e);
-            }
+            info!(target: ADMIN, "flushed trusted service {}, revalidation queued", svc_id);
             StatusCode::ACCEPTED
         }
         Err(ServiceError::TrustedServiceNotFound(_)) => StatusCode::NOT_FOUND,
@@ -1136,18 +1151,33 @@ async fn service_changed(
     };
 
     // Clone the Arcs and drop the read guard before awaiting.
-    let (ts_mgr, event_mgr, actor_mgr) = {
+    let (ts_mgr, event_mgr, actor_mgr, revocations) = {
         let rstate = state.read().await;
         (
             rstate.asm.ts_mgr.clone(),
             rstate.asm.event_mgr.clone(),
             rstate.asm.actor_mgr.clone(),
+            rstate.asm.revocations.clone(),
         )
     };
 
     if !ts_mgr.has_source(&svc_id) {
         return StatusCode::NOT_FOUND;
     }
+
+    // The changed data can make live visas unacceptable: record the obligation
+    // durably before marking anything stale, and hold its guard until the marks are
+    // done (zl-zipline#289). A failed record fails the request.
+    let obligation = match revocations
+        .begin(ObligationKind::Attributes, Vec::new())
+        .await
+    {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!(target: ADMIN, "could not record the revocation obligation for the change to {}: {}", svc_id, e);
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
 
     match identities {
         // "Everything changed": same effect as DELETE .../cache.
@@ -1207,11 +1237,8 @@ async fn service_changed(
         }
     }
 
-    // Same failure posture as flush_service_cache: losing the event loses only
-    // the sweep of existing visas; new decisions still hit the revision check.
-    if let Err(e) = event_mgr.record_event(VsEvent::TrustedServiceChange).await {
-        error!(target: ADMIN, "trusted service {} change recorded but could not queue revalidation: {}", svc_id, e);
-    }
+    drop(obligation);
+    event_mgr.kick_reconcile();
     StatusCode::ACCEPTED
 }
 
@@ -3050,9 +3077,25 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 1);
         // The revalidation of existing visas is queued for the event worker.
+        assert_obligation_recorded_and_kicked(&asm, &mut event_rx).await;
+    }
+
+    /// A trusted-service change recorded one attribute revocation obligation and
+    /// kicked the reconciler (zl-zipline#289).
+    async fn assert_obligation_recorded_and_kicked(
+        asm: &Arc<Assembly>,
+        event_rx: &mut tokio::sync::mpsc::Receiver<crate::event_mgr::VsEvent>,
+    ) {
+        let pending = asm.revocations.start_pass().await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "one obligation must be pending: {pending:?}"
+        );
+        assert_eq!(pending[0].1.kind, ObligationKind::Attributes);
         match event_rx.try_recv() {
-            Ok(VsEvent::TrustedServiceChange) => {}
-            other => panic!("expected TrustedServiceChange event, got {other:?}"),
+            Ok(crate::event_mgr::VsEvent::Reconcile) => {}
+            other => panic!("expected a Reconcile kick, got {other:?}"),
         }
     }
 
@@ -3178,10 +3221,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 1);
-        match event_rx.try_recv() {
-            Ok(VsEvent::TrustedServiceChange) => {}
-            other => panic!("expected TrustedServiceChange event, got {other:?}"),
-        }
+        assert_obligation_recorded_and_kicked(&asm, &mut event_rx).await;
     }
 
     /// A targeted body forgets the listed actor's revision for this source
@@ -3233,10 +3273,7 @@ mod tests {
         );
         // Targeted notification does NOT flush the whole service.
         assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 0);
-        match event_rx.try_recv() {
-            Ok(VsEvent::TrustedServiceChange) => {}
-            other => panic!("expected TrustedServiceChange event, got {other:?}"),
-        }
+        assert_obligation_recorded_and_kicked(&asm, &mut event_rx).await;
     }
 
     /// Malformed bodies are 400 (zipline#79): non-JSON, an unknown field, and

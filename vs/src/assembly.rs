@@ -12,6 +12,7 @@ use crate::deny_log::DenyLog;
 use crate::event_mgr::EventMgr;
 use crate::net_mgr::NetMgr;
 use crate::policy_mgr::PolicyMgr;
+use crate::revocation::RevocationLedger;
 use crate::topology_mgr::TopologyMgr;
 use crate::trusted_services::TrustedServicesMgr;
 use crate::visa_mgr::VisaMgr;
@@ -45,6 +46,9 @@ pub struct Assembly {
     /// relay's policy peers (the request refuses any other CN). A restart forgets it; the
     /// node actor's persisted claim stands in until the next rejoin observes again.
     pub observed_substrate: dashmap::DashMap<std::net::IpAddr, std::net::SocketAddr>,
+    /// Durable visa-revocation obligations and the barrier that orders their writers
+    /// against the reconciler (zl-zipline#289). See [crate::revocation].
+    pub revocations: Arc<RevocationLedger>,
 }
 
 impl Assembly {
@@ -143,14 +147,28 @@ pub mod tests {
     pub async fn new_assembly_with_event_rx_and_db(
         vreq_tx_chan: Option<mpsc::Sender<VisaRequestJob>>,
     ) -> (Assembly, mpsc::Receiver<VsEvent>, Arc<FakeDb>) {
+        let db = Arc::new(FakeDb::new());
+        let (asm, event_rx) = new_assembly_on(db.clone(), vreq_tx_chan).await;
+        (asm, event_rx, db)
+    }
+
+    /// A new assembly over an existing [FakeDb]: what a visa service restart sees
+    /// (state is hydrated from the DB; in-memory state starts empty).
+    pub async fn new_assembly_on_db(db: Arc<FakeDb>) -> (Assembly, mpsc::Receiver<VsEvent>) {
+        new_assembly_on(db, None).await
+    }
+
+    /// The body of the helpers above: an assembly over `db_handle`.
+    async fn new_assembly_on(
+        db_handle: Arc<FakeDb>,
+        vreq_tx_chan: Option<mpsc::Sender<VisaRequestJob>>,
+    ) -> (Assembly, mpsc::Receiver<VsEvent>) {
         let vreq_tx = if let Some(tx) = vreq_tx_chan {
             tx
         } else {
             let (tx, _rx) = mpsc::channel(100);
             tx
         };
-
-        let db_handle = Arc::new(FakeDb::new());
         let db_handle_for_tests = db_handle.clone();
 
         let policy_repo = PolicyRepo::new(db_handle.clone());
@@ -198,8 +216,10 @@ pub mod tests {
             ts_mgr,
             deny_log: Default::default(),
             observed_substrate: Default::default(),
+            revocations: Arc::new(RevocationLedger::new(db_handle_for_tests.clone())),
         };
         asm.policy_mgr.bind_topology_lock(asm.topo_mgr.ops_lock());
-        (asm, event_rx, db_handle_for_tests)
+        asm.policy_mgr.bind_revocations(asm.revocations.clone());
+        (asm, event_rx)
     }
 }

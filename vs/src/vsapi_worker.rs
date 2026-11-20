@@ -27,6 +27,7 @@ use crate::connection_control::{
     recheck_before_commit,
 };
 use crate::counters::CounterType;
+use crate::db::ObligationKind;
 use crate::error::ServiceError;
 use crate::event_mgr::VsEvent;
 use crate::link_state::validate_snapshot;
@@ -90,8 +91,30 @@ impl AuthenticateUndo {
             }
         }
         if let Some(addr) = self.actor_mgr_add_node {
+            // Removing a committed node leaves its visas (a reconnect keeps the old
+            // ones) to no sweep: the sweep skips visas of an actor it cannot resolve,
+            // and a pass may already have run. Record an obligation naming the node
+            // first, held across the removal (innermost, after the caller's topology
+            // guard), so the reconciler revokes the vanished actor's visas (g234 q6,
+            // zl-zipline#289). A failed record is logged and the removal goes ahead:
+            // keeping a half-authenticated node would be worse.
+            let obligation = match asm
+                .revocations
+                .begin(ObligationKind::Attributes, vec![addr])
+                .await
+            {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    error!(target: API, "failed to record the revocation obligation for undone node {addr}: {e}");
+                    None
+                }
+            };
             let _ = asm.actor_mgr.remove_node(&addr).await;
             let _ = asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await;
+            if obligation.is_some() {
+                drop(obligation);
+                asm.event_mgr.kick_reconcile();
+            }
         }
         if let Some(addr) = self.taken_zpr_addr {
             let _ = asm.net_mgr.release_zpr_addr(addr);
@@ -699,17 +722,15 @@ async fn mint_login_nonce_for_handle(
 /// lock, so a refused authentication never leaves the old node with its
 /// adapters, visas and topology destroyed (#63 review).
 ///
-/// Sets `attrs_dropped` when the write replaces a stored actor holding
-/// attributes the new one lacks ([attributes_dropped], zl-zipline#265): the
-/// fresh node actor is device-only, so a session replacement drops a logged-in
-/// user's login, and its visas must be re-checked. A first connect (no stored
-/// actor) drops nothing. The flag is set before the write and stays set when
-/// the write then fails: an actor update commits the attributes before its
-/// other writes, so a failed write may already have dropped them, and a later
-/// authentication would compare against the reduced actor and see no loss.
-/// The caller runs the sweep itself, success or not, once it has released the
-/// topology guard: the sweep re-checks every live visa and must not hold up the
-/// fleet's topology operations or node authentications.
+/// When the write replaces a stored actor holding attributes the new one lacks
+/// ([attributes_dropped], zl-zipline#265) -- the fresh node actor is device-only,
+/// so a session replacement drops a logged-in user's login -- the live visas must
+/// be re-checked. A first connect (no stored actor) drops nothing. The revocation
+/// obligation is recorded before the write and stays when the write then fails:
+/// an actor update commits the attributes before its other writes, so a failed
+/// write may already have dropped them, and a later authentication would compare
+/// against the reduced actor and see no loss. The reconciler, kicked here, runs
+/// the sweep on the event worker (zl-zipline#289); the caller does nothing more.
 ///
 /// The caller holds the topology guard (`ops`, #224's [TopoOps]); this takes
 /// the node commit lock inside it. Lock order: topology lock, then node commit
@@ -719,7 +740,6 @@ async fn add_node_serialized(
     ops: &TopoOps<'_>,
     node_actor: &Actor,
     reconnect: bool,
-    attrs_dropped: &mut bool,
 ) -> Result<(), ServiceError> {
     let _guard = asm.policy_mgr.node_commit_lock.lock().await;
     if let Some(addr) = node_actor.get_zpr_addr()
@@ -747,14 +767,39 @@ async fn add_node_serialized(
         Some(addr) => asm.actor_mgr.get_actor_by_zpr_addr(addr).await?,
         None => None,
     };
-    // Set before any write, so a write that fails part-way still reports it.
-    *attrs_dropped = stored.is_some_and(|stored| attributes_dropped(&stored, &node_actor));
+    let stored_exists = stored.is_some();
+    let attrs_dropped = stored.is_some_and(|stored| attributes_dropped(&stored, &node_actor));
     if !reconnect && let Some(addr) = node_actor.get_zpr_addr() {
         reset_node_state(asm, ops, addr).await?;
     }
-    asm.actor_mgr
+    // A write that drops attributes records its revocation obligation first and
+    // holds the guard across the write only -- innermost, inside the topology guard
+    // and the node commit lock (zl-zipline#289). The obligation names the node: if
+    // the write fails after cleaning the actor up, the reconciler revokes its visas
+    // although the sweep can no longer judge them. A Reset that replaces a stored
+    // actor records one too, drop or not: its replacing write deletes the stored
+    // actor first, so a failed one leaves the node's visas with no actor to judge
+    // them by (VS#79 review).
+    // ponytail: a Reset of a known node costs one full sweep; record only once the
+    // write has failed if Resets ever get frequent enough for that to matter.
+    let replaces_stored = !reconnect && stored_exists;
+    let obligation = match node_actor.get_zpr_addr() {
+        Some(addr) if attrs_dropped || replaces_stored => Some(
+            asm.revocations
+                .begin(ObligationKind::Attributes, vec![*addr])
+                .await?,
+        ),
+        _ => None,
+    };
+    let written = asm
+        .actor_mgr
         .add_node(&node_actor, reconnect, &asm.policy_service_names())
-        .await
+        .await;
+    if obligation.is_some() {
+        drop(obligation);
+        asm.event_mgr.kick_reconcile();
+    }
+    written
 }
 
 /// A VS-API session of `node` has just started (`authenticate`, or `open` for a
@@ -1699,24 +1744,9 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         // add_node_serialized, under the topology guard held here and the node
         // commit lock it takes, after the generation recheck (#63 review).
         // The add_node call will clean up after ifself if it fails.
-        let mut attrs_dropped = false;
-        if let Err(e) = add_node_serialized(
-            &self.asm,
-            &ops,
-            &node_actor,
-            self.reconnect,
-            &mut attrs_dropped,
-        )
-        .await
-        {
+        if let Err(e) = add_node_serialized(&self.asm, &ops, &node_actor, self.reconnect).await {
             undo.undo(&self.asm, Some(&ops)).await;
-            // A failed write may already have dropped the stored attributes:
-            // re-check the visas granted on them all the same (zl-zipline#265),
-            // outside the topology guard, as on success below.
             drop(ops);
-            if attrs_dropped {
-                ConnectionControl::sweep_visas_after_attribute_change(&self.asm).await;
-            }
             if let ServiceError::ApiResponse(api) = e {
                 info!(target: API, "authentication of node {:?} refused at commit: {}", &node_cn, api.message);
                 return self.ok_with_authenticate_error(results, api.code.into(), &api.message);
@@ -1783,16 +1813,6 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
             .topo_mgr
             .clear_failed_pairs_for(&ops, &node_zpr_addr);
         drop(ops);
-
-        // The session replaced a stored actor that held attributes this one
-        // lacks -- typically a logged-in user's login, which a fresh device-only
-        // authentication drops -- so re-check the live visas granted on them
-        // (zl-zipline#265). Outside the topology guard and the node commit lock,
-        // like the logout sweep, and before every later fallible step: an undo
-        // removes the actor, after which a sweep would skip its visas.
-        if attrs_dropped {
-            ConnectionControl::sweep_visas_after_attribute_change(&self.asm).await;
-        }
 
         let evt = VsEvent::ActorJoins(node_zpr_addr);
         if let Err(e) = self.asm.event_mgr.record_event(evt).await {
@@ -3397,6 +3417,36 @@ mod tests {
                 result.is_none(),
                 "node should have been removed from actor_mgr by undo"
             );
+        }
+
+        /// Undoing a committed node add removes the actor, so a reconciler pass
+        /// that already ran cannot have judged its visas (a reconnect keeps the
+        /// node's old ones). The undo records an obligation naming the node
+        /// before it removes it; the pass then revokes the visas of the vanished
+        /// actor (g234 q6, zl-zipline#289).
+        #[tokio::test]
+        async fn test_removing_the_node_records_an_obligation() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let addr: IpAddr = "fd5a:5052:90de:1::4".parse().unwrap();
+            let actor = make_node_actor_defexp(
+                "fd5a:5052:90de:1::4",
+                "test-node-4",
+                "[fd5a:5052::104]:1234",
+            );
+            asm.actor_mgr
+                .add_node(&actor, false, &Default::default())
+                .await
+                .unwrap();
+            assert!(asm.revocations.start_pass().await.unwrap().is_empty());
+
+            let mut undo = AuthenticateUndo::default();
+            undo.added_node_to_actor_mgr(&addr);
+            undo.undo(&asm, None).await;
+
+            let pending = asm.revocations.start_pass().await.unwrap();
+            assert_eq!(pending.len(), 1, "the undo must record one obligation");
+            assert_eq!(pending[0].1.kind, crate::db::ObligationKind::Attributes);
+            assert_eq!(pending[0].1.actors, vec![addr]);
         }
 
         #[tokio::test]
@@ -5822,7 +5872,7 @@ mod tests {
             asm.observed_substrate.insert(zode, moved);
 
             let ops = asm.topo_mgr.ops().await;
-            add_node_serialized(&asm, &ops, &prepared, true, &mut false)
+            add_node_serialized(&asm, &ops, &prepared, true)
                 .await
                 .unwrap();
             drop(ops);
@@ -5865,6 +5915,18 @@ mod tests {
             fresh
         }
 
+        /// The actors named by the pending attribute obligations (zl-zipline#289).
+        async fn attribute_obligation_actors(asm: &Assembly) -> Vec<IpAddr> {
+            crate::db::RevocationRepo::new(asm.state_db.clone())
+                .list()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|(_, ob)| ob.kind == crate::db::ObligationKind::Attributes)
+                .flat_map(|(_, ob)| ob.actors)
+                .collect()
+        }
+
         /// zl-zipline#265, gap 1: a logged-in Zode's session is replaced by a fresh,
         /// device-only authentication -- a reconnect (`reconnect`) or a `Reset` (a VS
         /// restart, a J10 rejoin). The write reports that it dropped attributes, the
@@ -5881,18 +5943,24 @@ mod tests {
             zode_login(&asm, &cc, addr, &privkey, cn).await;
             let id = create_zode_files_visa(&asm, addr).await;
 
+            crate::event_mgr::reconcile_obligations(&asm).await;
+
             let fresh = reauthenticate_zode(&asm, &cc, &privkey, cn, addr).await;
             let ops = asm.topo_mgr.ops().await;
-            let mut dropped = false;
-            add_node_serialized(&asm, &ops, &fresh, reconnect, &mut dropped)
+            add_node_serialized(&asm, &ops, &fresh, reconnect)
                 .await
                 .unwrap();
             drop(ops);
-            if dropped {
-                ConnectionControl::sweep_visas_after_attribute_change(&asm).await;
-            }
 
-            assert!(dropped, "replacing the login drops attributes");
+            // The write recorded an obligation naming the Zode (zl-zipline#289);
+            // `authenticate` does nothing more, so a cancellation after the write
+            // loses nothing. The reconciler's pass revokes.
+            assert_eq!(
+                attribute_obligation_actors(&asm).await,
+                vec![addr],
+                "replacing the login drops attributes"
+            );
+            crate::event_mgr::reconcile_obligations(&asm).await;
             let stored = asm
                 .actor_mgr
                 .get_actor_by_zpr_addr(&addr)
@@ -5941,11 +6009,11 @@ mod tests {
             zode_login(&asm, &cc, addr, &privkey, cn).await;
             let id = create_zode_files_visa(&asm, addr).await;
 
+            crate::event_mgr::reconcile_obligations(&asm).await;
             let fresh = reauthenticate_zode(&asm, &cc, &privkey, cn, addr).await;
             db.set_del_fault(crate::db::FaultMode::Reject);
             let ops = asm.topo_mgr.ops().await;
-            let mut dropped = false;
-            let result = add_node_serialized(&asm, &ops, &fresh, true, &mut dropped).await;
+            let result = add_node_serialized(&asm, &ops, &fresh, true).await;
             drop(ops);
             db.set_del_fault(crate::db::FaultMode::None);
             assert!(result.is_err(), "the injected fault fails the write");
@@ -5956,9 +6024,13 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(!has_user_attrs(&stored), "the attributes were committed");
-            assert!(dropped, "the failed write still reports the drop");
+            assert_eq!(
+                attribute_obligation_actors(&asm).await,
+                vec![addr],
+                "the failed write still leaves its obligation"
+            );
 
-            ConnectionControl::sweep_visas_after_attribute_change(&asm).await;
+            crate::event_mgr::reconcile_obligations(&asm).await;
             assert_eq!(
                 asm.visa_mgr
                     .get_pending_revoke_visa_ids_for_node(&addr)
@@ -5968,53 +6040,40 @@ mod tests {
             );
         }
 
-        /// Local review (Codex P1): the sweep survives the cancellation of the RPC that
-        /// awaits it. A cancelled `authenticate` drops its future; the sweep must still
-        /// finish, because the next authentication compares against the reduced actor
-        /// and sees no loss to re-check.
+        /// zl-zipline#289 (VS#79 Copilot r2): a `Reset` whose replacing write fails
+        /// deletes the stored actor even when it drops no attribute, and the sweep
+        /// skips visas of an actor it cannot resolve. So a Reset that replaces a
+        /// stored actor records an obligation naming the node before its write, and
+        /// the reconciler revokes the vanished actor's visas.
         #[tokio::test]
-        async fn test_attribute_sweep_survives_cancellation() {
-            use crate::connection_control::tests::{
-                create_zode_files_visa, zode_fixture, zode_login,
-            };
-            let cn = "zode-265d.zpr";
-            let (asm, cc, addr, privkey) = zode_fixture(cn).await;
-            zode_login(&asm, &cc, addr, &privkey, cn).await;
-            // Enough visas that the sweep exhausts tokio's cooperative budget and
-            // yields: with the in-memory store a short sweep finishes in one poll.
-            let mut ids = Vec::new();
-            for _ in 0..200 {
-                ids.push(create_zode_files_visa(&asm, addr).await);
-            }
-            ids.sort();
-            let fresh = reauthenticate_zode(&asm, &cc, &privkey, cn, addr).await;
-            let ops = asm.topo_mgr.ops().await;
-            add_node_serialized(&asm, &ops, &fresh, true, &mut false)
-                .await
-                .unwrap();
-            drop(ops);
+        async fn test_failed_reset_without_a_drop_records_an_obligation() {
+            use crate::connection_control::tests::{create_zode_files_visa, zode_fixture_on};
+            let (asm, _event_rx, db) =
+                crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+            let cn = "zode-289r.zpr";
+            let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+            create_zode_files_visa(&asm, addr).await;
+            crate::event_mgr::reconcile_obligations(&asm).await;
 
-            // Poll the sweep once, then drop it, as a cancelled RPC does.
-            let _ = tokio::time::timeout(
-                Duration::ZERO,
-                ConnectionControl::sweep_visas_after_attribute_change(&asm),
-            )
-            .await;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            let mut revoked = Vec::new();
-            while revoked != ids && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                revoked = asm
-                    .visa_mgr
-                    .get_pending_revoke_visa_ids_for_node(&addr)
+            let fresh = reauthenticate_zode(&asm, &cc, &privkey, cn, addr).await;
+            db.set_hset_fault(crate::db::FaultMode::Reject); // the replacing write fails
+            let ops = asm.topo_mgr.ops().await;
+            let result = add_node_serialized(&asm, &ops, &fresh, false).await;
+            drop(ops);
+            db.set_hset_fault(crate::db::FaultMode::None);
+            assert!(result.is_err(), "the injected fault fails the write");
+            assert!(
+                asm.actor_mgr
+                    .get_actor_by_zpr_addr(&addr)
                     .await
-                    .unwrap();
-                revoked.sort();
-            }
+                    .unwrap()
+                    .is_none(),
+                "the failed replacing write deleted the stored actor"
+            );
             assert_eq!(
-                revoked.len(),
-                ids.len(),
-                "the cancelled sweep must still finish"
+                attribute_obligation_actors(&asm).await,
+                vec![addr],
+                "the Reset must leave an obligation naming the vanished node"
             );
         }
 
@@ -6030,13 +6089,13 @@ mod tests {
 
             let fresh = reauthenticate_zode(&asm, &cc, &privkey, cn, addr).await;
             let ops = asm.topo_mgr.ops().await;
-            let mut dropped = false;
-            add_node_serialized(&asm, &ops, &fresh, true, &mut dropped)
-                .await
-                .unwrap();
+            add_node_serialized(&asm, &ops, &fresh, true).await.unwrap();
             drop(ops);
 
-            assert!(!dropped, "a device-only actor replacing a device-only one");
+            assert!(
+                attribute_obligation_actors(&asm).await.is_empty(),
+                "a device-only actor replacing a device-only one records no obligation"
+            );
             assert!(
                 asm.visa_mgr
                     .get_pending_revoke_visa_ids_for_node(&addr)
@@ -6063,7 +6122,7 @@ mod tests {
 
             // A fresh (`Reset`) connect: there is no stored actor to update.
             let ops = asm.topo_mgr.ops().await;
-            add_node_serialized(&asm, &ops, &prepared, false, &mut false)
+            add_node_serialized(&asm, &ops, &prepared, false)
                 .await
                 .unwrap();
             drop(ops);
@@ -6239,7 +6298,7 @@ mod tests {
                 let asm = asm.clone();
                 async move {
                     let ops = asm.topo_mgr.ops().await;
-                    add_node_serialized(&asm, &ops, &node, false, &mut false).await
+                    add_node_serialized(&asm, &ops, &node, false).await
                 }
             });
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -6300,10 +6359,9 @@ mod tests {
             let stale = asm.policy_mgr.get_current_snapshot().vinst() + 1;
             node.add_attribute(Attribute::builder(key::VINST).value(stale.to_string()))
                 .unwrap();
-            let err =
-                add_node_serialized(&asm, &asm.topo_mgr.ops().await, &node, false, &mut false)
-                    .await
-                    .expect_err("a stale admission must not persist");
+            let err = add_node_serialized(&asm, &asm.topo_mgr.ops().await, &node, false)
+                .await
+                .expect_err("a stale admission must not persist");
             assert!(
                 matches!(&err, ServiceError::ApiResponse(api) if matches!(api.code, zpr::vsapi_types::ErrorCode::TemporarilyUnavailable)),
                 "got {err:?}"
@@ -6320,7 +6378,7 @@ mod tests {
             let current = asm.policy_mgr.get_current_snapshot().vinst();
             node.add_attribute(Attribute::builder(key::VINST).value(current.to_string()))
                 .unwrap();
-            add_node_serialized(&asm, &asm.topo_mgr.ops().await, &node, false, &mut false)
+            add_node_serialized(&asm, &asm.topo_mgr.ops().await, &node, false)
                 .await
                 .expect("a current admission persists");
         }
@@ -6549,7 +6607,7 @@ mod tests {
                 .add_attribute(Attribute::builder(key::VINST).value(stale.to_string()))
                 .unwrap();
             assert!(
-                add_node_serialized(&asm, &asm.topo_mgr.ops().await, &fresh, false, &mut false)
+                add_node_serialized(&asm, &asm.topo_mgr.ops().await, &fresh, false)
                     .await
                     .is_err()
             );
@@ -6562,7 +6620,7 @@ mod tests {
             fresh
                 .add_attribute(Attribute::builder(key::VINST).value(current.to_string()))
                 .unwrap();
-            add_node_serialized(&asm, &asm.topo_mgr.ops().await, &fresh, false, &mut false)
+            add_node_serialized(&asm, &asm.topo_mgr.ops().await, &fresh, false)
                 .await
                 .expect("a current Reset commits");
             assert!(
@@ -7233,7 +7291,7 @@ mod tests {
         /// revokes the pair.
         #[tokio::test]
         async fn a_sweep_keeps_a_bootstrap_pair_while_its_peering_holds() {
-            use crate::visa_reconciler::{SweepReason, revalidate_visas};
+            use crate::visa_reconciler::revalidate_visas;
             tokio::task::LocalSet::new()
                 .run_until(async {
                     let relay: IpAddr = RELAY.parse().unwrap();
@@ -7264,14 +7322,12 @@ mod tests {
                         assert!(!asm.topo_mgr.link_up(&relay, &zode));
 
                         let psnap = asm.policy_mgr.get_current_snapshot();
-                        for reason in [SweepReason::AttributeChange, SweepReason::PolicyUpdate] {
-                            assert_eq!(revalidate_visas(&asm, &psnap, reason).await, 0);
-                            for id in ids(&bv.peer) {
-                                assert!(
-                                    !revoked_on(&asm, id, &relay).await,
-                                    "{reason:?} sweep kept bootstrap visa {id}: its peering holds"
-                                );
-                            }
+                        assert_eq!(revalidate_visas(&asm, &psnap).await, 0);
+                        for id in ids(&bv.peer) {
+                            assert!(
+                                !revoked_on(&asm, id, &relay).await,
+                                "the sweep kept bootstrap visa {id}: its peering holds"
+                            );
                         }
 
                         asm.policy_mgr
@@ -7279,10 +7335,7 @@ mod tests {
                             .await
                             .unwrap();
                         let psnap = asm.policy_mgr.get_current_snapshot();
-                        assert_eq!(
-                            revalidate_visas(&asm, &psnap, SweepReason::PolicyUpdate).await,
-                            0
-                        );
+                        assert_eq!(revalidate_visas(&asm, &psnap).await, 0);
                         for id in ids(&bv.peer) {
                             assert!(
                                 revoked_on(&asm, id, &relay).await,

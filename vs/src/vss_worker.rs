@@ -419,9 +419,8 @@ async fn send_pending_visas(
 /// If there are visas pending revocation for this node, send the revokes over
 /// VSS and tear down the acked ones. Mirrors `send_pending_visas`.
 ///
-/// No per-id staleness re-check is needed: allow verdicts cancel queued revokes
-/// under the same store lock that marks them, so a `PendingRevoke` with a newer
-/// allow cannot exist in memory.
+/// No per-id staleness re-check is needed: a `PendingRevoke` is final, nothing
+/// moves a node back out of it.
 async fn send_pending_revokes(
     asm: &Assembly,
     node_addr: &IpAddr,

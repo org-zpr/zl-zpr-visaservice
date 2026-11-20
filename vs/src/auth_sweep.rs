@@ -688,7 +688,9 @@ pub(crate) async fn sweep_expired_auths(asm: &Arc<Assembly>) -> SweepStats {
 /// [crate::config::MIN_VISA_LIFETIME]: fine-grained enough that a revocation
 /// lands inside the shortest visa lifetime, and well inside any sane
 /// `reauth_deadline`. The denylist pass here is the retry path for
-/// revocations the admin add deferred (zipline#136).
+/// revocations the admin add deferred (zipline#136). Each tick also kicks the
+/// revocation reconciler (`event_mgr::reconcile_obligations`), the retry path
+/// for obligations a pass left pending (zl-zipline#289).
 pub(crate) fn spawn_auth_expiry_sweeper(asm: Arc<Assembly>, period: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -696,6 +698,9 @@ pub(crate) fn spawn_auth_expiry_sweeper(asm: Arc<Assembly>, period: Duration) ->
             sweep_expired_auths(&asm).await;
             sweep_reauth_obligations(&asm).await;
             sweep_denylisted_actors(&asm).await;
+            // Retry any revocation obligation a reconciler pass left pending
+            // (zl-zipline#289): no timer of its own.
+            asm.event_mgr.kick_reconcile();
         }
     })
 }
@@ -1130,8 +1135,10 @@ mod tests {
         } else {
             SystemTime::now() - Duration::from_secs((-offset_secs) as u64)
         };
-        ReauthRepo::new(asm.state_db.clone())
-            .add_obligation(&ReauthObligation { vinst, deadline })
+        // Replace any obligation for `vinst`: add keeps the first deadline.
+        let repo = ReauthRepo::new(asm.state_db.clone());
+        repo.remove_obligation(vinst).await.unwrap();
+        repo.add_obligation(&ReauthObligation { vinst, deadline })
             .await
             .unwrap();
     }

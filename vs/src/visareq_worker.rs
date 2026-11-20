@@ -965,7 +965,7 @@ mod tests {
     }
 
     // Verifies that visa_from_allow issues a visa and returns Allow when given a valid hit and route,
-    // and that the stored metadata records the installed policy vinst as both created/checked_vinst.
+    // and that the stored metadata records the installed policy vinst as created_vinst.
     #[tokio::test]
     async fn visa_from_allow_issues_visa_on_allow() {
         let asm = Arc::new(new_assembly_for_tests(None).await);
@@ -1004,7 +1004,6 @@ mod tests {
             .unwrap()
             .expect("metadata should be stored");
         assert_eq!(md.created_vinst, 7);
-        assert_eq!(md.checked_vinst, 7);
     }
 
     // An actor whose authentication expires almost immediately leaves less than

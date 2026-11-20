@@ -45,6 +45,7 @@ mod net_mgr;
 mod oidc;
 mod packet;
 mod policy_mgr;
+mod revocation;
 mod router;
 mod signal_worker;
 mod topology_mgr;
@@ -77,6 +78,7 @@ use crate::logging::enable_logging;
 use crate::logging::targets::MAIN;
 use crate::net_mgr::NetMgr;
 use crate::policy_mgr::{PolicyMgr, SystemResolver};
+use crate::revocation::RevocationLedger;
 use crate::topology_mgr::TopologyMgr;
 use crate::trusted_services::TrustedServicesMgr;
 use crate::visa_mgr::VisaMgr;
@@ -413,6 +415,7 @@ async fn main() -> std::process::ExitCode {
             admin_api_keys.get_path().display());
     }
 
+    let revocations = Arc::new(RevocationLedger::new(db_handle.clone()));
     let asm = Arc::new(Assembly {
         config: cfg.clone(),
         counters,
@@ -431,9 +434,12 @@ async fn main() -> std::process::ExitCode {
         ts_mgr,
         deny_log: Default::default(),
         observed_substrate: Default::default(),
+        revocations,
     });
-    // Policy installs commit under the topology operation lock (TopoOps invariant).
+    // Policy installs commit under the topology operation lock (TopoOps invariant),
+    // and record their revocation obligation first (zl-zipline#289).
     asm.policy_mgr.bind_topology_lock(asm.topo_mgr.ops_lock());
+    asm.policy_mgr.bind_revocations(asm.revocations.clone());
 
     // Tear down what the startup cull left for us, now that the Assembly
     // exists: the culled nodes' adapters (records, visas, pool addresses),
@@ -460,6 +466,10 @@ async fn main() -> std::process::ExitCode {
 
     js.spawn_local(signal_worker::launch(asm.clone()));
     js.spawn_local(event_mgr::launch(asm.clone(), event_rx));
+    // Satisfy the revocation obligations a previous run left pending (a crash, or a
+    // sweep that had not completed), including a policy pass it cut short
+    // (zl-zipline#289). The auth-expiry sweeper re-kicks from here on.
+    asm.event_mgr.kick_reconcile();
 
     // zl-zipline#285: hydration is done. Perform the initial
     // self-authorization, with a time limit, and only then start listening
