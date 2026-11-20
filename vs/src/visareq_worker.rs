@@ -1836,4 +1836,59 @@ mod tests {
             );
         }
     }
+
+    // zl-zipline#275 end to end: the client's com-policy condition attribute comes
+    // from a trusted service and has 20 s left, under MIN_VISA_LIFETIME (30 s). The
+    // request path must refresh it ahead of expiry, so the flow is allowed with a visa
+    // that outlives MIN_VISA_LIFETIME, instead of being denied because the stale copy
+    // would cap the visa at 20 s.
+    #[tokio::test]
+    async fn visa_request_refreshes_a_condition_attribute_about_to_expire() {
+        use crate::test_helpers::{
+            TS_KEY, TS_SOURCE, make_allow_policy_for_tcp_service_with_client_cond, register_ts,
+            seed_source_attr_expiring,
+        };
+        use crate::trusted_services::TrustedServiceInterface;
+        const CLIENT_A: &str = "fd5a:5052:4000::a";
+
+        let asm = build_binding_test_asm().await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_allow_policy_for_tcp_service_with_client_cond(
+                "svc:web",
+                8080,
+                TS_KEY,
+                "engineering",
+            ))
+            .await
+            .unwrap();
+        let ts = register_ts(&asm, &[(TS_KEY, "engineering")]);
+        seed_source_attr_expiring(
+            &asm,
+            CLIENT_A,
+            TS_KEY,
+            "engineering",
+            SystemTime::now() + Duration::from_secs(20),
+        )
+        .await;
+        // Both actors are current with the service's revision, so only the TTL can make
+        // the source due for a refresh. (A refresh of provider B would restamp its
+        // fixture-set zpr.services under a policy with no join policy granting it.)
+        for addr in [CLIENT_A, "fd5a:5052:4000::b"] {
+            asm.ts_mgr
+                .record_revision(&addr.parse().unwrap(), TS_SOURCE, ts.current_revision());
+        }
+
+        let requesting_node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let (job, _rx) = VisaRequestJob::new(requesting_node, binding_allowed_pkt());
+        let floor = SystemTime::now() + config::MIN_VISA_LIFETIME;
+        match process_visa_request(asm, &job).await {
+            Ok(VisaDecision::Allow(visa, _)) => assert!(
+                visa.expires > floor,
+                "the visa must outlive MIN_VISA_LIFETIME, expires {:?}",
+                visa.expires
+            ),
+            Ok(VisaDecision::Deny(code)) => panic!("expected Allow, got Deny({code:?})"),
+            Err(e) => panic!("expected Allow, got Err({e:?})"),
+        }
+    }
 }
