@@ -354,14 +354,11 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // later sweep re-checks it: a grant is not yet checked atomically against
     // concurrent revocation (zl-zipline#248).
     //
-    // The sweep is the one a login or logout runs (zl-zipline#265): it retries a sweep
-    // that left visas undecided and then queues an attribute-change reconcile, and it
-    // judges against the policy current when it runs, skipping verdicts a newer
-    // install would overrule.
+    // A sweep that leaves visas undecided queues an attribute-change reconcile.
     //
     // ponytail: a second full sweep on every install; re-check only the visas to and
     // from nodes whose services changed if sweeps get costly.
-    crate::connection_control::ConnectionControl::sweep_visas_after_attribute_change(asm).await;
+    attribute_sweep_with_retry(asm, &psnap).await;
 
     Ok(())
 }
@@ -619,11 +616,21 @@ async fn handle_trusted_service_change(asm: &Arc<Assembly>) {
         failed.len()
     );
 
-    let failures = revalidate_visas(asm, &psnap, SweepReason::AttributeChange).await;
+    attribute_sweep_with_retry(asm, &psnap).await;
+}
+
+/// Re-check every live visa against `psnap` without the generation gate
+/// ([SweepReason::AttributeChange]), from the event worker.
+///
+/// A verdict that could not be recorded must not be dropped -- after a Zode logout
+/// it is a visa that should be revoked (#63 review). If any was, the whole
+/// attribute-change reconcile is queued again after `RECONCILE_RETRY`, and repeats
+/// while the sweep fails. The re-queue runs on its own task: this runs on the event
+/// worker, which must never wait on its own bounded queue (a full queue would
+/// deadlock it).
+async fn attribute_sweep_with_retry(asm: &Arc<Assembly>, psnap: &PolicySnapshot) {
+    let failures = revalidate_visas(asm, psnap, SweepReason::AttributeChange).await;
     if failures > 0 {
-        // A verdict that could not be recorded must not be dropped -- after a
-        // Zode logout it is a visa that should be revoked (#63 review). Run
-        // the whole reconcile again later; it repeats while the sweep fails.
         // ponytail: fixed interval; add backoff if long store outages make the
         // retries noisy.
         warn!(target: EVENT, "attribute-change sweep left {failures} visa(s) undecided; retrying in {:?}", crate::config::RECONCILE_RETRY);
@@ -748,6 +755,36 @@ mod tests {
             "the retry waits RECONCILE_RETRY"
         );
         // Let the spawned retry task start its sleep before the clock moves.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(crate::config::RECONCILE_RETRY + Duration::from_secs(1)).await;
+        let evt = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("the retry must be queued")
+            .unwrap();
+        assert!(matches!(evt, VsEvent::TrustedServiceChange));
+    }
+
+    /// Copilot on zl-zpr-visaservice#76: the policy pass runs on the event worker, so
+    /// a failed ungated sweep must re-queue its reconcile from a spawned task after
+    /// `RECONCILE_RETRY`, never by awaiting the worker's own bounded queue inline (a
+    /// full queue would deadlock the worker).
+    #[tokio::test(start_paused = true)]
+    async fn test_policy_pass_failed_ungated_sweep_is_retried_off_the_worker() {
+        let (asm, mut event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        // Only the ungated sweep sees this visa: it carries the new generation.
+        let (asm, _node_a, _node_b, _id) = issue_visa_on_stale_services_on(asm).await;
+        while event_rx.try_recv().is_ok() {}
+        db.set_set_ex_fault(crate::db::FaultMode::ApplyThenError);
+
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the retry waits RECONCILE_RETRY, off the event worker"
+        );
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
@@ -1406,11 +1443,22 @@ mod tests {
     /// it is allowed on B's stale services and carries the new generation. Returns
     /// (asm, A, B, the visa's id).
     async fn issue_visa_on_stale_services() -> (Arc<Assembly>, IpAddr, IpAddr, u64) {
+        // The assembly build_sweep_asm uses: its event queue stays open.
+        let (asm, event_rx, _db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        std::mem::forget(event_rx);
+        issue_visa_on_stale_services_on(asm).await
+    }
+
+    /// [issue_visa_on_stale_services] on the given assembly.
+    async fn issue_visa_on_stale_services_on(
+        asm: Assembly,
+    ) -> (Arc<Assembly>, IpAddr, IpAddr, u64) {
         use crate::test_helpers::{make_peering, policy_with_peerings_cns_and_tcp_services};
         use crate::visareq_worker::{VisaDecision, process_visa_request_for_test};
         use zpr::vsapi_types::{LinkState, LinkStateReport, PacketDesc};
 
-        let (asm, node_a) = build_sweep_asm(true).await;
+        let (asm, node_a) = crate::test_helpers::build_sweep_asm_on(asm, true).await;
         let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
         let mut host = asm
             .actor_mgr
