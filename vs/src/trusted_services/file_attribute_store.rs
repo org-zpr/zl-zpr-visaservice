@@ -16,10 +16,7 @@ use crate::error::ServiceError;
 use crate::logging::targets::TS;
 
 use super::attribute_mapper::{AttrHint, AttributeMapper};
-use super::{TrustedServiceInterface, next_revision};
-
-/// Shortest TTL emitted on an attribute. A nearly stale snapshot refreshes early.
-const MIN_ATTRIBUTE_TTL: Duration = Duration::from_secs(60);
+use super::{MIN_ATTRIBUTE_TTL, TrustedServiceInterface, next_revision};
 
 /// File-based attributes encoded in JSON.
 #[derive(Debug)]

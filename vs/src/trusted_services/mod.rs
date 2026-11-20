@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use libeval::attribute::{Attribute, AttributeSource, key};
 
@@ -25,6 +26,18 @@ pub use factory::{
     TS_API_OIDC, TrustedServiceDefinition, build_services, trusted_service_definitions,
 };
 pub use manager::TrustedServicesMgr;
+
+/// Shortest attribute lifetime a trusted-service declaration may configure, shared by
+/// the `file` and `zpr-attr/1` stores (docs/ATTRIBUTE_SERVICE.md, *Declaring an
+/// attribute service in policy*). The file store also reloads its snapshot once less
+/// than this remains, so it never vends an attribute with less than this to live.
+pub(crate) const MIN_ATTRIBUTE_TTL: Duration = Duration::from_secs(60);
+
+// The refresh-ahead window must stay under MIN_ATTRIBUTE_TTL: a file store reloads only
+// below MIN_ATTRIBUTE_TTL, so a refresh at or above it would re-vend the same expiry and
+// gain nothing (zl-zipline#275).
+const _: () =
+    assert!(crate::config::ATTRIBUTE_REFRESH_AHEAD.as_secs() < MIN_ATTRIBUTE_TTL.as_secs());
 
 /// A revision no snapshot will ever carry (the counter starts at 1). Recording it for
 /// an actor keeps a source relevant-and-stale, forcing a retry on the next request.
