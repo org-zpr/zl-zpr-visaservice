@@ -217,10 +217,16 @@ fn apply_changed_attributes(
 /// actor of that role count ([Policy::join_services_for_role]): an adapter never picks
 /// up a node-only service here (Codex P1 on PR #50).
 ///
+/// It also runs on every policy pass, for each connected node ([restamp_node_services]):
+/// a policy install that changes no attribute can still change the services a node is
+/// granted, and the pass judges nodes on their stored services (zl-zipline#273).
+///
 /// The policy-stamped keys are left out of the claims matched, as reauthorize does. An
 /// attribute stripped because its source was unreachable grants nothing, so the
 /// services it granted are dropped: fail-closed.
-fn restamp_services(policy: &Policy, actor: &mut Actor) {
+///
+/// Returns true if the actor's services changed.
+fn restamp_services(policy: &Policy, actor: &mut Actor) -> bool {
     let claims: Vec<Attribute> = actor
         .attrs_iter()
         .filter(|a| !key::POLICY_STAMPED.contains(&a.get_key()))
@@ -229,14 +235,47 @@ fn restamp_services(policy: &Policy, actor: &mut Actor) {
     let services = policy.join_services_for_role(&claims, actor.is_node());
     let current: HashSet<String> = actor.services_iter().map(str::to_string).collect();
     if services == current {
-        return;
+        return false;
     }
     debug!(
         target: VREQ,
-        "actor {:?} services change after attribute refresh: {current:?} -> {services:?}",
+        "actor {:?} services change: {current:?} -> {services:?}",
         actor.get_zpr_addr()
     );
     actor.set_services(services);
+    true
+}
+
+/// Recalculate the services of the node stored at `zpr_addr` under `policy`
+/// ([restamp_services]) and write the node back only if they changed. The policy pass
+/// runs this for every connected node before it judges them (zl-zipline#273), so a
+/// node hosting a service the new policy deleted loses that service instead of being
+/// disconnected for offering it. The write frees the `service:<name>` entries the node
+/// stopped providing.
+///
+/// The caller holds the topology guard ([crate::topology_mgr::TopoOps]). This takes the
+/// node commit lock inside it (lock order: topology lock, then node commit lock, as
+/// in [commit_refresh]), so a node's re-authorization of its own actor cannot land
+/// between this read and this write and be overwritten.
+///
+/// Returns true if it wrote the node; false if its services were unchanged or no
+/// actor is stored at the address.
+pub(crate) async fn restamp_node_services(
+    asm: &Assembly,
+    policy: &Policy,
+    zpr_addr: &IpAddr,
+) -> Result<bool, ServiceError> {
+    let _node_commit = asm.policy_mgr.node_commit_lock.lock().await;
+    let Some(mut node) = asm.actor_mgr.get_actor_by_zpr_addr(zpr_addr).await? else {
+        return Ok(false);
+    };
+    if !restamp_services(policy, &mut node) {
+        return Ok(false);
+    }
+    asm.actor_mgr
+        .update_actor(&node, &asm.policy_service_names())
+        .await?;
+    Ok(true)
 }
 
 /// Refresh the actor's attributes from the trusted service manager where
@@ -443,13 +482,18 @@ fn prune_from_source(actor: &mut Actor, source: &str, pred: impl Fn(&Attribute) 
 /// revision stays mismatched, so its next visa request refreshes it again. This includes
 /// an unreachable trusted service (`AttributesIndeterminate`).
 ///
-/// Returns `(refreshed, unresolved, failed)` counts for logging.
+/// Returns `(refreshed, unresolved, failed)`: the refreshed and unresolved counts for
+/// logging, and the addresses whose refresh failed. A caller that evaluates the stored
+/// actors must not trust a failed one's claims (see [refresh_and_persist_actor]).
 ///
 /// TODO: Sequential, and unbounded in the size of the set. Fine while the only trusted
 /// service is the in-memory file store; revisit once services are network calls and
 /// actor/visa counts are large.
-pub(crate) async fn refresh_actors(asm: &Assembly, zpr_addrs: HashSet<IpAddr>) -> (u32, u32, u32) {
-    let (mut refreshed, mut unresolved, mut failed) = (0u32, 0u32, 0u32);
+pub(crate) async fn refresh_actors(
+    asm: &Assembly,
+    zpr_addrs: HashSet<IpAddr>,
+) -> (u32, u32, HashSet<IpAddr>) {
+    let (mut refreshed, mut unresolved, mut failed) = (0u32, 0u32, HashSet::new());
     // Sequential for now, join_all it if sweeps ever get slow.
     for zpr_addr in zpr_addrs {
         match asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await {
@@ -458,13 +502,13 @@ pub(crate) async fn refresh_actors(asm: &Assembly, zpr_addrs: HashSet<IpAddr>) -
                 Ok(false) => {}
                 Err(e) => {
                     warn!(target: VREQ, "attribute reconcile: failed to refresh actor {zpr_addr}: {e}");
-                    failed += 1;
+                    failed.insert(zpr_addr);
                 }
             },
             Ok(None) => unresolved += 1,
             Err(e) => {
                 warn!(target: VREQ, "attribute reconcile: failed to load actor {zpr_addr}: {e}");
-                failed += 1;
+                failed.insert(zpr_addr);
             }
         }
     }
@@ -1608,6 +1652,52 @@ mod refresh_commit {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// zl-zipline#273: the policy pass's per-node recalculation writes the node back
+    /// only when its services change. Unchanged services write nothing (a store that
+    /// rejects every write would fail the call), and an address with no actor stored
+    /// is skipped.
+    #[tokio::test]
+    async fn test_restamp_node_services_writes_only_a_change() {
+        use crate::db::FaultMode;
+        use crate::test_helpers::build_sweep_asm_with_db;
+        // The default test policy grants nothing, and the sweep nodes provide nothing.
+        let (asm, node_a, db) = build_sweep_asm_with_db(false).await;
+        let policy = asm.policy_mgr.get_current();
+        db.set_hset_fault(FaultMode::Reject);
+
+        assert!(!restamp_node_services(&asm, &policy, &node_a).await.unwrap());
+        let nobody: IpAddr = "fd5a:5052:3000::99".parse().unwrap();
+        assert!(!restamp_node_services(&asm, &policy, &nobody).await.unwrap());
+    }
+
+    /// zl-zipline#273: a node providing a service the policy does not grant has it
+    /// removed, and the call reports the write.
+    #[tokio::test]
+    async fn test_restamp_node_services_writes_a_change() {
+        let (asm, node_a) = build_sweep_asm(false).await;
+        let mut node = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&node_a)
+            .await
+            .unwrap()
+            .unwrap();
+        node.set_services(HashSet::from(["svc-x".to_string()]));
+        asm.actor_mgr
+            .update_actor(&node, &Default::default())
+            .await
+            .unwrap();
+
+        let policy = asm.policy_mgr.get_current();
+        assert!(restamp_node_services(&asm, &policy, &node_a).await.unwrap());
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&node_a)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored.provides("svc-x"));
     }
 }
 

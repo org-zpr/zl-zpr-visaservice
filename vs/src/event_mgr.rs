@@ -15,7 +15,7 @@ use zpr::vsapi::v1::DisconnectReason;
 
 use libeval::eval::EvalContext;
 
-use crate::actor_attributes::refresh_actors;
+use crate::actor_attributes::{refresh_actors, restamp_node_services};
 use crate::assembly::Assembly;
 use crate::error::ServiceError;
 use crate::logging::targets::EVENT;
@@ -251,10 +251,11 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // (The live-node set used for topology is read again under the topology lock below.)
     let mut refresh_set = live_visa_actor_addrs(asm).await;
     refresh_set.extend(asm.actor_mgr.list_node_addrs().await?);
-    let (refreshed, unresolved, failed) = refresh_actors(asm, refresh_set).await;
+    let (refreshed, unresolved, unrefreshed) = refresh_actors(asm, refresh_set).await;
     info!(
         target: EVENT,
-        "policy updated vinst={vinst}: actors refreshed={refreshed} unresolved={unresolved} failed={failed}"
+        "policy updated vinst={vinst}: actors refreshed={refreshed} unresolved={unresolved} failed={}",
+        unrefreshed.len()
     );
 
     // Reconcile hostname claims against the new policy's service-name set
@@ -283,7 +284,7 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // revocations it calls for. A node that disconnects or connects meanwhile is
     // either fully before or fully after it.
     let ops = asm.topo_mgr.ops().await;
-    let locked = policy_pass_locked(asm, &ops, snapshot_vinst).await;
+    let locked = policy_pass_locked(asm, &ops, snapshot_vinst, &unrefreshed).await;
     drop(ops);
     let LockedPass::Applied {
         psnap,
@@ -340,6 +341,25 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // already reflect the updated topology. It does not wait for the pushes above.
     revalidate_visas(asm, &psnap, SweepReason::PolicyUpdate).await;
 
+    // A visa requested between the install and this pass was judged on the services
+    // its endpoints stored under the previous policy, which the pass may since have
+    // recalculated (zl-zipline#273), but it carries the new generation, so the
+    // generation-gated sweep above skipped it. Re-check every visa without that gate,
+    // as an attribute change does. It runs on every install, not only when this pass
+    // changed a node's services: a pass that failed after recalculating them leaves
+    // nothing changed for its retry to notice.
+    //
+    // A request that read its actors before the recalculation and commits its visa
+    // after this sweep has listed the visas still escapes until the visa expires or a
+    // later sweep re-checks it: a grant is not yet checked atomically against
+    // concurrent revocation (zl-zipline#248).
+    //
+    // A sweep that leaves visas undecided queues an attribute-change reconcile.
+    //
+    // ponytail: a second full sweep on every install; re-check only the visas to and
+    // from nodes whose services changed if sweeps get costly.
+    attribute_sweep_with_retry(asm, &psnap).await;
+
     Ok(())
 }
 
@@ -363,9 +383,15 @@ enum LockedPass {
 
 /// The topology part of a policy pass, under the caller's [TopoOps]: re-read the
 /// policy (installs commit under the same lock, so it stays current until the guard
-/// is dropped), read the live-node set and judge each node on it, disconnect the
+/// is dropped), read the live-node set, recalculate each node's services under the
+/// policy ([restamp_node_services]), judge each node on it, disconnect the
 /// invalid ones, reconcile links, revoke visas over links taken down and set apart
 /// the nodes those links cut off from the visa service ([nodes_cut_off]).
+///
+/// `unrefreshed` are the actors whose attribute refresh failed: their claims are
+/// indeterminate, so their services are not recalculated (a policy condition a
+/// missing key satisfies must not grant one) and they are judged on their stored
+/// services.
 ///
 /// `refreshed_vinst` is the policy the caller refreshed actor attributes for. If a
 /// newer policy has been installed since, the actors are stale for it: judging nodes
@@ -377,6 +403,7 @@ async fn policy_pass_locked(
     asm: &Arc<Assembly>,
     ops: &TopoOps<'_>,
     refreshed_vinst: u64,
+    unrefreshed: &HashSet<IpAddr>,
 ) -> Result<LockedPass, ServiceError> {
     let psnap = asm.policy_mgr.get_current_snapshot();
     if psnap.vinst() != refreshed_vinst {
@@ -388,6 +415,24 @@ async fn policy_pass_locked(
     // The new policy may invalidate some existing nodes. Read the live-node set
     // under the guard, so the pass cannot re-add a node that has disconnected.
     let connected_node_addrs = asm.actor_mgr.list_node_addrs().await?;
+
+    // Recalculate each node's services under the new policy before judging it
+    // (zl-zipline#273): a node still offering a service the policy deleted would
+    // otherwise be judged invalid and disconnected. If the recalculation fails, the
+    // node is judged on its stored services -- at worst it is disconnected, never kept
+    // with more than the policy grants. A node whose attribute refresh failed is
+    // judged on its stored services the same way: its claims are indeterminate.
+    let policy = psnap.policy_arc();
+    for naddr in &connected_node_addrs {
+        if unrefreshed.contains(naddr) {
+            warn!(target: EVENT, "policy updated vinst={vinst}: the attributes of node {naddr} could not be refreshed, judging it on its stored services");
+            continue;
+        }
+        if let Err(e) = restamp_node_services(asm, &policy, naddr).await {
+            warn!(target: EVENT, "policy updated vinst={vinst}: failed to recalculate the services of node {naddr}, judging it on its stored services: {e}");
+        }
+    }
+
     let (mut valid_node_addrs, invalid_node_addrs) =
         revalidate_nodes(asm, &psnap, connected_node_addrs).await;
 
@@ -567,14 +612,25 @@ async fn handle_trusted_service_change(asm: &Arc<Assembly>) {
         refresh_actors(asm, live_visa_actor_addrs(asm).await).await;
     info!(
         target: EVENT,
-        "trusted service changed: actors refreshed={refreshed} unresolved={unresolved} failed={failed}"
+        "trusted service changed: actors refreshed={refreshed} unresolved={unresolved} failed={}",
+        failed.len()
     );
 
-    let failures = revalidate_visas(asm, &psnap, SweepReason::AttributeChange).await;
+    attribute_sweep_with_retry(asm, &psnap).await;
+}
+
+/// Re-check every live visa against `psnap` without the generation gate
+/// ([SweepReason::AttributeChange]), from the event worker.
+///
+/// A verdict that could not be recorded must not be dropped -- after a Zode logout
+/// it is a visa that should be revoked (#63 review). If any was, the whole
+/// attribute-change reconcile is queued again after `RECONCILE_RETRY`, and repeats
+/// while the sweep fails. The re-queue runs on its own task: this runs on the event
+/// worker, which must never wait on its own bounded queue (a full queue would
+/// deadlock it).
+async fn attribute_sweep_with_retry(asm: &Arc<Assembly>, psnap: &PolicySnapshot) {
+    let failures = revalidate_visas(asm, psnap, SweepReason::AttributeChange).await;
     if failures > 0 {
-        // A verdict that could not be recorded must not be dropped -- after a
-        // Zode logout it is a visa that should be revoked (#63 review). Run
-        // the whole reconcile again later; it repeats while the sweep fails.
         // ponytail: fixed interval; add backoff if long store outages make the
         // retries noisy.
         warn!(target: EVENT, "attribute-change sweep left {failures} visa(s) undecided; retrying in {:?}", crate::config::RECONCILE_RETRY);
@@ -699,6 +755,36 @@ mod tests {
             "the retry waits RECONCILE_RETRY"
         );
         // Let the spawned retry task start its sleep before the clock moves.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(crate::config::RECONCILE_RETRY + Duration::from_secs(1)).await;
+        let evt = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("the retry must be queued")
+            .unwrap();
+        assert!(matches!(evt, VsEvent::TrustedServiceChange));
+    }
+
+    /// Copilot on zl-zpr-visaservice#76: the policy pass runs on the event worker, so
+    /// a failed ungated sweep must re-queue its reconcile from a spawned task after
+    /// `RECONCILE_RETRY`, never by awaiting the worker's own bounded queue inline (a
+    /// full queue would deadlock the worker).
+    #[tokio::test(start_paused = true)]
+    async fn test_policy_pass_failed_ungated_sweep_is_retried_off_the_worker() {
+        let (asm, mut event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        // Only the ungated sweep sees this visa: it carries the new generation.
+        let (asm, _node_a, _node_b, _id) = issue_visa_on_stale_services_on(asm).await;
+        while event_rx.try_recv().is_ok() {}
+        db.set_set_ex_fault(crate::db::FaultMode::ApplyThenError);
+
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the retry waits RECONCILE_RETRY, off the event worker"
+        );
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
@@ -1042,7 +1128,7 @@ mod tests {
 
         let outcome = {
             let ops = asm.topo_mgr.ops().await;
-            policy_pass_locked(&asm, &ops, refreshed_vinst)
+            policy_pass_locked(&asm, &ops, refreshed_vinst, &HashSet::new())
                 .await
                 .unwrap()
         };
@@ -1095,6 +1181,371 @@ mod tests {
             !asm.topo_mgr.has_node(&a),
             "disconnected node must stay out of the router"
         );
+    }
+
+    // ---- zl-zipline#273: a policy install recalculates a node's services. ----
+
+    /// Store a connected node at `addr` (CN `cn`) providing `services`, in both the
+    /// actor store and the router: the state a connect leaves behind.
+    async fn add_live_node_with_services(
+        asm: &Assembly,
+        addr: &str,
+        cn: &str,
+        services: &[&str],
+    ) -> IpAddr {
+        let mut node = make_node_actor_defexp(addr, cn, "[fd5a:5052::101]:1234");
+        node.set_services(services.iter().map(|s| s.to_string()).collect());
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        let naddr: IpAddr = addr.parse().unwrap();
+        asm.topo_mgr.add_node(naddr).unwrap();
+        naddr
+    }
+
+    /// The services the stored actor at `naddr` provides.
+    async fn stored_services(asm: &Assembly, naddr: &IpAddr) -> HashSet<String> {
+        let actor = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(naddr)
+            .await
+            .unwrap()
+            .expect("the actor must still be stored");
+        actor.services_iter().map(str::to_string).collect()
+    }
+
+    /// Run the guarded part of a policy pass under the current policy, as
+    /// `handle_policy_updated` does once its attribute refresh is done, and return
+    /// the nodes it judged valid. Panics if the pass deferred.
+    async fn run_locked_pass(asm: &Arc<Assembly>) -> Vec<IpAddr> {
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        let ops = asm.topo_mgr.ops().await;
+        match policy_pass_locked(asm, &ops, vinst, &HashSet::new())
+            .await
+            .unwrap()
+        {
+            LockedPass::Applied {
+                valid_node_addrs, ..
+            } => valid_node_addrs,
+            LockedPass::Deferred => panic!("the pass must apply under the current policy"),
+        }
+    }
+
+    /// The set of service names in `names`.
+    fn service_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Deleting a service a node hosts must not disconnect the node: the pass
+    /// recalculates the node's services from the new policy before judging it, so it
+    /// stays connected, provides nothing, and no longer owns the service entry.
+    #[tokio::test]
+    async fn test_policy_pass_keeps_a_node_whose_hosted_service_was_deleted() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a = add_live_node_with_services(&asm, "fd5a:5052::1", "node-a", &["svc-x"]).await;
+        assert!(
+            asm.actor_mgr
+                .get_service_detail("svc-x")
+                .await
+                .unwrap()
+                .is_some(),
+            "setup: the node owns the svc-x entry"
+        );
+        // The new policy still admits the node but grants it no service.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+
+        let valid = run_locked_pass(&asm).await;
+
+        assert_eq!(valid, vec![a], "the node must be judged valid");
+        assert_eq!(asm.actor_mgr.list_node_addrs().await.unwrap(), vec![a]);
+        assert!(
+            asm.topo_mgr.has_node(&a),
+            "the node must stay in the router"
+        );
+        assert!(stored_services(&asm, &a).await.is_empty());
+        assert!(
+            asm.actor_mgr
+                .get_service_detail("svc-x")
+                .await
+                .unwrap()
+                .is_none(),
+            "the deleted service's entry must no longer name the node"
+        );
+    }
+
+    /// Only the service the new policy dropped is removed; the one it still grants
+    /// stays.
+    #[tokio::test]
+    async fn test_policy_pass_prunes_only_the_deleted_service() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a =
+            add_live_node_with_services(&asm, "fd5a:5052::1", "node-a", &["svc-x", "svc-y"]).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(Some(vec![svc("svc-x")])))
+            .await
+            .unwrap();
+
+        let valid = run_locked_pass(&asm).await;
+
+        assert_eq!(valid, vec![a]);
+        assert_eq!(stored_services(&asm, &a).await, service_set(&["svc-x"]));
+    }
+
+    /// A service the new policy grants a node is added to it by the pass, as a
+    /// connect or re-authentication under that policy would.
+    #[tokio::test]
+    async fn test_policy_pass_adds_a_newly_granted_service() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a = add_live_node_with_services(&asm, "fd5a:5052::1", "node-a", &[]).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(Some(vec![svc("svc-x")])))
+            .await
+            .unwrap();
+
+        let valid = run_locked_pass(&asm).await;
+
+        assert_eq!(valid, vec![a]);
+        assert_eq!(stored_services(&asm, &a).await, service_set(&["svc-x"]));
+    }
+
+    /// A node whose attribute refresh failed is not recalculated (Copilot on
+    /// zl-zpr-visaservice#76): its claims are indeterminate, and a policy condition a
+    /// missing key satisfies must not grant it a service. It is judged on its stored
+    /// services instead.
+    #[tokio::test]
+    async fn test_policy_pass_does_not_recalculate_a_node_whose_refresh_failed() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a = add_live_node_with_services(&asm, "fd5a:5052::1", "node-a", &[]).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(Some(vec![svc("svc-x")])))
+            .await
+            .unwrap();
+        // A trusted service the node has never been refreshed from, and it is down.
+        let ts = register_ts(&asm, &[]);
+        ts.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+
+        assert_eq!(
+            stored_services(&asm, &a).await,
+            service_set(&[]),
+            "indeterminate claims must not grant a service"
+        );
+        assert!(
+            asm.topo_mgr.has_node(&a),
+            "the node is judged on its stored services"
+        );
+    }
+
+    /// The recalculation does not save a node the new policy no longer admits at
+    /// all: one whose CN no join policy matches is still disconnected.
+    #[tokio::test]
+    async fn test_policy_pass_still_disconnects_a_node_no_join_policy_matches() {
+        use crate::test_helpers::policy_with_peerings_and_node_cns;
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a = add_live_node_with_services(&asm, "fd5a:5052::1", "node-a", &["svc-x"]).await;
+        // The only join policy admits another node.
+        let other: IpAddr = "fd5a:5052::2".parse().unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(policy_with_peerings_and_node_cns(
+                &[],
+                &[(other, "node-other")],
+            ))
+            .await
+            .unwrap();
+
+        let valid = run_locked_pass(&asm).await;
+
+        assert!(valid.is_empty(), "the node must be judged invalid");
+        assert!(asm.actor_mgr.list_node_addrs().await.unwrap().is_empty());
+        assert!(!asm.topo_mgr.has_node(&a), "the node must leave the router");
+    }
+
+    /// The pass that keeps a node whose hosted service was deleted still revokes the
+    /// visas to that service: the visa sweep runs last in the same pass.
+    #[tokio::test]
+    async fn test_policy_pass_revokes_visas_to_a_deleted_service() {
+        use libeval::eval_result::{Direction, Hit};
+        use libeval::route::Route;
+        use zpr::vsapi_types::PacketDesc;
+
+        let (asm, node_a) = build_sweep_asm(false).await;
+        // Node B hosts "web" on TCP 80, and adapter `::4000::a` holds a visa to it.
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let mut host = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&node_b)
+            .await
+            .unwrap()
+            .unwrap();
+        host.set_services(service_set(&["web"]));
+        asm.actor_mgr
+            .update_actor(&host, &Default::default())
+            .await
+            .unwrap();
+        let pdesc =
+            PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:3000::2", 1234, 80).unwrap();
+        let id = asm
+            .visa_mgr
+            .create_visa(
+                &asm,
+                &node_a,
+                &pdesc,
+                &Hit::new_no_signal(0, Direction::Forward),
+                &Route::new_direct(node_a.into()),
+                "",
+                0,
+                0,
+                SystemTime::now() + Duration::from_secs(3600),
+            )
+            .await
+            .unwrap()
+            .visa
+            .issuer_id;
+
+        // "web" is deleted: the new policy admits every node and grants no service.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+
+        assert!(
+            asm.actor_mgr
+                .list_node_addrs()
+                .await
+                .unwrap()
+                .contains(&node_b),
+            "the host must stay connected"
+        );
+        assert!(stored_services(&asm, &node_b).await.is_empty());
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap()
+                .contains(&id),
+            "the visa to the deleted service must be revoked"
+        );
+    }
+
+    /// Set up the window between a policy install and its pass (local Codex P1 on
+    /// zl-zipline#273): node B stores "web" on TCP 80 from the previous policy; the new
+    /// policy keeps both nodes and the A--B link (reported up by both ends, R14) and
+    /// keeps allowing access to "web", but grants it to nobody. A visa from adapter
+    /// `::4000::a` to B on port 80 is then requested through the real request path:
+    /// it is allowed on B's stale services and carries the new generation. Returns
+    /// (asm, A, B, the visa's id).
+    async fn issue_visa_on_stale_services() -> (Arc<Assembly>, IpAddr, IpAddr, u64) {
+        // The assembly build_sweep_asm uses: its event queue stays open.
+        let (asm, event_rx, _db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        std::mem::forget(event_rx);
+        issue_visa_on_stale_services_on(asm).await
+    }
+
+    /// [issue_visa_on_stale_services] on the given assembly.
+    async fn issue_visa_on_stale_services_on(
+        asm: Assembly,
+    ) -> (Arc<Assembly>, IpAddr, IpAddr, u64) {
+        use crate::test_helpers::{make_peering, policy_with_peerings_cns_and_tcp_services};
+        use crate::visareq_worker::{VisaDecision, process_visa_request_for_test};
+        use zpr::vsapi_types::{LinkState, LinkStateReport, PacketDesc};
+
+        let (asm, node_a) = crate::test_helpers::build_sweep_asm_on(asm, true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let mut host = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&node_b)
+            .await
+            .unwrap()
+            .unwrap();
+        host.set_services(service_set(&["web"]));
+        asm.actor_mgr
+            .update_actor(&host, &Default::default())
+            .await
+            .unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(policy_with_peerings_cns_and_tcp_services(
+                &[make_peering(node_a, node_b, "l", vec![])],
+                &[(node_a, "na"), (node_b, "nb")],
+                &[("web", 80)],
+            ))
+            .await
+            .unwrap();
+
+        let cn_of = |n: &IpAddr| {
+            [(node_a, "na"), (node_b, "nb")]
+                .iter()
+                .find(|(addr, _)| addr == n)
+                .map(|(_, cn)| cn.to_string())
+        };
+        for (reporter, peer_cn) in [(node_a, "nb"), (node_b, "na")] {
+            asm.topo_mgr.record_link_states_with_cns(
+                &asm.topo_mgr.ops_now(),
+                &reporter,
+                None,
+                vec![LinkStateReport {
+                    peer_cn: peer_cn.to_string(),
+                    state: LinkState::Up,
+                }],
+                &cn_of,
+            );
+        }
+
+        let pkt = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:3000::2", 1234, 80).unwrap();
+        let VisaDecision::Allow(visa, _) =
+            process_visa_request_for_test(asm.clone(), node_a, pkt).await
+        else {
+            panic!("precondition: the stale services allow the visa");
+        };
+        (asm, node_a, node_b, visa.issuer_id)
+    }
+
+    /// Run the policy pass for the current policy and assert that it kept the A--B
+    /// link and that the visa `id` held by `node_a` is revoked.
+    async fn assert_pass_revokes(asm: &Arc<Assembly>, node_a: &IpAddr, node_b: &IpAddr, id: u64) {
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(asm, vinst).await.unwrap();
+        assert!(
+            asm.topo_mgr.link_up(node_a, node_b),
+            "the A--B link stays up"
+        );
+        assert!(stored_services(asm, node_b).await.is_empty());
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(node_a)
+                .await
+                .unwrap()
+                .contains(&id),
+            "the visa issued on stale services must be revoked"
+        );
+    }
+
+    /// The pass that recalculates the host's services revokes a visa issued on its
+    /// stale services, although the generation-gated policy sweep skips that visa.
+    #[tokio::test]
+    async fn test_policy_pass_revokes_a_visa_issued_on_stale_services() {
+        let (asm, node_a, node_b, id) = issue_visa_on_stale_services().await;
+        assert_pass_revokes(&asm, &node_a, &node_b, id).await;
+    }
+
+    /// Local Codex P2 on zl-zipline#273: a pass that recalculated the host's services
+    /// and then failed leaves nothing for its retry to recalculate. The retry must
+    /// still revoke the visa issued on the stale services. The failed pass's
+    /// recalculation is played here by recalculating B directly.
+    #[tokio::test]
+    async fn test_policy_pass_retry_revokes_a_visa_issued_on_stale_services() {
+        let (asm, node_a, node_b, id) = issue_visa_on_stale_services().await;
+        let policy = asm.policy_mgr.get_current();
+        assert!(restamp_node_services(&asm, &policy, &node_b).await.unwrap());
+        assert_pass_revokes(&asm, &node_a, &node_b, id).await;
     }
 
     /// zl-zipline#255: the policy pass sets the router's transit set from the policy,
