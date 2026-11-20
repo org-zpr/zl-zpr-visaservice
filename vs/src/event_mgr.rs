@@ -290,6 +290,7 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         valid_node_addrs,
         stopped_workers,
         reconciled,
+        services_changed,
     } = locked?
     else {
         return Ok(());
@@ -340,6 +341,14 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // already reflect the updated topology. It does not wait for the pushes above.
     revalidate_visas(asm, &psnap, SweepReason::PolicyUpdate).await;
 
+    // If the pass changed a node's services (zl-zipline#273), a visa requested between
+    // the install and the pass was judged on that node's previous services but carries
+    // the new generation, so the generation-gated sweep above skipped it. Re-check
+    // every visa without that gate, as an attribute change does.
+    if services_changed {
+        revalidate_visas(asm, &psnap, SweepReason::AttributeChange).await;
+    }
+
     Ok(())
 }
 
@@ -358,6 +367,8 @@ enum LockedPass {
         stopped_workers: Vec<(Option<crate::vss_mgr::VssHandle>, IpAddr)>,
         /// Link reconciliation result, returned after the workers are stopped.
         reconciled: Result<(), ServiceError>,
+        /// Whether recalculating the nodes' services under `psnap` changed any.
+        services_changed: bool,
     },
 }
 
@@ -396,9 +407,13 @@ async fn policy_pass_locked(
     // node is judged on its stored services -- at worst it is disconnected, never kept
     // with more than the policy grants.
     let policy = psnap.policy_arc();
+    let mut services_changed = false;
     for naddr in &connected_node_addrs {
-        if let Err(e) = restamp_node_services(asm, &policy, naddr).await {
-            warn!(target: EVENT, "policy updated vinst={vinst}: failed to recalculate the services of node {naddr}, judging it on its stored services: {e}");
+        match restamp_node_services(asm, &policy, naddr).await {
+            Ok(changed) => services_changed |= changed,
+            Err(e) => {
+                warn!(target: EVENT, "policy updated vinst={vinst}: failed to recalculate the services of node {naddr}, judging it on its stored services: {e}");
+            }
         }
     }
 
@@ -494,6 +509,7 @@ async fn policy_pass_locked(
         valid_node_addrs,
         stopped_workers,
         reconciled,
+        services_changed,
     })
 }
 
@@ -1327,6 +1343,86 @@ mod tests {
                 .unwrap()
                 .contains(&id),
             "the visa to the deleted service must be revoked"
+        );
+    }
+
+    /// Local Codex P1 on zl-zipline#273: a visa requested after a policy install but
+    /// before its pass is judged on the host's services as stored under the previous
+    /// policy, and carries the new generation, so the generation-gated policy sweep
+    /// skips it. The pass that recalculates the host's services must still revoke it.
+    /// Here the new policy keeps allowing access to "web" but grants it to nobody.
+    #[tokio::test]
+    async fn test_policy_pass_revokes_a_visa_issued_on_stale_services() {
+        use crate::test_helpers::{make_peering, policy_with_peerings_cns_and_tcp_services};
+        use crate::visareq_worker::{VisaDecision, process_visa_request_for_test};
+        use zpr::vsapi_types::{LinkState, LinkStateReport, PacketDesc};
+
+        let (asm, node_a) = build_sweep_asm(true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        // Node B hosts "web" on TCP 80, as stored under the previous policy.
+        let mut host = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&node_b)
+            .await
+            .unwrap()
+            .unwrap();
+        host.set_services(service_set(&["web"]));
+        asm.actor_mgr
+            .update_actor(&host, &Default::default())
+            .await
+            .unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(policy_with_peerings_cns_and_tcp_services(
+                &[make_peering(node_a, node_b, "l", vec![])],
+                &[(node_a, "na"), (node_b, "nb")],
+                &[("web", 80)],
+            ))
+            .await
+            .unwrap();
+
+        // Both ends report the A--B link up (R14), so the pass keeps it and its visas.
+        let cn_of = |n: &IpAddr| {
+            [(node_a, "na"), (node_b, "nb")]
+                .iter()
+                .find(|(addr, _)| addr == n)
+                .map(|(_, cn)| cn.to_string())
+        };
+        for (reporter, peer_cn) in [(node_a, "nb"), (node_b, "na")] {
+            asm.topo_mgr.record_link_states_with_cns(
+                &asm.topo_mgr.ops_now(),
+                &reporter,
+                None,
+                vec![LinkStateReport {
+                    peer_cn: peer_cn.to_string(),
+                    state: LinkState::Up,
+                }],
+                &cn_of,
+            );
+        }
+
+        // The request lands before the pass: B's stored services still say "web".
+        let pkt = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:3000::2", 1234, 80).unwrap();
+        let VisaDecision::Allow(visa, _) =
+            process_visa_request_for_test(asm.clone(), node_a, pkt).await
+        else {
+            panic!("precondition: the stale services allow the visa");
+        };
+
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+        assert!(
+            asm.topo_mgr.link_up(&node_a, &node_b),
+            "the A--B link stays up"
+        );
+
+        assert!(stored_services(&asm, &node_b).await.is_empty());
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap()
+                .contains(&visa.issuer_id),
+            "the visa issued on stale services must be revoked"
         );
     }
 
