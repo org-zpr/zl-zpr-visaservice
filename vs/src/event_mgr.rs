@@ -164,8 +164,8 @@ enum PassOutcome {
 ///    the current policy;
 /// 2. the attribute refresh of the actors behind live visas, then the sweep of every
 ///    live visa ([revalidate_visas]) -- an actor without a live visa is re-checked
-///    lazily, by the revision check on its next visa request; the sweep must record
-///    every verdict under a policy generation that did not move meanwhile (a sweep
+///    lazily, by the revision check on its next visa request; every refresh must be
+///    persisted and the sweep must record every verdict under a policy generation that did not move meanwhile (a sweep
 ///    under a superseded generation applies no revocations, so a newer install's
 ///    pass has to decide);
 /// 3. every visa of an actor an obligation names that no longer exists is revoked:
@@ -206,7 +206,12 @@ async fn satisfy_obligations(asm: &Arc<Assembly>, pending: &[(u64, Obligation)])
     // ponytail: a full sweep of every live visa per pass; sweep only the visas
     // touching the obligations' actors if sweeps get costly.
     let failures = revalidate_visas(asm, &psnap).await;
-    if failures > 0 || asm.policy_mgr.get_current_snapshot().vinst() != psnap.vinst() {
+    // A refresh that failed left that actor's old claims in the store, and the sweep
+    // judged it on them: keep the work pending until the refresh lands.
+    if failures > 0
+        || !failed.is_empty()
+        || asm.policy_mgr.get_current_snapshot().vinst() != psnap.vinst()
+    {
         return unfinished;
     }
 
@@ -242,9 +247,14 @@ async fn revoke_visas_of_vanished_actors(
     }
     info!(target: EVENT, "reconcile: revoking the visas of vanished actors {vanished:?}");
     // A visa whose revoke cannot be recorded is quarantined in memory for retry
-    // ([crate::visa_mgr::VisaMgr::revoke_visa_ids]), as everywhere else.
+    // ([crate::visa_mgr::VisaMgr::revoke_visa_ids]), which a restart loses, and the
+    // sweep skips it (its actor is gone): keep the obligation until it is persisted.
     match asm.visa_mgr.remove_visas_for_actors(&vanished).await {
-        Ok(()) => true,
+        Ok(0) => true,
+        Ok(quarantined) => {
+            warn!(target: EVENT, "reconcile: {quarantined} revoke(s) of vanished actors' visas not persisted; kept pending");
+            false
+        }
         Err(e) => {
             warn!(target: EVENT, "reconcile: failed to revoke the visas of vanished actors: {e}");
             false
@@ -974,6 +984,79 @@ mod tests {
             "the vanished actor's visa must be revoked"
         );
         assert!(pending(&asm).await.is_empty());
+    }
+
+    /// zl-zipline#289 (VS#79 Copilot): a vanished actor's visa whose revoke write
+    /// fails is only quarantined in memory, which a restart loses; the sweep then
+    /// skips the visa (its actor is unresolved). So the pass keeps the obligation
+    /// until the revoke is persisted, and the next pass records it.
+    #[tokio::test]
+    async fn test_failed_revoke_of_a_vanished_actors_visa_keeps_the_obligation() {
+        use crate::connection_control::tests::{
+            create_zode_files_visa, zode_fixture_on, zode_login,
+        };
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let cn = "zode-289d.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let id = create_zode_files_visa(&asm, addr).await;
+        reconcile_obligations(&asm).await; // settle the fixture's own obligations
+
+        record_attribute_obligation(&asm, vec![addr]).await;
+        asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await.unwrap();
+        db.set_set_ex_fault(crate::db::FaultMode::Reject); // the revoke write fails
+        reconcile_obligations(&asm).await;
+        db.set_set_ex_fault(crate::db::FaultMode::None);
+        assert!(
+            !pending(&asm).await.is_empty(),
+            "an unpersisted revoke must leave the obligation pending"
+        );
+
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty(), "the retry completes it");
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&addr)
+                .await
+                .unwrap()
+                .contains(&id)
+        );
+    }
+
+    /// zl-zipline#289 (VS#79 Copilot): an actor whose refreshed attributes could
+    /// not be persisted keeps its old claims in the store, so the sweep judges it on
+    /// them and may allow a visa that the refresh would have revoked. The pass keeps
+    /// the obligation, so the refresh and sweep run again once the store recovers.
+    #[tokio::test]
+    async fn test_failed_refresh_keeps_the_obligation() {
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let (asm, node_a) = crate::test_helpers::build_sweep_asm_on(asm, false).await;
+        reconcile_obligations(&asm).await; // settle the setup's own obligations
+        create_sweep_visa(&asm, &node_a, 0).await;
+        let svc = register_ts(&asm, &[(TS_KEY, "engineering")]);
+        seed_source_attr(&asm, "fd5a:5052:4000::a", TS_KEY, "sales").await;
+        {
+            use crate::trusted_services::TrustedServiceInterface;
+            svc.flush().await.unwrap();
+        }
+        record_attribute_obligation(&asm, vec![]).await;
+
+        db.set_hset_fault(crate::db::FaultMode::Reject); // the refreshed actor's write fails
+        reconcile_obligations(&asm).await;
+        db.set_hset_fault(crate::db::FaultMode::None);
+        assert!(
+            !pending(&asm).await.is_empty(),
+            "a refresh that could not be persisted must leave the obligation pending"
+        );
+
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty(), "the retry completes it");
+        assert_eq!(
+            stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
+            Some("engineering".to_string())
+        );
     }
 
     /// zl-zipline#289: obligations are durable. A logout that recorded its

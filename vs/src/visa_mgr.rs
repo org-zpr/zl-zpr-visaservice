@@ -983,16 +983,17 @@ impl VisaMgr {
     /// already cleared by `remove_visas_for_node`) is dropped here instead of
     /// waiting for TTL.
     ///
+    /// Returns the number of visas whose revocation could not be persisted (quarantined
+    /// in memory only, see [VisaMgr::revoke_visa_ids]).
     pub async fn remove_visas_for_actors(
         &self,
         actor_addrs: &[IpAddr],
-    ) -> Result<(), ServiceError> {
+    ) -> Result<u32, ServiceError> {
         if actor_addrs.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let ids = self.get_visa_ids_for_actors(actor_addrs).await?;
-        self.revoke_visa_ids(&ids).await;
-        Ok(())
+        Ok(self.revoke_visa_ids(&ids).await)
     }
 
     /// Revoke each of `ids` everywhere: mark every node holding it `PendingRevoke`, so VSS
@@ -1001,7 +1002,12 @@ impl VisaMgr {
     /// A visa whose revocation write fails is quarantined ([VisaMgr::quarantine]): never
     /// handed out, and its revocation retried by housekeeping. The rest carry on. The visas
     /// themselves are never changed.
-    pub async fn revoke_visa_ids(&self, ids: &[u64]) {
+    ///
+    /// Returns the number of visas quarantined: a caller that must know the revocation
+    /// is durable (the reconciler, zl-zipline#289) treats any as a failure, because a
+    /// restart loses the in-memory quarantine.
+    pub async fn revoke_visa_ids(&self, ids: &[u64]) -> u32 {
+        let mut quarantined = 0u32;
         for &id in ids {
             // Log-and-continue: one failure must not strand the remaining visas.
             match self.repo.mark_visa_revoked(id).await {
@@ -1009,6 +1015,7 @@ impl VisaMgr {
                 Ok(false) => continue, // vanished/expired between query and mark
                 Err(e) => {
                     self.quarantine(id);
+                    quarantined += 1;
                     warn!(target: VISA, "failed to mark visa {id} revoked, quarantined for retry: {e}");
                     continue;
                 }
@@ -1020,6 +1027,7 @@ impl VisaMgr {
                 }
             }
         }
+        quarantined
     }
 
     /// Drop expired visas from the in-memory store. Called by housekeeping.
