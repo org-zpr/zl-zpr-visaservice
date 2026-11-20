@@ -102,7 +102,7 @@ pub async fn launch(asm: Arc<Assembly>, mut event_rx: mpsc::Receiver<VsEvent>) {
 /// Starts a pass on the ledger (waiting out every writer holding an obligation
 /// guard, so every listed obligation's write has landed), then satisfies the
 /// listed obligations with one sweep under the current state, and deletes them only
-/// if every step completed. Anything short of that leaves them all pending; the
+/// if every step completed. Anything short of that leaves the work pending; the
 /// auth-expiry sweeper's loop kicks the next pass. Runs on the event worker only,
 /// so passes never overlap.
 pub(crate) async fn reconcile_obligations(asm: &Arc<Assembly>) {
@@ -116,45 +116,81 @@ pub(crate) async fn reconcile_obligations(asm: &Arc<Assembly>) {
     if pending.is_empty() {
         return;
     }
-    if satisfy_obligations(asm, &pending).await {
-        let seqs: Vec<u64> = pending.iter().map(|(seq, _)| *seq).collect();
-        if let Err(e) = asm.revocations.complete(&seqs).await {
-            // Harmless: the next pass repeats the sweep and deletes them then.
-            error!(target: EVENT, "failed to delete satisfied revocation obligations: {e}");
+    let seqs: Vec<u64> = pending.iter().map(|(seq, _)| *seq).collect();
+    match satisfy_obligations(asm, &pending).await {
+        PassOutcome::Satisfied => {}
+        PassOutcome::SweepPending => {
+            // The policy step completed: running it again would re-push the policy
+            // and move the re-authentication deadline out on every retry. Leave
+            // only the sweep pending, as one attribute obligation naming every
+            // listed actor, recorded before the listed ones are deleted.
+            let actors: Vec<IpAddr> = pending
+                .iter()
+                .flat_map(|(_, ob)| ob.actors.iter().copied())
+                .collect();
+            if let Err(e) = asm
+                .revocations
+                .begin(ObligationKind::Attributes, actors)
+                .await
+            {
+                error!(target: EVENT, "failed to record the pending sweep: {e}; the policy step will run again");
+                return;
+            }
+            warn!(target: EVENT, "the visa sweep did not complete; left pending for the next sweeper tick");
         }
-    } else {
-        warn!(target: EVENT, "{} revocation obligation(s) left pending; the next sweeper tick retries", pending.len());
+        PassOutcome::Pending => {
+            warn!(target: EVENT, "{} revocation obligation(s) left pending; the next sweeper tick retries", pending.len());
+            return;
+        }
+    }
+    if let Err(e) = asm.revocations.complete(&seqs).await {
+        // Harmless: the next pass repeats the work and deletes them then.
+        error!(target: EVENT, "failed to delete revocation obligations: {e}");
     }
 }
 
-/// The work of one pass over `pending`, in order. Returns whether all of it
-/// completed:
+/// How far a pass got ([satisfy_obligations]).
+enum PassOutcome {
+    /// Everything completed: the listed obligations are satisfied.
+    Satisfied,
+    /// The policy step completed, a later step did not: only the sweep is left.
+    SweepPending,
+    /// Nothing that can be kept completed: all of it is left pending.
+    Pending,
+}
+
+/// The work of one pass over `pending`, in order:
 /// 1. if any obligation is a policy install, the policy pass ([policy_pass]) against
 ///    the current policy;
 /// 2. the attribute refresh of the actors behind live visas, then the sweep of every
 ///    live visa ([revalidate_visas]) -- an actor without a live visa is re-checked
 ///    lazily, by the revision check on its next visa request; the sweep must record
-///    every verdict under a policy
-///    generation that did not move meanwhile (a sweep under a superseded generation
-///    applies no revocations, so a newer install's pass has to decide);
+///    every verdict under a policy generation that did not move meanwhile (a sweep
+///    under a superseded generation applies no revocations, so a newer install's
+///    pass has to decide);
 /// 3. every visa of an actor an obligation names that no longer exists is revoked:
 ///    the sweep skips visas whose actor it cannot resolve, and an actor is gone when
 ///    a failed write cleaned it up or an undo removed it.
-async fn satisfy_obligations(asm: &Arc<Assembly>, pending: &[(u64, Obligation)]) -> bool {
-    if pending
+async fn satisfy_obligations(asm: &Arc<Assembly>, pending: &[(u64, Obligation)]) -> PassOutcome {
+    let policy_step = pending
         .iter()
-        .any(|(_, ob)| ob.kind == ObligationKind::Policy)
-    {
+        .any(|(_, ob)| ob.kind == ObligationKind::Policy);
+    if policy_step {
         match policy_pass(asm).await {
             Ok(true) => {}
             // A newer install committed during the refresh; its pass applies.
-            Ok(false) => return false,
+            Ok(false) => return PassOutcome::Pending,
             Err(e) => {
                 error!(target: EVENT, "policy pass failed: {e}");
-                return false;
+                return PassOutcome::Pending;
             }
         }
     }
+    let unfinished = if policy_step {
+        PassOutcome::SweepPending
+    } else {
+        PassOutcome::Pending
+    };
 
     // One snapshot for the refresh and the sweep. The refresh writes the actors'
     // attributes back before the sweep re-reads them; after a policy pass it costs
@@ -171,10 +207,14 @@ async fn satisfy_obligations(asm: &Arc<Assembly>, pending: &[(u64, Obligation)])
     // touching the obligations' actors if sweeps get costly.
     let failures = revalidate_visas(asm, &psnap).await;
     if failures > 0 || asm.policy_mgr.get_current_snapshot().vinst() != psnap.vinst() {
-        return false;
+        return unfinished;
     }
 
-    revoke_visas_of_vanished_actors(asm, pending).await
+    if revoke_visas_of_vanished_actors(asm, pending).await {
+        PassOutcome::Satisfied
+    } else {
+        unfinished
+    }
 }
 
 /// Step 3 of [satisfy_obligations]: revoke every visa of each actor named in
@@ -844,8 +884,11 @@ mod tests {
 
     /// zl-zipline#289, replacing p60's
     /// `test_policy_pass_failed_ungated_sweep_is_retried_off_the_worker`: a policy
-    /// install whose sweep could not record a revoke leaves its obligation pending;
-    /// the next pass revokes the visa issued on stale services and deletes it.
+    /// install whose sweep could not record a revoke leaves the sweep pending; the
+    /// next pass revokes the visa issued on stale services and completes it. The
+    /// policy step itself is not run again: its obligation is replaced by an
+    /// attribute obligation, so a failing sweep does not re-push the policy and
+    /// push the re-authentication deadline out on every retry.
     #[tokio::test]
     async fn test_policy_pass_failed_sweep_keeps_the_obligation() {
         let (asm, _event_rx, db) =
@@ -856,12 +899,13 @@ mod tests {
         db.set_set_ex_fault(crate::db::FaultMode::ApplyThenError);
         reconcile_obligations(&asm).await;
         db.set_set_ex_fault(crate::db::FaultMode::None);
+        let left = pending(&asm).await;
         assert!(
-            pending(&asm)
-                .await
-                .iter()
-                .any(|ob| ob.kind == crate::db::ObligationKind::Policy),
-            "the install's obligation must stay pending"
+            !left.is_empty()
+                && left
+                    .iter()
+                    .all(|ob| ob.kind == crate::db::ObligationKind::Attributes),
+            "only the sweep is left pending, not the policy step: {left:?}"
         );
 
         assert_pass_revokes(&asm, &node_a, &node_b, id).await;
