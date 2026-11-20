@@ -210,7 +210,8 @@ impl TopologyMgr {
     ///
     /// Returns the links that went from up to down, as `(reporter, peer)`, so the caller
     /// can revoke the visas that use them. A link coming up is not returned: it affects
-    /// new visas only (Zodes plan §5.8). Also returns the declared peers whose link the
+    /// new visas only (zl-zpr-dev-context docs/ROUTING.md, Design decisions, "Link down
+    /// revokes; link up does not"). Also returns the declared peers whose link the
     /// report newly lists `down` (zl-zipline#268), resolved by CN like `failed` entries.
     ///
     /// `session` is the VS-API session the report came from. A report from an older
