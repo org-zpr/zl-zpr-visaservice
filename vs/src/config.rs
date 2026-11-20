@@ -139,6 +139,16 @@ pub const MAX_VISA_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60); // 24
 /// one second the visa store's seconds-granularity TTL truncates to zero and drops it.
 pub const MIN_VISA_LIFETIME: Duration = Duration::from_secs(30);
 
+/// How long before a trusted-service attribute expires the visa-request path re-queries
+/// its source (zl-zipline#275). A visa cannot outlive the attributes it was granted on,
+/// and one that would live under [MIN_VISA_LIFETIME] is denied, so an attribute refreshed
+/// only once expired would deny every request in its last [MIN_VISA_LIFETIME]. Refreshing
+/// in the last 45 s instead leaves a visa issued then more than the floor: the extra 15 s
+/// cover the refresh itself and the request round trip.
+///
+/// Must stay under `trusted_services::MIN_ATTRIBUTE_TTL` (checked at compile time there).
+pub const ATTRIBUTE_REFRESH_AHEAD: Duration = Duration::from_secs(MIN_VISA_LIFETIME.as_secs() + 15);
+
 pub const DEFAULT_AUTH_EXPIRATION: Duration = Duration::from_secs(4 * 60 * 60); // 4 hours
 
 /// Expiration used on the visa service's own identity attributes. The VS must not expire its own

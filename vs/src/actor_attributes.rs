@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::time::SystemTime;
 
 use libeval::actor::Actor;
 use libeval::attribute::{Attribute, key};
@@ -18,6 +19,7 @@ use libeval::policy::Policy;
 use tracing::{debug, warn};
 
 use crate::assembly::Assembly;
+use crate::config::ATTRIBUTE_REFRESH_AHEAD;
 use crate::error::ServiceError;
 use crate::logging::targets::VREQ;
 use crate::trusted_services::{
@@ -63,9 +65,10 @@ impl RefreshOutcome {
     }
 }
 
-/// Refresh the actor's attributes (see [refresh_expired_attributes]), persist it to the
-/// store if anything changed, and only then record the source revisions. Used by the
-/// request path and by the attribute-change reconciliation in `event_mgr`.
+/// Refresh the actor's expired or about-to-expire attributes (see
+/// [refresh_expired_attributes]), persist it to the store if anything changed, and only
+/// then record the source revisions. Used by the request path and by the
+/// attribute-change reconciliation in `event_mgr`.
 ///
 /// Returns TRUE if the actor was changed and written back.
 ///
@@ -237,12 +240,22 @@ fn restamp_services(policy: &Policy, actor: &mut Actor) {
 }
 
 /// Refresh the actor's attributes from the trusted service manager where
-/// needed: any source with an expired attribute (TTL path), plus any source
-/// whose snapshot revision differs from the actor's recorded one (revision
-/// path, e.g. after an admin flush).
+/// needed: any source with an expired or about-to-expire attribute (TTL path),
+/// plus any source whose snapshot revision differs from the actor's recorded one
+/// (revision path, e.g. after an admin flush).
+///
+/// "About to expire" means within [ATTRIBUTE_REFRESH_AHEAD] of expiry
+/// (zl-zipline#275): refreshing only once expired would leave every visa granted
+/// on the attribute in its last [crate::config::MIN_VISA_LIFETIME] too short to
+/// issue. The early refresh applies only to sources that are configured trusted
+/// services: an internal (`zpr`) or no-longer-declared source has nobody to ask,
+/// and a lookup would only log a warning on every request in the window.
 ///
 /// A successful lookup is authoritative for that source: anything the service
-/// did not vend is dropped.
+/// did not vend is dropped (on the TTL path, once it is itself due for refresh).
+/// The actor counts as changed only if the lookup actually changed an attribute,
+/// so a service that re-vends what the actor already holds (an OIDC cache, a
+/// file snapshot not yet reloaded) causes no write.
 ///
 /// A failed TTL lookup changes nothing, so a service outage cannot strip
 /// attributes. The leftovers stay expired, and libeval already refuses to
@@ -276,9 +289,14 @@ async fn refresh_expired_attributes(
     // no policy-declared identity attribute); sources then match nothing.
     let identities = lookup_identities(lookup_keys, actor.attrs_iter());
 
+    // Sampled once so source selection and pruning agree on what is due.
+    let now = SystemTime::now();
     let mut sources = HashSet::new();
     for attr in actor.attrs_iter() {
-        if attr.is_expired() {
+        // Expired: re-query whatever the source (unchanged from before refresh-ahead).
+        // Merely near expiry: only a configured trusted service is worth asking.
+        if attr.is_expired() || (due_for_refresh(attr, now) && ts_mgr.has_source(attr.get_source()))
+        {
             sources.insert(attr.get_source().to_string());
         }
     }
@@ -344,10 +362,13 @@ async fn refresh_expired_attributes(
                     let returned: HashSet<String> =
                         ts_attrs.iter().map(|a| a.get_key().to_string()).collect();
                     for attr in ts_attrs {
+                        // Only a different attribute is a change: an identical re-vend
+                        // must not cost a write on every request (zl-zipline#275).
+                        let differs = actor.get_attribute(attr.get_key()) != Some(&attr);
                         if let Err(e) = actor.add_attribute(attr) {
                             warn!(target: VREQ, "failed to add attribute for actor {}: {}", zpr_addr, e);
                         } else {
-                            outcome.changed = true;
+                            outcome.changed |= differs;
                         }
                     }
                     if let Some(&(rev, generation)) = stale_rev {
@@ -360,9 +381,14 @@ async fn refresh_expired_attributes(
                         outcome.revisions.push((source.clone(), rev, generation));
                     } else {
                         // TTL refresh: whatever the service did not just set for this
-                        // source is gone; drop the leftovers rather than carry a
-                        // permanently expired copy.
-                        outcome.changed |= prune_from_source(actor, source, |a| a.is_expired());
+                        // source is gone; drop the leftovers that are due for refresh
+                        // rather than carry an expired or about-to-expire copy. What
+                        // the service did return is kept even with a short expiry,
+                        // unless it is already expired (as before refresh-ahead).
+                        outcome.changed |= prune_from_source(actor, source, |a| {
+                            a.is_expired()
+                                || (!returned.contains(a.get_key()) && due_for_refresh(a, now))
+                        });
                     }
                 }
                 Err(e) => {
@@ -387,6 +413,13 @@ async fn refresh_expired_attributes(
     outcome
 }
 
+/// Whether `attr` is expired or expires within [ATTRIBUTE_REFRESH_AHEAD] of `now`,
+/// i.e. whether a visa granted on it now could still reach
+/// [crate::config::MIN_VISA_LIFETIME] without a refresh first.
+fn due_for_refresh(attr: &Attribute, now: SystemTime) -> bool {
+    attr.get_expires() <= now + ATTRIBUTE_REFRESH_AHEAD
+}
+
 /// Removes every attribute on `actor` from `source` that matches `pred`.
 /// Returns TRUE if anything was removed.
 fn prune_from_source(actor: &mut Actor, source: &str, pred: impl Fn(&Attribute) -> bool) -> bool {
@@ -404,7 +437,7 @@ fn prune_from_source(actor: &mut Actor, source: &str, pred: impl Fn(&Attribute) 
 }
 
 /// Refresh (and persist) the attributes of each actor in `zpr_addrs`. Only sources that
-/// are TTL-expired or revision-stale are actually fetched.
+/// are TTL-due (expired or about to expire) or revision-stale are actually fetched.
 ///
 /// A failure is logged and skipped rather than aborting the pass: that actor's recorded
 /// revision stays mismatched, so its next visa request refreshes it again. This includes
