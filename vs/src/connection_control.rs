@@ -1645,10 +1645,6 @@ impl ConnectionControl {
             .actor_mgr
             .update_actor(&renewed, &asm.policy_service_names())
             .await;
-        if obligation.is_some() {
-            drop(obligation);
-            asm.event_mgr.kick_reconcile();
-        }
         if let Err(e) = written {
             // The write can fail after the attributes were committed (a later
             // metadata write failed). For a login or logout, do not drop the
@@ -1669,6 +1665,11 @@ impl ConnectionControl {
                 error!(target: CC, "rollback of {zpr_addr}'s failed login failed ({re}); disconnecting the node");
                 disconnect_node = true;
             }
+            // The rollback is a write too: release the obligation guard only now.
+            if obligation.is_some() {
+                drop(obligation);
+                asm.event_mgr.kick_reconcile();
+            }
             if user_change != UserNamespaceChange::Keep && logout_without_enrichment {
                 asm.ts_mgr.invalidate_actor_revisions(&zpr_addr);
             }
@@ -1684,6 +1685,10 @@ impl ConnectionControl {
                 error!(target: CC, "failed to disconnect {zpr_addr} after a failed login rollback: {de}");
             }
             return Err(e);
+        }
+        if obligation.is_some() {
+            drop(obligation);
+            asm.event_mgr.kick_reconcile();
         }
 
         // Test seam (zl-zipline#289): a gated test parks here, right after the
