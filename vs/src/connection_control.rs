@@ -1767,7 +1767,22 @@ impl ConnectionControl {
     /// reconcile (refresh, then sweep) rather than dropped: the actor is
     /// already persisted, and a visa whose revocation failed must not stay
     /// usable until it expires.
+    ///
+    /// The sweep runs on its own task, which the caller awaits. The callers are
+    /// RPC handlers (`authenticate`, `reauthorize`), and a cancelled RPC drops
+    /// its future: the actor is already persisted, so a sweep dropped half way
+    /// would leave visas live with nothing to redo it.
     pub(crate) async fn sweep_visas_after_attribute_change(asm: &Arc<Assembly>) {
+        let task = tokio::spawn(Self::sweep_until_complete(asm.clone()));
+        if let Err(e) = task.await {
+            error!(target: CC, "the visa sweep after an attribute change failed: {e}");
+        }
+    }
+
+    /// The body of [Self::sweep_visas_after_attribute_change]: the bounded
+    /// sweep retries, then the fallback reconcile.
+    async fn sweep_until_complete(asm: Arc<Assembly>) {
+        let asm = &asm;
         for _ in 0..config::NAMESPACE_SWEEP_ATTEMPTS {
             let sweep_snap = asm.policy_mgr.get_current_snapshot();
             let failures = revalidate_visas(asm, &sweep_snap, SweepReason::AttributeChange).await;

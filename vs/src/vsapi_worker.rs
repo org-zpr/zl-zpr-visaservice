@@ -5968,6 +5968,56 @@ mod tests {
             );
         }
 
+        /// Local review (Codex P1): the sweep survives the cancellation of the RPC that
+        /// awaits it. A cancelled `authenticate` drops its future; the sweep must still
+        /// finish, because the next authentication compares against the reduced actor
+        /// and sees no loss to re-check.
+        #[tokio::test]
+        async fn test_attribute_sweep_survives_cancellation() {
+            use crate::connection_control::tests::{
+                create_zode_files_visa, zode_fixture, zode_login,
+            };
+            let cn = "zode-265d.zpr";
+            let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+            zode_login(&asm, &cc, addr, &privkey, cn).await;
+            // Enough visas that the sweep exhausts tokio's cooperative budget and
+            // yields: with the in-memory store a short sweep finishes in one poll.
+            let mut ids = Vec::new();
+            for _ in 0..200 {
+                ids.push(create_zode_files_visa(&asm, addr).await);
+            }
+            ids.sort();
+            let fresh = reauthenticate_zode(&asm, &cc, &privkey, cn, addr).await;
+            let ops = asm.topo_mgr.ops().await;
+            add_node_serialized(&asm, &ops, &fresh, true, &mut false)
+                .await
+                .unwrap();
+            drop(ops);
+
+            // Poll the sweep once, then drop it, as a cancelled RPC does.
+            let _ = tokio::time::timeout(
+                Duration::ZERO,
+                ConnectionControl::sweep_visas_after_attribute_change(&asm),
+            )
+            .await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut revoked = Vec::new();
+            while revoked != ids && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                revoked = asm
+                    .visa_mgr
+                    .get_pending_revoke_visa_ids_for_node(&addr)
+                    .await
+                    .unwrap();
+                revoked.sort();
+            }
+            assert_eq!(
+                revoked.len(),
+                ids.len(),
+                "the cancelled sweep must still finish"
+            );
+        }
+
         /// zl-zipline#265: a Zode that never logged in authenticates again. The write
         /// drops nothing, so no sweep runs: a visa policy would now deny (it needs the
         /// login) is left alone.
