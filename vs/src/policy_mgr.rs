@@ -188,6 +188,9 @@ pub struct PolicyMgr {
     /// Assembly exists. An install commits under it, so the current policy cannot
     /// change while a topology operation that read it is still running.
     topology_lock: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>>,
+    /// The revocation ledger ([crate::revocation]), bound once the Assembly exists. An
+    /// install records a policy obligation before it commits (zl-zipline#289).
+    revocations: std::sync::OnceLock<Arc<crate::revocation::RevocationLedger>>,
     resolver: PolicyResolver,
     ts_mgr: Arc<TrustedServicesMgr>,
     /// Directory holding the `<service-id>.json` files for `api=file` trusted services.
@@ -647,6 +650,7 @@ impl PolicyMgr {
             update_lock: tokio::sync::Mutex::new(()),
             node_commit_lock: tokio::sync::Mutex::new(()),
             topology_lock: std::sync::OnceLock::new(),
+            revocations: std::sync::OnceLock::new(),
             resolver,
             ts_mgr,
             file_ts_dir,
@@ -717,13 +721,26 @@ impl PolicyMgr {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
-        self.repo.set_current_policy(&loaded, false).await?;
-
-        // Publish under the node commit lock too: an install never lands between a
+        // Commit under the node commit lock too: an install never lands between a
         // node commit's recheck and its write (#63 review, zl-zipline#247). Lock
         // order: update_lock -> topology lock -> node_commit_lock (see the
-        // `node_commit_lock` field).
+        // `node_commit_lock` field) -> the revocation guard.
         let _commit = self.node_commit_lock.lock().await;
+
+        // The new policy can make live visas unacceptable: record the policy
+        // obligation durably before anything is written, and hold its guard until
+        // the install is published, so the reconciler's pass for it reads the new
+        // policy (zl-zipline#289). A failed record fails the install (fail closed).
+        // The caller kicks the reconciler once this returns.
+        let _obligation = match self.revocations.get() {
+            Some(ledger) => Some(
+                ledger
+                    .begin(crate::db::ObligationKind::Policy, Vec::new())
+                    .await?,
+            ),
+            None => None,
+        };
+        self.repo.set_current_policy(&loaded, false).await?;
         self.publish(candidate.commit(Some(&previous), self.oidc_refresh));
         Ok(vinst)
     }
@@ -773,6 +790,13 @@ impl PolicyMgr {
     /// built; a second call is ignored.
     pub fn bind_topology_lock(&self, lock: Arc<tokio::sync::Mutex<()>>) {
         let _ = self.topology_lock.set(lock);
+    }
+
+    /// Bind the revocation ledger ([crate::revocation::RevocationLedger]); from then on
+    /// every install records a policy obligation before it commits. Called once, when
+    /// the Assembly is built; a second call is ignored.
+    pub fn bind_revocations(&self, ledger: Arc<crate::revocation::RevocationLedger>) {
+        let _ = self.revocations.set(ledger);
     }
 
     /// Callers should drop the policy as quickly as possible to avoid missing a policy update.

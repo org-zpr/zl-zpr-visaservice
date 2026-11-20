@@ -17,11 +17,12 @@ use libeval::eval::EvalContext;
 
 use crate::actor_attributes::{refresh_actors, restamp_node_services};
 use crate::assembly::Assembly;
+use crate::db::{Obligation, ObligationKind};
 use crate::error::ServiceError;
 use crate::logging::targets::EVENT;
 use crate::policy_mgr::PolicySnapshot;
 use crate::topology_mgr::TopoOps;
-use crate::visa_reconciler::{SweepReason, revalidate_visas};
+use crate::visa_reconciler::revalidate_visas;
 
 #[derive(Debug)]
 pub enum VsEvent {
@@ -32,15 +33,11 @@ pub enum VsEvent {
     /// EventManager takes care of state updates.
     ActorLeaves(IpAddr, DisconnectReason),
 
-    /// Indicates that policy has been successfully updated. Pass the new `vinst`.
-    PolicyUpdated(u64),
-
-    /// The attribute data behind a trusted service changed (an admin refreshed it).
-    /// Handler reconciles *all* stale or TTL-expired trusted attributes on the actors
-    /// behind live visas, then re-checks those visas. Deliberately not scoped to the
-    /// source that changed: `stale_sources_for_actor` already narrows the fetch to
-    /// sources whose revision actually moved, so a source id would buy nothing.
-    TrustedServiceChange,
+    /// Revocation obligations may be pending (zl-zipline#289): run one reconciler pass,
+    /// [reconcile_obligations]. Queued after every write that records an obligation, by
+    /// the auth-expiry sweeper's loop and at startup. It carries nothing: the pass reads
+    /// the obligations from the state DB, so a lost or duplicate kick is harmless.
+    Reconcile,
 }
 
 #[derive(Clone)]
@@ -58,6 +55,16 @@ impl EventMgr {
     #[cfg(test)]
     pub fn try_record_event_for_tests(&self, event: VsEvent) -> bool {
         self.event_queue.try_send(event).is_ok()
+    }
+
+    /// Ask the event worker for a reconciler pass ([VsEvent::Reconcile]) without
+    /// waiting: safe under any lock and from the event worker itself. A full queue
+    /// drops the kick, which is harmless -- the obligations stay in the state DB and
+    /// the auth-expiry sweeper's loop kicks again.
+    pub fn kick_reconcile(&self) {
+        if self.event_queue.try_send(VsEvent::Reconcile).is_err() {
+            debug!(target: EVENT, "event queue full; the next sweeper tick re-kicks the reconciler");
+        }
     }
 
     pub async fn record_event(&self, event: VsEvent) -> Result<(), ServiceError> {
@@ -84,17 +91,125 @@ pub async fn launch(asm: Arc<Assembly>, mut event_rx: mpsc::Receiver<VsEvent>) {
                     error!(target: EVENT, "failed to handle actor leave event: {}", e);
                 }
             }
-            VsEvent::PolicyUpdated(vinst) => {
-                if let Err(e) = handle_policy_updated(&asm, vinst).await {
-                    error!(target: EVENT, "failed to handle policy updated event: {}", e);
-                }
-            }
-            VsEvent::TrustedServiceChange => {
-                handle_trusted_service_change(&asm).await;
-            }
+            VsEvent::Reconcile => reconcile_obligations(&asm).await,
         }
     }
     info!(target: EVENT, "event manager shutting down");
+}
+
+/// One reconciler pass (zl-zipline#289; see [crate::revocation] for the invariant).
+///
+/// Starts a pass on the ledger (waiting out every writer holding an obligation
+/// guard, so every listed obligation's write has landed), then satisfies the
+/// listed obligations with one sweep under the current state, and deletes them only
+/// if every step completed. Anything short of that leaves them all pending; the
+/// auth-expiry sweeper's loop kicks the next pass. Runs on the event worker only,
+/// so passes never overlap.
+pub(crate) async fn reconcile_obligations(asm: &Arc<Assembly>) {
+    let pending = match asm.revocations.start_pass().await {
+        Ok(pending) => pending,
+        Err(e) => {
+            error!(target: EVENT, "failed to list revocation obligations: {e}");
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+    if satisfy_obligations(asm, &pending).await {
+        let seqs: Vec<u64> = pending.iter().map(|(seq, _)| *seq).collect();
+        if let Err(e) = asm.revocations.complete(&seqs).await {
+            // Harmless: the next pass repeats the sweep and deletes them then.
+            error!(target: EVENT, "failed to delete satisfied revocation obligations: {e}");
+        }
+    } else {
+        warn!(target: EVENT, "{} revocation obligation(s) left pending; the next sweeper tick retries", pending.len());
+    }
+}
+
+/// The work of one pass over `pending`, in order. Returns whether all of it
+/// completed:
+/// 1. if any obligation is a policy install, the policy pass ([policy_pass]) against
+///    the current policy;
+/// 2. the attribute refresh of the actors behind live visas, then the sweep of every
+///    live visa ([revalidate_visas]) -- an actor without a live visa is re-checked
+///    lazily, by the revision check on its next visa request; the sweep must record
+///    every verdict under a policy
+///    generation that did not move meanwhile (a sweep under a superseded generation
+///    applies no revocations, so a newer install's pass has to decide);
+/// 3. every visa of an actor an obligation names that no longer exists is revoked:
+///    the sweep skips visas whose actor it cannot resolve, and an actor is gone when
+///    a failed write cleaned it up or an undo removed it.
+async fn satisfy_obligations(asm: &Arc<Assembly>, pending: &[(u64, Obligation)]) -> bool {
+    if pending
+        .iter()
+        .any(|(_, ob)| ob.kind == ObligationKind::Policy)
+    {
+        match policy_pass(asm).await {
+            Ok(true) => {}
+            // A newer install committed during the refresh; its pass applies.
+            Ok(false) => return false,
+            Err(e) => {
+                error!(target: EVENT, "policy pass failed: {e}");
+                return false;
+            }
+        }
+    }
+
+    // One snapshot for the refresh and the sweep. The refresh writes the actors'
+    // attributes back before the sweep re-reads them; after a policy pass it costs
+    // nothing more (only stale actors are fetched).
+    let psnap = asm.policy_mgr.get_current_snapshot();
+    let (refreshed, unresolved, failed) =
+        refresh_actors(asm, live_visa_actor_addrs(asm).await).await;
+    info!(
+        target: EVENT,
+        "reconcile: actors refreshed={refreshed} unresolved={unresolved} failed={}",
+        failed.len()
+    );
+    // ponytail: a full sweep of every live visa per pass; sweep only the visas
+    // touching the obligations' actors if sweeps get costly.
+    let failures = revalidate_visas(asm, &psnap).await;
+    if failures > 0 || asm.policy_mgr.get_current_snapshot().vinst() != psnap.vinst() {
+        return false;
+    }
+
+    revoke_visas_of_vanished_actors(asm, pending).await
+}
+
+/// Step 3 of [satisfy_obligations]: revoke every visa of each actor named in
+/// `pending` that no longer exists. False if an actor lookup or the visa listing
+/// failed.
+async fn revoke_visas_of_vanished_actors(
+    asm: &Arc<Assembly>,
+    pending: &[(u64, Obligation)],
+) -> bool {
+    let mut vanished = Vec::new();
+    for addr in pending.iter().flat_map(|(_, ob)| ob.actors.iter()) {
+        match asm.actor_mgr.get_actor_by_zpr_addr(addr).await {
+            Ok(Some(_)) => {}
+            Ok(None) => vanished.push(*addr),
+            Err(e) => {
+                warn!(target: EVENT, "reconcile: failed to look up actor {addr}: {e}");
+                return false;
+            }
+        }
+    }
+    vanished.sort();
+    vanished.dedup();
+    if vanished.is_empty() {
+        return true;
+    }
+    info!(target: EVENT, "reconcile: revoking the visas of vanished actors {vanished:?}");
+    // A visa whose revoke cannot be recorded is quarantined in memory for retry
+    // ([crate::visa_mgr::VisaMgr::revoke_visa_ids]), as everywhere else.
+    match asm.visa_mgr.remove_visas_for_actors(&vanished).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(target: EVENT, "reconcile: failed to revoke the visas of vanished actors: {e}");
+            false
+        }
+    }
 }
 
 /// TODO: Does not do anything yet.
@@ -192,7 +307,12 @@ async fn push_policy_to_nodes(
     }
 }
 
-async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), ServiceError> {
+/// The policy step of a reconciler pass ([satisfy_obligations]): bring nodes,
+/// links, transit and the re-authentication obligation in line with the current
+/// policy. Returns `Ok(false)` when a newer policy was installed during the
+/// attribute refresh (nothing applied; that install's own obligation drives the
+/// next pass). The visa sweep is not part of it: the caller runs it next.
+async fn policy_pass(asm: &Arc<Assembly>) -> Result<bool, ServiceError> {
     /*
     When we get here we have already updated policy.
 
@@ -207,8 +327,8 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
 
     // Which nodes may pass traffic through comes from the current policy
     // (zl-zipline#255). Transit the policy takes away is withdrawn first, under its own
-    // short topology guard, before anything fallible or slow: an error below ends this
-    // event with no retry, the actor refresh can take long, and until this runs the
+    // short topology guard, before anything fallible or slow: an error below leaves
+    // the rest to the next pass, the actor refresh can take long, and until this runs the
     // router would keep routing through a node the policy no longer lets carry
     // traffic. Transit the policy grants waits for the link reconciliation in
     // `policy_pass_locked`. A newer policy's own pass applies its set again, so a
@@ -223,17 +343,7 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // everything from there on (node validity, links, re-auth obligation, visa sweep)
     // uses that one consistent view.
     let psnap = asm.policy_mgr.get_current_snapshot();
-
-    // PolicyUpdated(vinst) is a trigger, not a guarantee that this handler reconciles that
-    // exact revision. If updates queue faster than we process them we reconcile against the
-    // latest snapshot.
     let snapshot_vinst = psnap.vinst();
-    if snapshot_vinst != vinst {
-        info!(
-            target: EVENT,
-            "policy update event called with vinst={vinst}, using current snapshot vinst={snapshot_vinst}"
-        );
-    }
 
     // Reconcile attributes before anything reads them. Both consumers below --
     // node revalidation and the visa sweep -- evaluate actors exactly as stored, so
@@ -254,7 +364,7 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     let (refreshed, unresolved, unrefreshed) = refresh_actors(asm, refresh_set).await;
     info!(
         target: EVENT,
-        "policy updated vinst={vinst}: actors refreshed={refreshed} unresolved={unresolved} failed={}",
+        "policy pass vinst={snapshot_vinst}: actors refreshed={refreshed} unresolved={unresolved} failed={}",
         unrefreshed.len()
     );
 
@@ -293,7 +403,7 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         reconciled,
     } = locked?
     else {
-        return Ok(());
+        return Ok(false);
     };
     // The VSS workers of the nodes disconnected, or cut off, under the guard are
     // stopped now that it is released, before any reconciliation error is returned:
@@ -315,10 +425,10 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // Codex P1): the sweep discovers obligations only from the state DB, so
     // an unrecorded obligation means non-reauthenticating actors would never
     // be revoked for this generation. Propagating the error means the update
-    // is not reported as successfully enforced; the event worker logs it, and
-    // the next policy-updated event (or VS restart, which replays the current
-    // policy) retries the write against the same snapshot vinst. The nodes still
-    // get the new topology and services list, but no re-auth request.
+    // is not reported as successfully enforced: the revocation obligation stays
+    // pending, and the next reconciler pass (or a restart's) retries the write
+    // against the then-current snapshot. The nodes still get the new topology and
+    // services list, but no re-auth request.
     let deadline_secs = asm
         .config
         .core
@@ -337,30 +447,11 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     push_policy_to_nodes(asm, &psnap, &valid_node_addrs, recorded.is_ok()).await;
     recorded?;
 
-    // Re-check existing visas against the new policy. Runs last so route checks
-    // already reflect the updated topology. It does not wait for the pushes above.
-    revalidate_visas(asm, &psnap, SweepReason::PolicyUpdate).await;
-
-    // A visa requested between the install and this pass was judged on the services
-    // its endpoints stored under the previous policy, which the pass may since have
-    // recalculated (zl-zipline#273), but it carries the new generation, so the
-    // generation-gated sweep above skipped it. Re-check every visa without that gate,
-    // as an attribute change does. It runs on every install, not only when this pass
-    // changed a node's services: a pass that failed after recalculating them leaves
-    // nothing changed for its retry to notice.
-    //
-    // A request that read its actors before the recalculation and commits its visa
-    // after this sweep has listed the visas still escapes until the visa expires or a
-    // later sweep re-checks it: a grant is not yet checked atomically against
-    // concurrent revocation (zl-zipline#248).
-    //
-    // A sweep that leaves visas undecided queues an attribute-change reconcile.
-    //
-    // ponytail: a second full sweep on every install; re-check only the visas to and
-    // from nodes whose services changed if sweeps get costly.
-    attribute_sweep_with_retry(asm, &psnap).await;
-
-    Ok(())
+    // The visa sweep the caller runs next re-checks every live visa against this
+    // policy, including one requested between the install and this pass: it was
+    // judged on the services its endpoints stored under the previous policy, which
+    // this pass may since have recalculated (zl-zipline#273).
+    Ok(true)
 }
 
 /// What the guarded part of a policy pass ([policy_pass_locked]) did.
@@ -396,8 +487,8 @@ enum LockedPass {
 /// `refreshed_vinst` is the policy the caller refreshed actor attributes for. If a
 /// newer policy has been installed since, the actors are stale for it: judging nodes
 /// on them could disconnect one the new policy admits. Then this applies nothing and
-/// returns [LockedPass::Deferred]; the newer policy's own pass, queued behind this
-/// one (every install records a PolicyUpdated event after it commits), refreshes
+/// returns [LockedPass::Deferred]; the pass that follows for the newer install
+/// (it records a revocation obligation before it commits and kicks after), refreshes
 /// first and applies.
 async fn policy_pass_locked(
     asm: &Arc<Assembly>,
@@ -593,61 +684,6 @@ fn nodes_cut_off(
         .collect()
 }
 
-/// A trusted service's attribute data changed (eg, an admin refreshed it). The
-/// new data may invalidate visas that were issued under the old data, so
-/// reconcile in two phases: refresh and persist the actors behind live visas,
-/// then re-check those visas.
-///
-/// Phase order matters: the sweep re-reads actors from the store, so their
-/// attributes have to be reconciled and written back first.
-///
-/// Note this only reconciles actors that hold a live visa. Everyone else is
-/// handled lazily on their next visa request by the revision check in
-/// `refresh_expired_attributes`.
-async fn handle_trusted_service_change(asm: &Arc<Assembly>) {
-    // One snapshot for the whole pass, same as the policy handler.
-    let psnap = asm.policy_mgr.get_current_snapshot();
-
-    let (refreshed, unresolved, failed) =
-        refresh_actors(asm, live_visa_actor_addrs(asm).await).await;
-    info!(
-        target: EVENT,
-        "trusted service changed: actors refreshed={refreshed} unresolved={unresolved} failed={}",
-        failed.len()
-    );
-
-    attribute_sweep_with_retry(asm, &psnap).await;
-}
-
-/// Re-check every live visa against `psnap` without the generation gate
-/// ([SweepReason::AttributeChange]), from the event worker.
-///
-/// A verdict that could not be recorded must not be dropped -- after a Zode logout
-/// it is a visa that should be revoked (#63 review). If any was, the whole
-/// attribute-change reconcile is queued again after `RECONCILE_RETRY`, and repeats
-/// while the sweep fails. The re-queue runs on its own task: this runs on the event
-/// worker, which must never wait on its own bounded queue (a full queue would
-/// deadlock it).
-async fn attribute_sweep_with_retry(asm: &Arc<Assembly>, psnap: &PolicySnapshot) {
-    let failures = revalidate_visas(asm, psnap, SweepReason::AttributeChange).await;
-    if failures > 0 {
-        // ponytail: fixed interval; add backoff if long store outages make the
-        // retries noisy.
-        warn!(target: EVENT, "attribute-change sweep left {failures} visa(s) undecided; retrying in {:?}", crate::config::RECONCILE_RETRY);
-        let asm = asm.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(crate::config::RECONCILE_RETRY).await;
-            if let Err(e) = asm
-                .event_mgr
-                .record_event(VsEvent::TrustedServiceChange)
-                .await
-            {
-                error!(target: EVENT, "failed to re-queue the attribute-change reconcile: {e}");
-            }
-        });
-    }
-}
-
 /// The distinct actor addresses referenced by a live visa (both ends of every visa's
 /// five-tuple). The reconcile set for a sweep that only re-checks visas.
 async fn live_visa_actor_addrs(asm: &Arc<Assembly>) -> HashSet<IpAddr> {
@@ -668,7 +704,7 @@ async fn live_visa_actor_addrs(asm: &Arc<Assembly>) -> HashSet<IpAddr> {
 /// nodes' attributes first; the evaluation below reads the actors as stored.
 ///
 /// This is the attribute-side check only. The authentication side is handled by
-/// the policy-install re-auth obligation (zipline#123): `handle_policy_updated`
+/// the policy-install re-auth obligation (zipline#123): `policy_pass`
 /// records `(V, T)` and fans out `requestAuthentication`, and `auth_sweep`
 /// revokes whoever has not re-authenticated under the new generation by `T`.
 async fn revalidate_nodes(
@@ -737,63 +773,200 @@ mod tests {
     use zpr::policy_types::{JoinPolicy, PFlags, Scope, Service, ServiceType};
     use zpr::write_to::WriteTo;
 
-    /// #63 review (Copilot): a reconcile whose sweep could not record every
-    /// verdict re-queues itself after `RECONCILE_RETRY` instead of dropping
-    /// the work.
-    #[tokio::test(start_paused = true)]
-    async fn test_failed_reconcile_sweep_is_retried() {
-        let (asm, mut event_rx, db) =
-            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
-        let (asm, node_a) = crate::test_helpers::build_sweep_asm_on(asm, false).await;
-        create_sweep_visa(&asm, &node_a, 0).await; // the empty policy denies it
-        while event_rx.try_recv().is_ok() {}
-        db.set_set_ex_fault(crate::db::FaultMode::ApplyThenError);
-
-        handle_trusted_service_change(&asm).await;
-        assert!(
-            event_rx.try_recv().is_err(),
-            "the retry waits RECONCILE_RETRY"
-        );
-        // Let the spawned retry task start its sleep before the clock moves.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(crate::config::RECONCILE_RETRY + Duration::from_secs(1)).await;
-        let evt = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+    /// The pending obligations, read without starting a pass.
+    async fn pending(asm: &Assembly) -> Vec<crate::db::Obligation> {
+        crate::db::RevocationRepo::new(asm.state_db.clone())
+            .list()
             .await
-            .expect("the retry must be queued")
-            .unwrap();
-        assert!(matches!(evt, VsEvent::TrustedServiceChange));
+            .unwrap()
+            .into_iter()
+            .map(|(_, ob)| ob)
+            .collect()
     }
 
-    /// Copilot on zl-zpr-visaservice#76: the policy pass runs on the event worker, so
-    /// a failed ungated sweep must re-queue its reconcile from a spawned task after
-    /// `RECONCILE_RETRY`, never by awaiting the worker's own bounded queue inline (a
-    /// full queue would deadlock the worker).
-    #[tokio::test(start_paused = true)]
-    async fn test_policy_pass_failed_ungated_sweep_is_retried_off_the_worker() {
-        let (asm, mut event_rx, db) =
-            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
-        // Only the ungated sweep sees this visa: it carries the new generation.
-        let (asm, _node_a, _node_b, _id) = issue_visa_on_stale_services_on(asm).await;
-        while event_rx.try_recv().is_ok() {}
-        db.set_set_ex_fault(crate::db::FaultMode::ApplyThenError);
-
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(&asm, vinst).await.unwrap();
-        assert!(
-            event_rx.try_recv().is_err(),
-            "the retry waits RECONCILE_RETRY, off the event worker"
-        );
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(crate::config::RECONCILE_RETRY + Duration::from_secs(1)).await;
-        let evt = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+    /// What a trusted-service change sets off: an attribute obligation, then a pass.
+    /// The obligations the test's setup left (its policy installs) are dropped first,
+    /// so the pass runs the attribute step only.
+    async fn attribute_pass(asm: &Arc<Assembly>) {
+        let setup: Vec<u64> = asm
+            .revocations
+            .start_pass()
             .await
-            .expect("the retry must be queued")
+            .unwrap()
+            .iter()
+            .map(|(seq, _)| *seq)
+            .collect();
+        asm.revocations.complete(&setup).await.unwrap();
+        record_attribute_obligation(asm, vec![]).await;
+        reconcile_obligations(asm).await;
+    }
+
+    /// Record an attribute obligation for `actors`, as a writer does before its write.
+    async fn record_attribute_obligation(asm: &Assembly, actors: Vec<IpAddr>) {
+        drop(
+            asm.revocations
+                .begin(crate::db::ObligationKind::Attributes, actors)
+                .await
+                .unwrap(),
+        );
+    }
+
+    /// zl-zipline#289, replacing p61's `test_failed_reconcile_sweep_is_retried`
+    /// (#63 review, Copilot): a pass whose sweep could not record every verdict
+    /// leaves the obligation pending, and the next pass completes it -- no
+    /// in-memory retry task, nothing to lose on a restart.
+    #[tokio::test]
+    async fn test_failed_sweep_keeps_the_obligation() {
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let (asm, node_a) = crate::test_helpers::build_sweep_asm_on(asm, false).await;
+        let id = create_sweep_visa(&asm, &node_a, 0).await; // the empty policy denies it
+        record_attribute_obligation(&asm, vec![]).await;
+
+        db.set_set_ex_fault(crate::db::FaultMode::Reject);
+        reconcile_obligations(&asm).await;
+        db.set_set_ex_fault(crate::db::FaultMode::None);
+        assert!(
+            !pending(&asm).await.is_empty(),
+            "a sweep that failed must leave its obligation pending"
+        );
+
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty(), "the retry completes it");
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap()
+                .contains(&id)
+        );
+    }
+
+    /// zl-zipline#289, replacing p60's
+    /// `test_policy_pass_failed_ungated_sweep_is_retried_off_the_worker`: a policy
+    /// install whose sweep could not record a revoke leaves its obligation pending;
+    /// the next pass revokes the visa issued on stale services and deletes it.
+    #[tokio::test]
+    async fn test_policy_pass_failed_sweep_keeps_the_obligation() {
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let (asm, node_a, node_b, id) = issue_visa_on_stale_services_on(asm).await;
+
+        // ApplyThenError: the visa write errors, link writes are unaffected.
+        db.set_set_ex_fault(crate::db::FaultMode::ApplyThenError);
+        reconcile_obligations(&asm).await;
+        db.set_set_ex_fault(crate::db::FaultMode::None);
+        assert!(
+            pending(&asm)
+                .await
+                .iter()
+                .any(|ob| ob.kind == crate::db::ObligationKind::Policy),
+            "the install's obligation must stay pending"
+        );
+
+        assert_pass_revokes(&asm, &node_a, &node_b, id).await;
+    }
+
+    /// zl-zipline#289: a policy pass that fails before its sweep (here the
+    /// re-authentication obligation write) is not lost: the obligation stays
+    /// pending, and once the store recovers the next pass runs the policy step again.
+    #[tokio::test]
+    async fn test_failed_policy_pass_keeps_the_obligation() {
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let asm = Arc::new(asm);
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
             .unwrap();
-        assert!(matches!(evt, VsEvent::TrustedServiceChange));
+
+        // The re-authentication obligation write fails (hset); the revocation
+        // obligation itself is already recorded.
+        db.set_hset_fault(crate::db::FaultMode::Reject);
+        reconcile_obligations(&asm).await;
+        db.set_hset_fault(crate::db::FaultMode::None);
+        assert!(
+            !pending(&asm).await.is_empty(),
+            "a failed policy pass must leave the obligation pending"
+        );
+
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty());
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        assert!(
+            crate::db::ReauthRepo::new(asm.state_db.clone())
+                .list_obligations()
+                .await
+                .unwrap()
+                .iter()
+                .any(|ob| ob.vinst == vinst),
+            "the retried policy pass records the re-authentication obligation"
+        );
+    }
+
+    /// zl-zipline#289 (VS#77 declined P2): an obligation names an actor that no
+    /// longer exists -- a failed Reset whose replacing add cleaned the old actor
+    /// up, or an undo -- so the sweep cannot judge its visas (it skips unresolved
+    /// actors). The reconciler revokes every visa of that actor instead.
+    #[tokio::test]
+    async fn test_visas_of_a_vanished_actor_are_revoked() {
+        use crate::connection_control::tests::{create_zode_files_visa, zode_fixture, zode_login};
+        let cn = "zode-289a.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let id = create_zode_files_visa(&asm, addr).await;
+        reconcile_obligations(&asm).await; // settle the fixture's own obligations
+
+        record_attribute_obligation(&asm, vec![addr]).await;
+        asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await.unwrap();
+        reconcile_obligations(&asm).await;
+
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&addr)
+                .await
+                .unwrap(),
+            vec![id],
+            "the vanished actor's visa must be revoked"
+        );
+        assert!(pending(&asm).await.is_empty());
+    }
+
+    /// zl-zipline#289: obligations are durable. A logout that recorded its
+    /// obligation and wrote, then the visa service stopped before any pass: a new
+    /// assembly over the same state DB (a restart) reconciles it.
+    #[tokio::test]
+    async fn test_restart_reconciles_a_pending_obligation() {
+        use crate::connection_control::tests::{
+            create_zode_files_visa, zode_fixture_on, zode_login, zode_logout,
+        };
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let cn = "zode-289b.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let id = create_zode_files_visa(&asm, addr).await;
+        reconcile_obligations(&asm).await;
+        zode_logout(&asm, &cc, addr, &privkey, cn).await;
+        drop(asm); // the "crash": no pass ran after the logout
+
+        let (restarted, _event_rx) = crate::assembly::tests::new_assembly_on_db(db).await;
+        let restarted = Arc::new(restarted);
+        assert!(
+            !pending(&restarted).await.is_empty(),
+            "the obligation survived"
+        );
+        reconcile_obligations(&restarted).await;
+        assert!(pending(&restarted).await.is_empty());
+        assert!(
+            restarted
+                .visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&addr)
+                .await
+                .unwrap()
+                .contains(&id),
+            "the restarted visa service must revoke the visa"
+        );
     }
 
     /// Build a policy container whose single join policy marks connections as
@@ -999,7 +1172,7 @@ mod tests {
             svc.flush().await.unwrap();
         }
 
-        handle_trusted_service_change(&asm).await;
+        attribute_pass(&asm).await;
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
@@ -1024,7 +1197,7 @@ mod tests {
         seed_source_attr(&asm, "fd5a:5052:4000::a", TS_KEY, "sales").await;
 
         svc.fail.store(true, std::sync::atomic::Ordering::SeqCst);
-        handle_trusted_service_change(&asm).await;
+        attribute_pass(&asm).await;
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
@@ -1043,14 +1216,13 @@ mod tests {
             .update_policy_from_container_bytes(make_node_join_policy(None))
             .await
             .unwrap();
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
 
         tokio::task::LocalSet::new()
             .run_until(async {
                 let held = asm.topo_mgr.ops().await;
                 let update = tokio::task::spawn_local({
                     let asm = asm.clone();
-                    async move { handle_policy_updated(&asm, vinst).await }
+                    async move { policy_pass(&asm).await }
                 });
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 assert!(!update.is_finished(), "policy pass must wait for the lock");
@@ -1157,14 +1329,13 @@ mod tests {
             .await
             .unwrap();
         asm.topo_mgr.add_node(a).unwrap();
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
 
         tokio::task::LocalSet::new()
             .run_until(async {
                 let held = asm.topo_mgr.ops().await;
                 let pass = tokio::task::spawn_local({
                     let asm = asm.clone();
-                    async move { handle_policy_updated(&asm, vinst).await }
+                    async move { policy_pass(&asm).await }
                 });
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 // A disconnects while the pass waits: the same steps as
@@ -1216,7 +1387,7 @@ mod tests {
     }
 
     /// Run the guarded part of a policy pass under the current policy, as
-    /// `handle_policy_updated` does once its attribute refresh is done, and return
+    /// `policy_pass` does once its attribute refresh is done, and return
     /// the nodes it judged valid. Panics if the pass deferred.
     async fn run_locked_pass(asm: &Arc<Assembly>) -> Vec<IpAddr> {
         let vinst = asm.policy_mgr.get_current_snapshot().vinst();
@@ -1328,8 +1499,7 @@ mod tests {
         let ts = register_ts(&asm, &[]);
         ts.fail.store(true, std::sync::atomic::Ordering::SeqCst);
 
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(&asm, vinst).await.unwrap();
+        policy_pass(&asm).await.unwrap();
 
         assert_eq!(
             stored_services(&asm, &a).await,
@@ -1413,8 +1583,7 @@ mod tests {
             .update_policy_from_container_bytes(make_node_join_policy(None))
             .await
             .unwrap();
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(&asm, vinst).await.unwrap();
+        reconcile_obligations(&asm).await;
 
         assert!(
             asm.actor_mgr
@@ -1511,8 +1680,11 @@ mod tests {
     /// Run the policy pass for the current policy and assert that it kept the A--B
     /// link and that the visa `id` held by `node_a` is revoked.
     async fn assert_pass_revokes(asm: &Arc<Assembly>, node_a: &IpAddr, node_b: &IpAddr, id: u64) {
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(asm, vinst).await.unwrap();
+        reconcile_obligations(asm).await;
+        assert!(
+            pending(asm).await.is_empty(),
+            "the pass completes the obligation"
+        );
         assert!(
             asm.topo_mgr.link_up(node_a, node_b),
             "the A--B link stays up"
@@ -1562,8 +1734,7 @@ mod tests {
             .update_policy_from_container_bytes(transit_policy(&[c]))
             .await
             .unwrap();
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(&asm, vinst).await.unwrap();
+        policy_pass(&asm).await.unwrap();
         // Under R14 the links are up once both ends report them.
         report_transit_asm_links(&asm, true);
         let via_c = asm
@@ -1581,7 +1752,7 @@ mod tests {
             .unwrap();
         let vinst = asm.policy_mgr.get_current_snapshot().vinst();
         let id = create_sweep_visa_on_route(&asm, &a, vinst, &via_c).await;
-        handle_policy_updated(&asm, vinst).await.unwrap();
+        policy_pass(&asm).await.unwrap();
 
         assert!(
             asm.topo_mgr
@@ -1660,9 +1831,8 @@ mod tests {
             .update_policy_from_container_bytes(transit_policy(&[]))
             .await
             .unwrap();
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
         db.set_scan_fault(crate::db::FaultMode::Reject);
-        assert!(handle_policy_updated(&asm, vinst).await.is_err());
+        assert!(policy_pass(&asm).await.is_err());
         db.set_scan_fault(crate::db::FaultMode::None);
 
         assert!(
@@ -1736,8 +1906,7 @@ mod tests {
             .update_policy_from_container_bytes(transit_policy(&[c]))
             .await
             .unwrap();
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(&asm, vinst).await.unwrap();
+        policy_pass(&asm).await.unwrap();
         assert!(asm.topo_mgr.get_best_route(&a, &b).is_some());
     }
 
@@ -1759,8 +1928,7 @@ mod tests {
         // What the actor holds from the previous store's data.
         seed_source_attr(&asm, "fd5a:5052:4000::a", TS_KEY, "sales").await;
 
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(&asm, vinst).await.unwrap();
+        policy_pass(&asm).await.unwrap();
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
@@ -1783,8 +1951,7 @@ mod tests {
         // No visa anywhere, so the node is in scope only via the node-address list.
         seed_source_attr(&asm, "fd5a:5052:3000::1", TS_KEY, "sales").await;
 
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(&asm, vinst).await.unwrap();
+        policy_pass(&asm).await.unwrap();
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:3000::1", TS_KEY).await,
@@ -1824,7 +1991,7 @@ mod tests {
         // every connected actor carrying a listed identity pair.
         asm.ts_mgr.forget_source_revision(&listed, TS_SOURCE);
 
-        handle_trusted_service_change(&asm).await;
+        attribute_pass(&asm).await;
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
@@ -1847,7 +2014,7 @@ mod tests {
         seed_source_attr(&asm, "fd5a:5052:4000::a", TS_KEY, "sales").await;
 
         // No visa created, so no actor is in scope for the refresh.
-        handle_trusted_service_change(&asm).await;
+        attribute_pass(&asm).await;
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
@@ -1937,7 +2104,7 @@ mod tests {
         create_routed_sweep_visa(&asm, &node_a, 0).await;
 
         change_host_attrs(&svc, &[(HOST_KEY, HOST_VALUE)]).await;
-        handle_trusted_service_change(&asm).await;
+        attribute_pass(&asm).await;
 
         assert!(stored_provides(&asm, HOST_ADDR, HOSTED_SVC).await);
         assert!(
@@ -1959,7 +2126,7 @@ mod tests {
         let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
 
         change_host_attrs(&svc, &[]).await;
-        handle_trusted_service_change(&asm).await;
+        attribute_pass(&asm).await;
 
         assert!(
             !stored_provides(&asm, HOST_ADDR, HOSTED_SVC).await,
@@ -2072,8 +2239,7 @@ mod tests {
             .update_policy_from_container_bytes(make_node_join_policy(Some(vec![svc("svc-x")])))
             .await
             .unwrap();
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(&asm, vinst).await.unwrap();
+        policy_pass(&asm).await.unwrap();
 
         assert_eq!(
             repo.get_zpr_addr_for_hostname("svc-x").await.unwrap(),
@@ -2114,7 +2280,7 @@ mod tests {
                 .await
                 .unwrap();
             let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-            tokio::time::timeout(Duration::from_secs(5), handle_policy_updated(&asm, vinst))
+            tokio::time::timeout(Duration::from_secs(5), policy_pass(&asm))
                 .await
                 .expect("the policy pass must not wait on a node's VSS")
                 .unwrap();
@@ -2186,8 +2352,7 @@ mod tests {
         let (zode_tx, mut zode_rx) = mpsc::channel::<crate::vss::VssCmd>(16);
         asm.vss_mgr.insert_test_handle(zode, zode_tx);
 
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        tokio::time::timeout(Duration::from_secs(5), handle_policy_updated(&asm, vinst))
+        tokio::time::timeout(Duration::from_secs(5), policy_pass(&asm))
             .await
             .expect("the policy pass must not wait on a node's VSS")
             .unwrap();
@@ -2327,8 +2492,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(&asm, vinst).await.unwrap();
+        policy_pass(&asm).await.unwrap();
 
         assert!(
             matches!(
@@ -2352,8 +2516,7 @@ mod tests {
             .update_policy_from_container_bytes(relay_zb_zc_policy(nodes, &links, &[]))
             .await
             .unwrap();
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(&asm, vinst).await.unwrap();
+        policy_pass(&asm).await.unwrap();
 
         assert!(
             matches!(
@@ -2385,8 +2548,7 @@ mod tests {
         // No nodes connected: everything before the obligation write is a
         // no-op, so the injected hset fault hits exactly the obligation add.
         db.set_hset_fault(FaultMode::Reject);
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        let result = handle_policy_updated(&asm, vinst).await;
+        let result = policy_pass(&asm).await;
         db.set_hset_fault(FaultMode::None);
 
         assert!(

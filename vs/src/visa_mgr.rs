@@ -54,7 +54,7 @@ enum VCtx {
 /// Outcome of re-checking an existing visa against a newer policy snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisaRecheck {
-    /// An actor could not be resolved; skip without bumping `checked_vinst`.
+    /// An actor could not be resolved; skip the visa.
     SkipUnresolvedActor,
     /// Still allowed and the selected route is unchanged.
     AllowSameRoute,
@@ -793,27 +793,8 @@ impl VisaMgr {
         self.repo.list_visa_metadata().await
     }
 
-    /// Apply an allow verdict to a visa at policy generation `vinst`. See [db::VisaRepo::record_allow_verdict].
-    pub async fn record_allow_verdict(
-        &self,
-        visa_id: u64,
-        vinst: u64,
-    ) -> Result<bool, ServiceError> {
-        Ok(self.repo.record_allow_verdict(visa_id, vinst).await?)
-    }
-
-    /// Apply a deny verdict to a visa at policy generation `vinst`. See [db::VisaRepo::record_deny_verdict].
-    pub async fn record_deny_verdict(
-        &self,
-        visa_id: u64,
-        vinst: u64,
-    ) -> Result<bool, ServiceError> {
-        Ok(self.repo.record_deny_verdict(visa_id, vinst).await?)
-    }
-
-    /// Mark every node of a visa `PendingRevoke` with no policy-generation gate. Used by
-    /// the attribute-change sweep, where the policy `vinst` has not moved and so the
-    /// verdict recorders would no-op. See [db::VisaRepo::mark_visa_revoked].
+    /// Mark every node of a visa `PendingRevoke`. Used by the visa sweep. See
+    /// [db::VisaRepo::mark_visa_revoked].
     pub async fn mark_visa_revoked(&self, visa_id: u64) -> Result<bool, ServiceError> {
         Ok(self.repo.mark_visa_revoked(visa_id).await?)
     }
@@ -1912,7 +1893,7 @@ mod tests {
         let mgr = make_mgr().await;
         let node: IpAddr = NODE_ADDR.parse().unwrap();
         store_node_visa(&mgr, 800, node, db::NodeVisaState::PendingInstall).await;
-        assert!(mgr.repo.record_deny_verdict(800, 1).await.unwrap());
+        assert!(mgr.repo.mark_visa_revoked(800).await.unwrap());
 
         mgr.visa_installed(800, &node).await.unwrap();
 
@@ -1929,7 +1910,7 @@ mod tests {
         let mgr = make_mgr().await;
         let node: IpAddr = NODE_ADDR.parse().unwrap();
         store_node_visa(&mgr, 810, node, db::NodeVisaState::Installed).await;
-        assert!(mgr.repo.record_deny_verdict(810, 1).await.unwrap());
+        assert!(mgr.repo.mark_visa_revoked(810).await.unwrap());
 
         mgr.revoke_acked(node, 810).await;
 
@@ -1937,8 +1918,8 @@ mod tests {
         assert!(mgr.repo.get_visa_by_id(810).is_err());
     }
 
-    /// revoke_acked misses when the node is not PendingRevoke (an allow verdict
-    /// canceled the revoke mid-RPC): the record survives.
+    /// revoke_acked misses when the node is not PendingRevoke: the record
+    /// survives.
     #[tokio::test]
     async fn test_revoke_acked_leaves_record_when_not_pending_revoke() {
         let mgr = make_mgr().await;

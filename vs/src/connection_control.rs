@@ -38,6 +38,7 @@ use zpr::vsapi_types::{
 use crate::assembly::Assembly;
 use crate::auth;
 use crate::config;
+use crate::db::ObligationKind;
 use crate::error::ServiceError;
 use crate::logging::targets::CC;
 use crate::login_nonce::LoginNonceStore;
@@ -46,7 +47,6 @@ use crate::oidc::{NonceExpectation, OidcError, OidcTrustedService, validate_id_t
 use crate::policy_mgr::PolicySnapshot;
 use crate::topology_mgr::TopoOps;
 use crate::trusted_services::{TrustedServicesMgr, derive_user_authority, lookup_identities};
-use crate::visa_reconciler::{SweepReason, revalidate_visas};
 use crate::vss_mgr::VssHandle;
 
 // TODO: move to libeval
@@ -1621,11 +1621,35 @@ impl ConnectionControl {
         let needs_visa_sweep =
             user_change != UserNamespaceChange::Keep || attributes_dropped(&actor, &renewed);
 
-        if let Err(e) = asm
+        // Visas follow the namespace change (g27 q4): a logout must revoke visas
+        // that needed user attributes, and a login can invalidate visas through a
+        // `never allow` on a user attribute. So does a renewal that keeps the login
+        // but lost an attribute value, such as a claim missing from the renewed
+        // token (zl-zipline#265). Record the revocation obligation durably before
+        // the write, holding its guard across the write only (under the node commit
+        // lock, so the guard is innermost), then kick the reconciler, which re-checks
+        // every live visa against the stored actors (zl-zipline#289). Nothing else
+        // in this handler revokes: a cancelled RPC, a failed sweep or a crash leaves
+        // the obligation pending until a pass completes it. A failed record fails
+        // the renewal before anything is written.
+        let obligation = if needs_visa_sweep {
+            Some(
+                asm.revocations
+                    .begin(ObligationKind::Attributes, vec![zpr_addr])
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let written = asm
             .actor_mgr
             .update_actor(&renewed, &asm.policy_service_names())
-            .await
-        {
+            .await;
+        if obligation.is_some() {
+            drop(obligation);
+            asm.event_mgr.kick_reconcile();
+        }
+        if let Err(e) = written {
             // The write can fail after the attributes were committed (a later
             // metadata write failed). For a login or logout, do not drop the
             // follow-up with the error (#63 review):
@@ -1634,9 +1658,7 @@ impl ConnectionControl {
             //   fails too, the node is disconnected (fail closed) and must
             //   re-authenticate;
             // - the revisions a reduced logout dropped are invalidated;
-            // - the node commit lock is released BEFORE awaiting the bounded
-            //   event queue -- its worker may need that lock -- and the visa
-            //   reconciliation is handed to the event manager.
+            // - the visa re-check is the obligation recorded above.
             let mut disconnect_node = false;
             if user_change == UserNamespaceChange::Gain
                 && let Err(re) = asm
@@ -1661,18 +1683,13 @@ impl ConnectionControl {
             {
                 error!(target: CC, "failed to disconnect {zpr_addr} after a failed login rollback: {de}");
             }
-            if needs_visa_sweep {
-                warn!(target: CC, "write of {zpr_addr}'s attribute change failed ({e}); queueing an attribute-change reconcile");
-                if let Err(qe) = asm
-                    .event_mgr
-                    .record_event(crate::event_mgr::VsEvent::TrustedServiceChange)
-                    .await
-                {
-                    error!(target: CC, "failed to queue the reconcile after a failed write for {zpr_addr}: {qe}");
-                }
-            }
             return Err(e);
         }
+
+        // Test seam (zl-zipline#289): a gated test parks here, right after the
+        // write, and cancels the RPC. Compiled out of release.
+        #[cfg(test)]
+        crate::visareq_worker::race_gate::pause_if_gated(&zpr_addr).await;
 
         // PR #42 review (P1): re-check the denylist now that the renewal is
         // persisted. A revocation landing between the pre-check above and
@@ -1729,76 +1746,8 @@ impl ConnectionControl {
             }
         }
 
-        // Visas follow the namespace change (g27 q4): a logout must revoke
-        // visas that needed user attributes, and a login can invalidate visas
-        // through a `never allow` on a user attribute. So does a renewal that
-        // keeps the login but lost an attribute value, such as a claim missing
-        // from the renewed token (zl-zipline#265). The attribute-change sweep
-        // re-checks every live visa against the stored actors.
-        // ponytail: full sweep of every live visa per login, logout or lossy
-        // renewal; these are rare. Add a per-actor sweep if visa counts make
-        // this slow.
-        //
-        // The sweep uses the CURRENT snapshot, taken after the actor is
-        // persisted, and repeats while the policy generation moves under it:
-        // a sweep under a superseded generation applies no verdicts, and a
-        // policy install whose own sweep ran before this persist re-checked
-        // the visas against the pre-logout actor (#63 review).
-        //
-        // The self-renewal lock covers load -> classify -> persist -> anchors;
-        // the fleet-wide sweep needs none of that, so release it first rather
-        // than block every node authentication and nonce mint for the sweep's
-        // duration (#63 review).
         drop(self_reauth_guard);
-        if needs_visa_sweep {
-            Self::sweep_visas_after_attribute_change(&asm).await;
-        }
         Ok(renewed)
-    }
-
-    /// Re-check every live visa after an actor's attributes changed in a way
-    /// that can revoke one: a node's login or logout (#63 review), a node
-    /// authentication that replaced an actor holding attributes the new one
-    /// lacks, or a renewal that lost an attribute value (zl-zipline#265). Runs
-    /// up to [config::NAMESPACE_SWEEP_ATTEMPTS] attribute-change sweeps, each
-    /// under the policy snapshot current when it starts, until one completes
-    /// with no failures under a generation that did not move. If none does,
-    /// the work is handed to the event manager as an attribute-change
-    /// reconcile (refresh, then sweep) rather than dropped: the actor is
-    /// already persisted, and a visa whose revocation failed must not stay
-    /// usable until it expires.
-    ///
-    /// The sweep runs on its own task, which the caller awaits. The callers are
-    /// RPC handlers (`authenticate`, `reauthorize`), and a cancelled RPC drops
-    /// its future: the actor is already persisted, so a sweep dropped half way
-    /// would leave visas live with nothing to redo it.
-    pub(crate) async fn sweep_visas_after_attribute_change(asm: &Arc<Assembly>) {
-        let task = tokio::spawn(Self::sweep_until_complete(asm.clone()));
-        if let Err(e) = task.await {
-            error!(target: CC, "the visa sweep after an attribute change failed: {e}");
-        }
-    }
-
-    /// The body of [Self::sweep_visas_after_attribute_change]: the bounded
-    /// sweep retries, then the fallback reconcile.
-    async fn sweep_until_complete(asm: Arc<Assembly>) {
-        let asm = &asm;
-        for _ in 0..config::NAMESPACE_SWEEP_ATTEMPTS {
-            let sweep_snap = asm.policy_mgr.get_current_snapshot();
-            let failures = revalidate_visas(asm, &sweep_snap, SweepReason::AttributeChange).await;
-            if failures == 0 && asm.policy_mgr.get_current_snapshot().vinst() == sweep_snap.vinst()
-            {
-                return;
-            }
-        }
-        warn!(target: CC, "visa sweep after an attribute change (login, logout, session replacement or renewal with fewer attributes) did not complete; queueing an attribute-change reconcile");
-        if let Err(e) = asm
-            .event_mgr
-            .record_event(crate::event_mgr::VsEvent::TrustedServiceChange)
-            .await
-        {
-            error!(target: CC, "failed to queue the attribute-change reconcile after an attribute change: {e}");
-        }
     }
 
     /// Spend a node's login nonce for a `user` namespace gain on its own actor
@@ -8443,7 +8392,7 @@ pub(crate) mod tests {
     }
 
     /// Log the fixture Zode out (drop) and return the renewed actor.
-    async fn zode_logout(
+    pub(crate) async fn zode_logout(
         asm: &Arc<Assembly>,
         cc: &ConnectionControl,
         addr: IpAddr,
@@ -8464,6 +8413,62 @@ pub(crate) mod tests {
     /// Whether `actor` carries any attribute in the `user.` namespace.
     pub(crate) fn has_user_attrs(actor: &Actor) -> bool {
         actor.attrs_iter().any(|a| a.get_key().starts_with("user."))
+    }
+
+    /// Whether an attribute revocation obligation is pending (zl-zipline#289); the
+    /// fixture's policy installs record only policy obligations.
+    pub(crate) async fn has_attribute_obligation(asm: &Assembly) -> bool {
+        crate::db::RevocationRepo::new(asm.state_db.clone())
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, ob)| ob.kind == crate::db::ObligationKind::Attributes)
+    }
+
+    /// zl-zipline#289 (VS#77 declined codex pass-3 P1): a logout RPC cancelled right
+    /// after its actor write still gets its visas revoked. The obligation was
+    /// recorded before the write, so the next reconciler pass revokes the visa the
+    /// login allowed; nothing depends on the cancelled handler.
+    #[tokio::test]
+    async fn test_logout_cancelled_after_the_write_is_still_revoked() {
+        let cn = "zode-289c.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let id = create_zode_files_visa(&asm, addr).await;
+        crate::event_mgr::reconcile_obligations(&asm).await;
+
+        let (parked, _resume) = crate::visareq_worker::race_gate::arm(addr);
+        let cc = Arc::new(cc);
+        let logout = tokio::spawn({
+            let (asm, cc) = (asm.clone(), cc.clone());
+            let blobs = vec![make_fresh_ss_blob(&privkey, cn)];
+            async move {
+                cc.reauthorize_actor(asm, addr, blobs, &addr, Some(ZODE_SESSION))
+                    .await
+            }
+        });
+        parked.notified().await; // the write is done
+        logout.abort();
+        let _ = logout.await;
+        crate::visareq_worker::race_gate::disarm(&addr);
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!has_user_attrs(&stored), "the logout write landed");
+
+        crate::event_mgr::reconcile_obligations(&asm).await;
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&addr)
+                .await
+                .unwrap(),
+            vec![id],
+            "the cancelled logout's visa must be revoked"
+        );
     }
 
     /// Policy decision for the Zode reaching `files` (TCP 8000).
@@ -8650,6 +8655,8 @@ pub(crate) mod tests {
         );
 
         zode_logout(&asm, &cc, addr, &privkey, cn).await;
+        // The logout records the obligation; the reconciler revokes (zl-zipline#289).
+        crate::event_mgr::reconcile_obligations(&asm).await;
 
         assert_eq!(
             asm.visa_mgr
@@ -8679,11 +8686,8 @@ pub(crate) mod tests {
         .await
         .expect("device-only renewal must succeed");
         assert!(
-            asm.visa_mgr
-                .get_pending_revoke_visa_ids_for_node(&addr)
-                .await
-                .unwrap()
-                .is_empty()
+            !has_attribute_obligation(&asm).await,
+            "a renewal that drops nothing records no revocation obligation"
         );
     }
 
@@ -8731,6 +8735,7 @@ pub(crate) mod tests {
             "the renewal keeps the login"
         );
         assert!(renewed.get_attribute("user.domain").is_none());
+        crate::event_mgr::reconcile_obligations(&asm).await;
 
         assert_eq!(
             asm.visa_mgr
@@ -9069,6 +9074,7 @@ pub(crate) mod tests {
             !has_user_attrs(&renewed),
             "a stale OIDC user namespace must be dropped"
         );
+        crate::event_mgr::reconcile_obligations(&asm).await;
         assert_eq!(
             asm.visa_mgr
                 .get_pending_revoke_visa_ids_for_node(&addr)
@@ -9337,34 +9343,38 @@ pub(crate) mod tests {
         );
     }
 
-    /// Review fix (#63 round 5, Codex P1): when the logout's visa sweep
-    /// cannot record a revocation, the logout still persists but the work is
-    /// handed to the event manager (an attribute-change reconcile) instead of
-    /// being dropped.
+    /// Review fix (#63 round 5, Codex P1), moved onto the ledger (zl-zipline#289):
+    /// when the sweep cannot record a revocation, the logout still persists and its
+    /// obligation stays pending until a pass records it.
     #[tokio::test]
-    async fn test_incomplete_logout_sweep_is_requeued() {
-        let (asm, mut event_rx, db) =
+    async fn test_incomplete_logout_sweep_keeps_the_obligation() {
+        let (asm, _event_rx, db) =
             crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
         let cn = "zode-y.zpr";
         let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
         zode_login(&asm, &cc, addr, &privkey, cn).await;
-        create_zode_files_visa(&asm, addr).await;
-        while event_rx.try_recv().is_ok() {} // drain events so far
+        let id = create_zode_files_visa(&asm, addr).await;
+        crate::event_mgr::reconcile_obligations(&asm).await;
 
-        // Visa writes fail from here on: the sweep cannot record the revoke.
-        // ApplyThenError: the visa write errors, while actor writes (atomic
-        // pipelines, which fail only on Reject) are unaffected.
-        db.set_set_ex_fault(crate::db::FaultMode::ApplyThenError);
         let renewed = zode_logout(&asm, &cc, addr, &privkey, cn).await;
         assert!(!has_user_attrs(&renewed), "the logout itself persists");
-
-        let mut requeued = false;
-        while let Ok(evt) = event_rx.try_recv() {
-            requeued |= matches!(evt, crate::event_mgr::VsEvent::TrustedServiceChange);
-        }
+        // Visa writes fail: the sweep cannot record the revoke.
+        db.set_set_ex_fault(crate::db::FaultMode::Reject);
+        crate::event_mgr::reconcile_obligations(&asm).await;
+        db.set_set_ex_fault(crate::db::FaultMode::None);
         assert!(
-            requeued,
-            "an incomplete sweep must hand its work to the event manager"
+            has_attribute_obligation(&asm).await,
+            "an incomplete sweep must leave the obligation pending"
+        );
+
+        crate::event_mgr::reconcile_obligations(&asm).await;
+        assert!(!has_attribute_obligation(&asm).await);
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&addr)
+                .await
+                .unwrap(),
+            vec![id]
         );
     }
 
@@ -9891,71 +9901,47 @@ pub(crate) mod tests {
         );
     }
 
-    /// #63 review (Copilot): a logout whose actor write fails part-way (the
-    /// attributes may already be committed) still hands its follow-up -- the
-    /// visa reconciliation -- to the event manager before returning the error.
+    /// #63 review (Copilot), moved onto the ledger (zl-zipline#289): a logout whose
+    /// actor write fails part-way (the attributes may already be committed) leaves
+    /// its obligation recorded, so a pass re-checks the visas; and the failure
+    /// returns at once even with the event queue full (the kick never waits).
     #[tokio::test]
-    async fn test_failed_logout_write_queues_reconcile() {
-        let (asm, mut event_rx, db) =
+    async fn test_failed_logout_write_keeps_the_obligation() {
+        let (asm, _event_rx, db) =
             crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
         let cn = "zode-ak.zpr";
         let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
         zode_login(&asm, &cc, addr, &privkey, cn).await;
-        while event_rx.try_recv().is_ok() {}
+        crate::event_mgr::reconcile_obligations(&asm).await;
+        // Fill the event queue; nothing drains it.
+        while asm
+            .event_mgr
+            .try_record_event_for_tests(crate::event_mgr::VsEvent::Reconcile)
+        {}
 
         db.set_hset_fault(crate::db::FaultMode::Reject);
-        let result = cc
-            .reauthorize_actor(
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            cc.reauthorize_actor(
                 asm.clone(),
                 addr,
                 vec![make_fresh_ss_blob(&privkey, cn)],
                 &addr,
                 Some(ZODE_SESSION),
-            )
-            .await;
+            ),
+        )
+        .await
+        .expect("a failed write must not wait on the full event queue");
+        db.set_hset_fault(crate::db::FaultMode::None);
         assert!(result.is_err(), "the failed write is reported");
-        let mut requeued = false;
-        while let Ok(evt) = event_rx.try_recv() {
-            requeued |= matches!(evt, crate::event_mgr::VsEvent::TrustedServiceChange);
-        }
-        assert!(
-            requeued,
-            "a failed logout write must still queue the reconcile"
-        );
-    }
-
-    /// #63 review (Copilot): a failed namespace-change write releases the
-    /// node commit lock before it awaits the (bounded) event queue, so a
-    /// full queue whose worker needs that lock cannot deadlock.
-    #[tokio::test]
-    async fn test_failed_write_releases_lock_before_queueing() {
-        let (asm, _event_rx, db) =
-            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
-        let cn = "zode-al.zpr";
-        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
-        zode_login(&asm, &cc, addr, &privkey, cn).await;
-        // Fill the event queue; nothing drains it, so the next send waits.
-        while asm
-            .event_mgr
-            .try_record_event_for_tests(crate::event_mgr::VsEvent::TrustedServiceChange)
-        {}
-        db.set_hset_fault(crate::db::FaultMode::Reject);
-        let cc = Arc::new(cc);
-        let task = tokio::spawn({
-            let (asm, cc) = (asm.clone(), cc.clone());
-            let blobs = vec![make_fresh_ss_blob(&privkey, cn)];
-            async move {
-                cc.reauthorize_actor(asm, addr, blobs, &addr, Some(ZODE_SESSION))
-                    .await
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!task.is_finished(), "the send waits on the full queue");
         assert!(
             asm.policy_mgr.node_commit_lock.try_lock().is_ok(),
-            "the node commit lock must be free while the send waits"
+            "the node commit lock is released"
         );
-        task.abort();
+        assert!(
+            has_attribute_obligation(&asm).await,
+            "a failed logout write must leave its obligation pending"
+        );
     }
 
     /// #63 review (Codex P1): a login whose actor write fails part-way never

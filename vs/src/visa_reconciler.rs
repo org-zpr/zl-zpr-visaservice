@@ -15,45 +15,23 @@ use crate::logging::targets::VISA;
 use crate::policy_mgr::PolicySnapshot;
 use crate::visa_mgr::VisaRecheck;
 
-/// Why a visa sweep is running. The two reasons need different handling because
-/// an attribute change does not move the policy generation, so the
-/// `checked_vinst` gates that make the policy sweep idempotent (ie, do not do
-/// anything if the `vinst` has not changed) would make an attribute sweep a
-/// complete no-op.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SweepReason {
-    /// A new policy was installed.
-    PolicyUpdate,
-    /// A trusted service's attribute data changed.
-    AttributeChange,
-}
-
-/// Sweep every live visa and re-evaluate it against the given policy snapshot.
-/// Denied visas (and visas whose route moved) are marked `PendingRevoke` on all
-/// their nodes so VSS housekeeping revokes them.
+/// Sweep every live visa and re-evaluate it against the given policy snapshot,
+/// with the actors as stored. Denied visas (and visas whose route moved) are marked
+/// `PendingRevoke` on all their nodes ([VisaMgr::mark_visa_revoked]) so VSS
+/// housekeeping revokes them. An allowed visa is left as it is: a revoke an earlier
+/// sweep queued stays queued, and the node simply re-requests to get a fresh
+/// decision. Every visa is checked: whatever changed (policy, attributes), any of
+/// them may no longer hold.
 ///
-/// Visas whose actors can't be resolved are skipped (not revoked). A verdict is
-/// only applied while `target_vinst` is still the live policy generation —
-/// otherwise a newer policy sweep is coming and it will decide when it runs.
+/// Visas whose actors can't be resolved are skipped (not revoked; the reconciler
+/// revokes those of actors it knows to be gone). A revoke is only applied while
+/// `psnap` is still the live policy generation -- otherwise a newer pass is coming
+/// and it decides.
 ///
-/// [SweepReason::PolicyUpdate] skips any visa already checked at/after
-/// `target_vinst`, bumps `checked_vinst` on allow (canceling any older queued
-/// revoke), and denies through the vinst-gated verdict recorder.
-///
-/// [SweepReason::AttributeChange] cannot use those gates: the policy generation has
-/// not moved, so every visa looks "current". It checks every visa, revokes through
-/// the ungated [VisaMgr::mark_visa_revoked], and does nothing at all on allow —
-/// a revoke queued by an earlier attribute sweep stays queued, and the node simply
-/// re-requests to get a fresh decision.
-///
-/// Returns the number of visas the sweep could not decide or record (a
-/// re-check error, or a failed verdict write). Those are logged either way; a
-/// caller that must not lose them (a node's logout, zl-zipline#232) retries.
-pub(crate) async fn revalidate_visas(
-    asm: &Arc<Assembly>,
-    psnap: &PolicySnapshot,
-    reason: SweepReason,
-) -> u32 {
+/// Returns the number of visas the sweep could not decide or record (a re-check
+/// error, or a failed revoke write). Those are logged either way; the reconciler
+/// keeps its obligations pending while any are left (zl-zipline#289).
+pub(crate) async fn revalidate_visas(asm: &Arc<Assembly>, psnap: &PolicySnapshot) -> u32 {
     let target_vinst = psnap.vinst();
     let snapshot = asm.visa_mgr.list_visa_metadata().await;
 
@@ -63,16 +41,9 @@ pub(crate) async fn revalidate_visas(
     let mut revoked = 0u32;
     let mut skipped_stale = 0u32;
     let mut skipped_unresolved = 0u32;
-    let mut skipped_current = 0u32;
     let mut failed = 0u32;
 
     for (visa_id, metadata) in snapshot {
-        // Only a policy sweep can skip on generation: an attribute change leaves the
-        // generation alone, so this would skip everything.
-        if reason == SweepReason::PolicyUpdate && metadata.checked_vinst >= target_vinst {
-            skipped_current += 1;
-            continue;
-        }
         match asm
             .visa_mgr
             .recheck_visa_allowed(asm, &metadata, psnap)
@@ -82,32 +53,7 @@ pub(crate) async fn revalidate_visas(
                 skipped_unresolved += 1;
                 debug!(target: VISA, "visa sweep: visa {visa_id} actor unresolved, skipping");
             }
-            Ok(VisaRecheck::AllowSameRoute) => {
-                // An attribute sweep records nothing on allow: it must not bump
-                // checked_vinst (that would make a later policy sweep skip the visa)
-                // and it deliberately leaves any queued revoke in place.
-                if reason == SweepReason::AttributeChange {
-                    allowed += 1;
-                    continue;
-                }
-                // Allowed. Only apply while target_vinst is still the live policy;
-                // otherwise an older sweep could cancel a newer revoke verdict.
-                if asm.policy_mgr.get_current_snapshot().vinst() != target_vinst {
-                    skipped_stale += 1;
-                    continue;
-                }
-                match asm
-                    .visa_mgr
-                    .record_allow_verdict(visa_id, target_vinst)
-                    .await
-                {
-                    Ok(_) => allowed += 1,
-                    Err(e) => {
-                        failed += 1;
-                        warn!(target: VISA, "visa sweep: failed to record allow for visa {visa_id}: {e}")
-                    }
-                }
-            }
+            Ok(VisaRecheck::AllowSameRoute) => allowed += 1,
             Ok(VisaRecheck::Revoke) => {
                 // Denied, or allowed but rerouted. Only apply while target_vinst
                 // is still the live policy; otherwise a newer sweep is coming and
@@ -116,17 +62,7 @@ pub(crate) async fn revalidate_visas(
                     skipped_stale += 1;
                     continue;
                 }
-                // The verdict recorder is vinst-gated, so an attribute sweep has to
-                // revoke through the ungated path.
-                let res = match reason {
-                    SweepReason::PolicyUpdate => {
-                        asm.visa_mgr
-                            .record_deny_verdict(visa_id, target_vinst)
-                            .await
-                    }
-                    SweepReason::AttributeChange => asm.visa_mgr.mark_visa_revoked(visa_id).await,
-                };
-                match res {
+                match asm.visa_mgr.mark_visa_revoked(visa_id).await {
                     Ok(_) => revoked += 1,
                     Err(e) => {
                         failed += 1;
@@ -145,7 +81,7 @@ pub(crate) async fn revalidate_visas(
     // actual revocations happen asynchronously in VSS housekeeping.
     info!(
         target: VISA,
-        "visa sweep reason={reason:?} vinst={target_vinst}: total={total} allowed={allowed} revoked={revoked} skipped_stale={skipped_stale} skipped_unresolved={skipped_unresolved} skipped_current={skipped_current} failed={failed}"
+        "visa sweep vinst={target_vinst}: total={total} allowed={allowed} revoked={revoked} skipped_stale={skipped_stale} skipped_unresolved={skipped_unresolved} failed={failed}"
     );
     failed
 }
@@ -257,7 +193,7 @@ mod tests {
         db.set_exists_fault(crate::db::FaultMode::Reject);
 
         let psnap = asm.policy_mgr.get_current_snapshot();
-        let failures = revalidate_visas(&asm, &psnap, SweepReason::AttributeChange).await;
+        let failures = revalidate_visas(&asm, &psnap).await;
         assert_eq!(failures, 1, "the unreadable actor must count as a failure");
     }
 
@@ -269,11 +205,7 @@ mod tests {
         let id = create_sweep_visa(&asm, &node_a, 0).await;
 
         let psnap = asm.policy_mgr.get_current_snapshot();
-        assert!(
-            psnap.vinst() > 0,
-            "target must exceed the visa's checked_vinst"
-        );
-        revalidate_visas(&asm, &psnap, SweepReason::PolicyUpdate).await;
+        revalidate_visas(&asm, &psnap).await;
 
         let revoke_ids = asm
             .visa_mgr
@@ -281,34 +213,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoke_ids, vec![id]);
-    }
-
-    /// A visa already checked at/after target_vinst is skipped before re-eval:
-    /// even on the deny (no-route) assembly it is NOT marked PendingRevoke.
-    #[tokio::test]
-    async fn test_sweep_skips_already_checked() {
-        let (asm, node_a) = build_sweep_asm(false).await;
-        let target = asm.policy_mgr.get_current_snapshot().vinst();
-        // checked_vinst == target, so the guard skips before recheck.
-        let id = create_sweep_visa(&asm, &node_a, target).await;
-
-        let psnap = asm.policy_mgr.get_current_snapshot();
-        revalidate_visas(&asm, &psnap, SweepReason::PolicyUpdate).await;
-
-        assert!(
-            asm.visa_mgr
-                .get_pending_revoke_visa_ids_for_node(&node_a)
-                .await
-                .unwrap()
-                .is_empty(),
-            "already-checked visa must not be re-evaluated/revoked"
-        );
-        let pending = asm
-            .visa_mgr
-            .get_pending_visa_ids_for_node(&node_a)
-            .await
-            .unwrap();
-        assert_eq!(pending, vec![id]);
     }
 
     /// An unresolvable actor leaves the visa untouched (skipped, not revoked).
@@ -320,7 +224,7 @@ mod tests {
         let id = create_sweep_visa(&asm, &node, 0).await;
 
         let psnap = asm.policy_mgr.get_current_snapshot();
-        revalidate_visas(&asm, &psnap, SweepReason::PolicyUpdate).await;
+        revalidate_visas(&asm, &psnap).await;
 
         // Still held as PendingInstall (untouched); nothing marked for revoke.
         let pending = asm
@@ -354,7 +258,7 @@ mod tests {
             .unwrap();
         assert!(asm.policy_mgr.get_current_snapshot().vinst() > stale_psnap.vinst());
 
-        revalidate_visas(&asm, &stale_psnap, SweepReason::PolicyUpdate).await;
+        revalidate_visas(&asm, &stale_psnap).await;
 
         // No revoke marked; the visa stays PendingInstall.
         assert!(
@@ -370,88 +274,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending, vec![id]);
-    }
-
-    /// The core case: an attribute sweep re-checks (and revokes) a visa whose
-    /// `checked_vinst` already equals the live generation -- exactly what the policy
-    /// sweep skips, at both the sweep and the store layer.
-    #[tokio::test]
-    async fn test_attr_sweep_revokes_visa_at_current_vinst() {
-        let (asm, node_a) = build_sweep_asm(false).await;
-        let target = asm.policy_mgr.get_current_snapshot().vinst();
-        let id = create_sweep_visa(&asm, &node_a, target).await;
-
-        let psnap = asm.policy_mgr.get_current_snapshot();
-        revalidate_visas(&asm, &psnap, SweepReason::AttributeChange).await;
-
-        let revoke_ids = asm
-            .visa_mgr
-            .get_pending_revoke_visa_ids_for_node(&node_a)
-            .await
-            .unwrap();
-        assert_eq!(revoke_ids, vec![id]);
-
-        // The attribute sweep must not touch the policy generation it was checked at.
-        let md = asm.visa_mgr.list_visa_metadata().await;
-        assert_eq!(md.len(), 1);
-        assert_eq!(md[0].1.checked_vinst, target);
-    }
-
-    /// An attribute sweep holding a snapshot older than the live policy applies nothing:
-    /// a policy sweep is already coming and will decide.
-    #[tokio::test]
-    async fn test_attr_sweep_stale_target_skips() {
-        let (asm, node_a) = build_sweep_asm(false).await;
-        let id = create_sweep_visa(&asm, &node_a, 0).await;
-
-        let stale_psnap = asm.policy_mgr.get_current_snapshot();
-        asm.policy_mgr
-            .update_policy_from_container_bytes(make_policy("2024-01-02T00:00:00Z", 2, Some("m")))
-            .await
-            .unwrap();
-
-        revalidate_visas(&asm, &stale_psnap, SweepReason::AttributeChange).await;
-
-        assert!(
-            asm.visa_mgr
-                .get_pending_revoke_visa_ids_for_node(&node_a)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            asm.visa_mgr
-                .get_pending_visa_ids_for_node(&node_a)
-                .await
-                .unwrap(),
-            vec![id]
-        );
-    }
-
-    /// An unresolvable actor is skipped by the attribute sweep too, never revoked.
-    #[tokio::test]
-    async fn test_attr_sweep_unresolved_actor_leaves_visa_untouched() {
-        let asm = Arc::new(new_assembly_for_tests(None).await);
-        let node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
-        let id = create_sweep_visa(&asm, &node, 0).await;
-
-        let psnap = asm.policy_mgr.get_current_snapshot();
-        revalidate_visas(&asm, &psnap, SweepReason::AttributeChange).await;
-
-        assert_eq!(
-            asm.visa_mgr
-                .get_pending_visa_ids_for_node(&node)
-                .await
-                .unwrap(),
-            vec![id]
-        );
-        assert!(
-            asm.visa_mgr
-                .get_pending_revoke_visa_ids_for_node(&node)
-                .await
-                .unwrap()
-                .is_empty()
-        );
     }
 
     // --- Revoke on link down (zl-zipline#224) ---

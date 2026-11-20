@@ -85,15 +85,6 @@ pub const LOGIN_NONCE_TTL_SECS: u64 = 300;
 /// may hold; minting past it is refused with `quotaExceeded` (zl-zipline#232).
 pub const LOGIN_NONCE_MAX_PER_ACTOR: usize = 4;
 
-/// How many visa sweeps an attribute change (a node's login or logout, a
-/// session replacement or a renewal that lost attributes) runs before it hands
-/// an incomplete sweep to the event manager (zl-zipline#232, #265).
-pub const NAMESPACE_SWEEP_ATTEMPTS: usize = 3;
-
-/// Delay before an attribute-change reconcile whose visa sweep could not
-/// record every verdict runs again (zl-zipline#232 review).
-pub const RECONCILE_RETRY: Duration = Duration::from_secs(30);
-
 /// Retry hint (seconds) sent with `temporarilyUnavailable` when a node's login
 /// is refused because policy changed while it was authorized (zl-zipline#232).
 pub const LOGIN_POLICY_CHANGED_RETRY_SECS: u32 = 1;
