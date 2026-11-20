@@ -530,6 +530,23 @@ pub fn make_allow_policy_for_tcp_service(service_id: &str, port: u16) -> Vec<u8>
 /// As [make_allow_policy_for_tcp_service], with one unconditional ALLOW
 /// communication policy per `(service_id, port)`.
 pub fn make_allow_policy_for_tcp_services(services: &[(&str, u16)]) -> Vec<u8> {
+    make_allow_tcp_policy(services, None)
+}
+
+/// As [make_allow_policy_for_tcp_service], with the ALLOW conditioned on the client
+/// actor's `cond_key` attribute equalling `cond_value`.
+pub fn make_allow_policy_for_tcp_service_with_client_cond(
+    service_id: &str,
+    port: u16,
+    cond_key: &str,
+    cond_value: &str,
+) -> Vec<u8> {
+    make_allow_tcp_policy(&[(service_id, port)], Some((cond_key, cond_value)))
+}
+
+/// Build the policy container for [make_allow_policy_for_tcp_services], with an
+/// optional `(key, value)` equality condition on the client of every com policy.
+fn make_allow_tcp_policy(services: &[(&str, u16)], client_cond: Option<(&str, &str)>) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
     {
         let mut policy_bldr = msg.init_root::<capnp_policy::policy::Builder>();
@@ -537,6 +554,15 @@ pub fn make_allow_policy_for_tcp_services(services: &[(&str, u16)]) -> Vec<u8> {
         policy_bldr.set_version(1);
         policy_bldr.set_metadata("");
         init_allow_tcp_com_policies(&mut policy_bldr, services);
+        if let Some((cond_key, cond_value)) = client_cond {
+            let mut coms = policy_bldr.reborrow().get_com_policies().unwrap();
+            for i in 0..coms.len() {
+                let mut cond = coms.reborrow().get(i).init_client_conds(1).get(0);
+                cond.set_key(cond_key);
+                cond.set_op(capnp_policy::AttrOp::Eq);
+                cond.init_value(1).set(0, cond_value);
+            }
+        }
     }
     let mut bytes = Vec::new();
     capnp::serialize::write_message(&mut bytes, &msg).unwrap();
@@ -1058,6 +1084,24 @@ pub fn register_ts(asm: &Arc<Assembly>, attrs: &[(&str, &str)]) -> Arc<MutableTr
 /// Give the stored actor at `zpr_addr` an attribute from [TS_SOURCE], standing in for
 /// data the actor picked up from that source under the previous snapshot.
 pub async fn seed_source_attr(asm: &Arc<Assembly>, zpr_addr: &str, ts_key: &str, value: &str) {
+    seed_source_attr_expiring(
+        asm,
+        zpr_addr,
+        ts_key,
+        value,
+        SystemTime::now() + Duration::from_secs(600),
+    )
+    .await;
+}
+
+/// As [seed_source_attr], with the seeded attribute expiring at `expires`.
+pub async fn seed_source_attr_expiring(
+    asm: &Arc<Assembly>,
+    zpr_addr: &str,
+    ts_key: &str,
+    value: &str,
+    expires: SystemTime,
+) {
     let addr: IpAddr = zpr_addr.parse().unwrap();
     let mut actor = asm
         .actor_mgr
@@ -1069,7 +1113,7 @@ pub async fn seed_source_attr(asm: &Arc<Assembly>, zpr_addr: &str, ts_key: &str,
         .add_attribute(
             AttributeSource::new(TS_SOURCE)
                 .builder(ts_key)
-                .expires_in(Duration::from_secs(600))
+                .expires(expires)
                 .value(value),
         )
         .unwrap();

@@ -9,8 +9,9 @@
 //!
 //! **Stateless**: the store holds no attribute cache. The actor's own
 //! attribute expiry is the cache — `refresh_expired_attributes` re-queries a
-//! source only when an attribute expired or the revision moved, so a
-//! snapshot cache here would just be a second TTL to reason about.
+//! source only when an attribute expired or is about to (within
+//! `config::ATTRIBUTE_REFRESH_AHEAD`), or the revision moved, so a snapshot
+//! cache here would just be a second TTL to reason about.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -28,12 +29,7 @@ use crate::http_util::read_body_capped;
 use crate::logging::targets::TS;
 
 use super::attribute_mapper::{AttrHint, AttributeMapper};
-use super::{TrustedServiceInterface, next_revision};
-
-/// Shortest attribute lifetime a declaration may configure — the same floor
-/// the file store enforces (docs/ATTRIBUTE_SERVICE.md, *Declaring an
-/// attribute service in policy*).
-const MIN_ATTRIBUTE_TTL: Duration = Duration::from_secs(60);
+use super::{MIN_ATTRIBUTE_TTL, TrustedServiceInterface, next_revision};
 
 /// Whole-request timeout when the policy record carries none (the compiler
 /// defaults to 5 and caps at 30; a hand-built record decoding to 0 gets the

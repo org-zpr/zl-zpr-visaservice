@@ -271,7 +271,7 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         return Ok(VisaDecision::Deny(DenyCode::NoMatch));
     }
 
-    // If necessary, refresh any expired attributes
+    // If necessary, refresh any expired or about-to-expire attributes
     if let Err(e) = refresh_and_persist_actor(&asm, &mut source_actor).await {
         error!(target: VREQ, "failed to update source actor after refreshing attributes: {}", e);
         return Ok(VisaDecision::Deny(DenyCode::NoReason));
@@ -389,7 +389,10 @@ fn fabricate_aaa_actor(anon_addr: &IpAddr, expiration: SystemTime) -> Actor {
 /// Note that an ALLOW decision can still come back as a [VisaDecision::Deny]: if the
 /// authentication or attribute expirations leave less than [config::MIN_VISA_LIFETIME] to
 /// work with, the visa would lapse before the nodes could install and use it, so we deny
-/// rather than issue it.
+/// rather than issue it. The request path refreshes trusted-service attributes ahead of
+/// expiry ([config::ATTRIBUTE_REFRESH_AHEAD]) so this should not happen for them; when it
+/// does (an authentication about to expire, a service vending a short expiry) the deny
+/// is logged at WARN naming what limited the lifetime. The wire code stays `NoReason`.
 async fn visa_from_allow(
     asm: Arc<Assembly>,
     job: &VisaRequestJob,
@@ -410,14 +413,21 @@ async fn visa_from_allow(
 
     let allowed_route: Route = route_for_allow(hits, default_route)?;
 
-    let expiration = compute_expiration(src_actor, dst_actor, policy, &hits[0])?;
+    let (expiration, gate) = compute_expiration(src_actor, dst_actor, policy, &hits[0])?;
 
     // Too little time left to be usable. Deny rather than issue a visa that cannot be
     // installed before it lapses -- and that the store would silently discard.
-    if expiration < SystemTime::now() + config::MIN_VISA_LIFETIME {
-        debug!(target: VREQ,
-            "visa request from {:?} denied: computed expiration {:?} leaves less than {:?}",
-            job.requesting_node, expiration, config::MIN_VISA_LIFETIME
+    let now = SystemTime::now();
+    if expiration < now + config::MIN_VISA_LIFETIME {
+        let left = expiration.duration_since(now).unwrap_or_default();
+        warn!(target: VREQ,
+            "visa request from node {} denied: flow {} would get a visa living {:?}, \
+             under the minimum {:?} (limited by {})",
+            job.requesting_node,
+            describe_five_tuple(&job.packet_desc),
+            left,
+            config::MIN_VISA_LIFETIME,
+            gate
         );
         return Ok(VisaDecision::Deny(DenyCode::NoReason));
     }
@@ -452,7 +462,9 @@ async fn visa_from_allow(
     Ok(VisaDecision::Allow(visa, allowed_route))
 }
 
-/// Compute a visa expiration value. The expiration is set to the soonest of:
+/// Compute a visa expiration value, and name what set it (the "gate": a condition
+/// attribute key, `source_actor_auth`, `destination_actor_auth` or `max_visa_lifetime`).
+/// The expiration is set to the soonest of:
 /// - source actor authentication expiration.
 /// - dest actor authentication expiration.
 /// - soonest attribute expiration used in the policy conditions for the hit.
@@ -475,7 +487,7 @@ fn compute_expiration(
     dst_actor: &Actor,
     policy: &Policy,
     hit: &Hit,
-) -> Result<SystemTime, ServiceError> {
+) -> Result<(SystemTime, String), ServiceError> {
     // Both sides come back Some for a valid index -- an empty vec means that side has no
     // conditions -- so a None here is only ever a failed lookup or an undecodable list.
     let (Some(client_keys), Some(service_keys)) =
@@ -503,7 +515,7 @@ fn compute_expiration(
     // Sampled once so the clamp below compares and assigns against the same instant.
     let now = SystemTime::now();
     let mut soonest_expiration = now + libeval::attribute::NEVER_EXPIRES;
-    let mut expiration_gate = String::from("(none)"); // for debugging
+    let mut expiration_gate = String::from("(none)");
 
     for (keys, actor) in [(&client_keys, client_actor), (&service_keys, service_actor)] {
         for key in keys {
@@ -538,7 +550,7 @@ fn compute_expiration(
         "visa request computed expiration {:?} (gate: {})",
         soonest_expiration, expiration_gate
     );
-    Ok(soonest_expiration)
+    Ok((soonest_expiration, expiration_gate))
 }
 
 /// Pushes actualized copies of a visa to all non-requesting nodes on the path.
@@ -1053,8 +1065,9 @@ mod tests {
         let hit = Hit::new_no_signal(0, Direction::Forward);
 
         let expected = src.get_attribute("user.role").unwrap().get_expires();
-        let exp = compute_expiration(&src, &dst, &policy, &hit).unwrap();
+        let (exp, gate) = compute_expiration(&src, &dst, &policy, &hit).unwrap();
         assert_eq!(exp, expected);
+        assert_eq!(gate, "user.role");
     }
 
     // Client conditions apply to the source on a Forward hit and to the dest on a Reverse
@@ -1080,8 +1093,20 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(fwd, src.get_attribute("user.role").unwrap().get_expires());
-        assert_eq!(rev, dst.get_attribute("user.role").unwrap().get_expires());
+        assert_eq!(
+            fwd,
+            (
+                src.get_attribute("user.role").unwrap().get_expires(),
+                "user.role".to_string()
+            )
+        );
+        assert_eq!(
+            rev,
+            (
+                dst.get_attribute("user.role").unwrap().get_expires(),
+                "user.role".to_string()
+            )
+        );
     }
 
     // The zpr.services attribute selected the policy, so its expiration bounds the visa even
@@ -1102,7 +1127,7 @@ mod tests {
             &Hit::new_no_signal(0, Direction::Forward),
         )
         .unwrap();
-        assert_eq!(fwd, expected);
+        assert_eq!(fwd, (expected, key::SERVICES.to_string()));
 
         // Reverse: the source provides the service.
         let rev = compute_expiration(
@@ -1112,7 +1137,7 @@ mod tests {
             &Hit::new_no_signal(0, Direction::Reverse),
         )
         .unwrap();
-        assert_eq!(rev, expected);
+        assert_eq!(rev, (expected, key::SERVICES.to_string()));
     }
 
     // With no condition attributes and no authentication expiration, the expiration falls
@@ -1125,7 +1150,8 @@ mod tests {
         let hit = Hit::new_no_signal(0, Direction::Forward);
 
         let before = SystemTime::now();
-        let exp = compute_expiration(&src, &dst, &policy, &hit).unwrap();
+        let (exp, gate) = compute_expiration(&src, &dst, &policy, &hit).unwrap();
+        assert_eq!(gate, "max_visa_lifetime");
         assert!(exp >= before + config::MAX_VISA_LIFETIME);
         assert!(exp <= SystemTime::now() + config::MAX_VISA_LIFETIME);
     }
@@ -1834,6 +1860,61 @@ mod tests {
                     .is_empty(),
                 "nothing may be queued for {node} by a request whose requester undocked"
             );
+        }
+    }
+
+    // zl-zipline#275 end to end: the client's com-policy condition attribute comes
+    // from a trusted service and has 20 s left, under MIN_VISA_LIFETIME (30 s). The
+    // request path must refresh it ahead of expiry, so the flow is allowed with a visa
+    // that outlives MIN_VISA_LIFETIME, instead of being denied because the stale copy
+    // would cap the visa at 20 s.
+    #[tokio::test]
+    async fn visa_request_refreshes_a_condition_attribute_about_to_expire() {
+        use crate::test_helpers::{
+            TS_KEY, TS_SOURCE, make_allow_policy_for_tcp_service_with_client_cond, register_ts,
+            seed_source_attr_expiring,
+        };
+        use crate::trusted_services::TrustedServiceInterface;
+        const CLIENT_A: &str = "fd5a:5052:4000::a";
+
+        let asm = build_binding_test_asm().await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_allow_policy_for_tcp_service_with_client_cond(
+                "svc:web",
+                8080,
+                TS_KEY,
+                "engineering",
+            ))
+            .await
+            .unwrap();
+        let ts = register_ts(&asm, &[(TS_KEY, "engineering")]);
+        seed_source_attr_expiring(
+            &asm,
+            CLIENT_A,
+            TS_KEY,
+            "engineering",
+            SystemTime::now() + Duration::from_secs(20),
+        )
+        .await;
+        // Both actors are current with the service's revision, so only the TTL can make
+        // the source due for a refresh. (A refresh of provider B would restamp its
+        // fixture-set zpr.services under a policy with no join policy granting it.)
+        for addr in [CLIENT_A, "fd5a:5052:4000::b"] {
+            asm.ts_mgr
+                .record_revision(&addr.parse().unwrap(), TS_SOURCE, ts.current_revision());
+        }
+
+        let requesting_node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let (job, _rx) = VisaRequestJob::new(requesting_node, binding_allowed_pkt());
+        let floor = SystemTime::now() + config::MIN_VISA_LIFETIME;
+        match process_visa_request(asm, &job).await {
+            Ok(VisaDecision::Allow(visa, _)) => assert!(
+                visa.expires > floor,
+                "the visa must outlive MIN_VISA_LIFETIME, expires {:?}",
+                visa.expires
+            ),
+            Ok(VisaDecision::Deny(code)) => panic!("expected Allow, got Deny({code:?})"),
+            Err(e) => panic!("expected Allow, got Err({e:?})"),
         }
     }
 }
