@@ -832,10 +832,12 @@ async fn vss_do_set_topology(
 ///
 /// The candidates are [topology_links] (R13a and the CN rule apply there). Of those:
 /// - a **relay link** -- one end is the relay, the node the visa service docks on
-///   ([crate::visa_bootstrap::is_relay]; the v1 relay, §5.6) -- is always proposed:
-///   an endpoint dials its configured initial link, and the relay must know a joiner's
-///   CN before the joiner connects (J2). `peer` is the other end's known address, or
-///   unset if there is none (the relay never dials a joiner);
+///   ([crate::visa_bootstrap::is_relay]; the v1 relay, zl-zpr-dev-context
+///   docs/SYSTEM_OVERVIEW.md, Design decisions, "The relay Zode hosts the visa service
+///   on one TUN") -- is always proposed: an endpoint dials its configured initial link,
+///   and the relay must know a joiner's CN before the joiner connects (J2). `peer` is
+///   the other end's known address, or unset if there is none (the relay never dials a
+///   joiner);
 /// - a **direct link** is proposed only when both ends have a known address, and its
 ///   `peer` is the other end's. Which end dials is the Zodes' rule, not copied here.
 ///
