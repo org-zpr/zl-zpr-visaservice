@@ -251,10 +251,11 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // (The live-node set used for topology is read again under the topology lock below.)
     let mut refresh_set = live_visa_actor_addrs(asm).await;
     refresh_set.extend(asm.actor_mgr.list_node_addrs().await?);
-    let (refreshed, unresolved, failed) = refresh_actors(asm, refresh_set).await;
+    let (refreshed, unresolved, unrefreshed) = refresh_actors(asm, refresh_set).await;
     info!(
         target: EVENT,
-        "policy updated vinst={vinst}: actors refreshed={refreshed} unresolved={unresolved} failed={failed}"
+        "policy updated vinst={vinst}: actors refreshed={refreshed} unresolved={unresolved} failed={}",
+        unrefreshed.len()
     );
 
     // Reconcile hostname claims against the new policy's service-name set
@@ -283,7 +284,7 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // revocations it calls for. A node that disconnects or connects meanwhile is
     // either fully before or fully after it.
     let ops = asm.topo_mgr.ops().await;
-    let locked = policy_pass_locked(asm, &ops, snapshot_vinst).await;
+    let locked = policy_pass_locked(asm, &ops, snapshot_vinst, &unrefreshed).await;
     drop(ops);
     let LockedPass::Applied {
         psnap,
@@ -385,6 +386,11 @@ enum LockedPass {
 /// invalid ones, reconcile links, revoke visas over links taken down and set apart
 /// the nodes those links cut off from the visa service ([nodes_cut_off]).
 ///
+/// `unrefreshed` are the actors whose attribute refresh failed: their claims are
+/// indeterminate, so their services are not recalculated (a policy condition a
+/// missing key satisfies must not grant one) and they are judged on their stored
+/// services.
+///
 /// `refreshed_vinst` is the policy the caller refreshed actor attributes for. If a
 /// newer policy has been installed since, the actors are stale for it: judging nodes
 /// on them could disconnect one the new policy admits. Then this applies nothing and
@@ -395,6 +401,7 @@ async fn policy_pass_locked(
     asm: &Arc<Assembly>,
     ops: &TopoOps<'_>,
     refreshed_vinst: u64,
+    unrefreshed: &HashSet<IpAddr>,
 ) -> Result<LockedPass, ServiceError> {
     let psnap = asm.policy_mgr.get_current_snapshot();
     if psnap.vinst() != refreshed_vinst {
@@ -411,9 +418,14 @@ async fn policy_pass_locked(
     // (zl-zipline#273): a node still offering a service the policy deleted would
     // otherwise be judged invalid and disconnected. If the recalculation fails, the
     // node is judged on its stored services -- at worst it is disconnected, never kept
-    // with more than the policy grants.
+    // with more than the policy grants. A node whose attribute refresh failed is
+    // judged on its stored services the same way: its claims are indeterminate.
     let policy = psnap.policy_arc();
     for naddr in &connected_node_addrs {
+        if unrefreshed.contains(naddr) {
+            warn!(target: EVENT, "policy updated vinst={vinst}: the attributes of node {naddr} could not be refreshed, judging it on its stored services");
+            continue;
+        }
         if let Err(e) = restamp_node_services(asm, &policy, naddr).await {
             warn!(target: EVENT, "policy updated vinst={vinst}: failed to recalculate the services of node {naddr}, judging it on its stored services: {e}");
         }
@@ -598,7 +610,8 @@ async fn handle_trusted_service_change(asm: &Arc<Assembly>) {
         refresh_actors(asm, live_visa_actor_addrs(asm).await).await;
     info!(
         target: EVENT,
-        "trusted service changed: actors refreshed={refreshed} unresolved={unresolved} failed={failed}"
+        "trusted service changed: actors refreshed={refreshed} unresolved={unresolved} failed={}",
+        failed.len()
     );
 
     let failures = revalidate_visas(asm, &psnap, SweepReason::AttributeChange).await;
@@ -1073,7 +1086,7 @@ mod tests {
 
         let outcome = {
             let ops = asm.topo_mgr.ops().await;
-            policy_pass_locked(&asm, &ops, refreshed_vinst)
+            policy_pass_locked(&asm, &ops, refreshed_vinst, &HashSet::new())
                 .await
                 .unwrap()
         };
@@ -1166,7 +1179,10 @@ mod tests {
     async fn run_locked_pass(asm: &Arc<Assembly>) -> Vec<IpAddr> {
         let vinst = asm.policy_mgr.get_current_snapshot().vinst();
         let ops = asm.topo_mgr.ops().await;
-        match policy_pass_locked(asm, &ops, vinst).await.unwrap() {
+        match policy_pass_locked(asm, &ops, vinst, &HashSet::new())
+            .await
+            .unwrap()
+        {
             LockedPass::Applied {
                 valid_node_addrs, ..
             } => valid_node_addrs,
@@ -1252,6 +1268,36 @@ mod tests {
 
         assert_eq!(valid, vec![a]);
         assert_eq!(stored_services(&asm, &a).await, service_set(&["svc-x"]));
+    }
+
+    /// A node whose attribute refresh failed is not recalculated (Copilot on
+    /// zl-zpr-visaservice#76): its claims are indeterminate, and a policy condition a
+    /// missing key satisfies must not grant it a service. It is judged on its stored
+    /// services instead.
+    #[tokio::test]
+    async fn test_policy_pass_does_not_recalculate_a_node_whose_refresh_failed() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a = add_live_node_with_services(&asm, "fd5a:5052::1", "node-a", &[]).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(Some(vec![svc("svc-x")])))
+            .await
+            .unwrap();
+        // A trusted service the node has never been refreshed from, and it is down.
+        let ts = register_ts(&asm, &[]);
+        ts.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+
+        assert_eq!(
+            stored_services(&asm, &a).await,
+            service_set(&[]),
+            "indeterminate claims must not grant a service"
+        );
+        assert!(
+            asm.topo_mgr.has_node(&a),
+            "the node is judged on its stored services"
+        );
     }
 
     /// The recalculation does not save a node the new policy no longer admits at

@@ -449,13 +449,18 @@ fn prune_from_source(actor: &mut Actor, source: &str, pred: impl Fn(&Attribute) 
 /// revision stays mismatched, so its next visa request refreshes it again. This includes
 /// an unreachable trusted service (`AttributesIndeterminate`).
 ///
-/// Returns `(refreshed, unresolved, failed)` counts for logging.
+/// Returns `(refreshed, unresolved, failed)`: the refreshed and unresolved counts for
+/// logging, and the addresses whose refresh failed. A caller that evaluates the stored
+/// actors must not trust a failed one's claims (see [refresh_and_persist_actor]).
 ///
 /// TODO: Sequential, and unbounded in the size of the set. Fine while the only trusted
 /// service is the in-memory file store; revisit once services are network calls and
 /// actor/visa counts are large.
-pub(crate) async fn refresh_actors(asm: &Assembly, zpr_addrs: HashSet<IpAddr>) -> (u32, u32, u32) {
-    let (mut refreshed, mut unresolved, mut failed) = (0u32, 0u32, 0u32);
+pub(crate) async fn refresh_actors(
+    asm: &Assembly,
+    zpr_addrs: HashSet<IpAddr>,
+) -> (u32, u32, HashSet<IpAddr>) {
+    let (mut refreshed, mut unresolved, mut failed) = (0u32, 0u32, HashSet::new());
     // Sequential for now, join_all it if sweeps ever get slow.
     for zpr_addr in zpr_addrs {
         match asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await {
@@ -464,13 +469,13 @@ pub(crate) async fn refresh_actors(asm: &Assembly, zpr_addrs: HashSet<IpAddr>) -
                 Ok(false) => {}
                 Err(e) => {
                     warn!(target: VREQ, "attribute reconcile: failed to refresh actor {zpr_addr}: {e}");
-                    failed += 1;
+                    failed.insert(zpr_addr);
                 }
             },
             Ok(None) => unresolved += 1,
             Err(e) => {
                 warn!(target: VREQ, "attribute reconcile: failed to load actor {zpr_addr}: {e}");
-                failed += 1;
+                failed.insert(zpr_addr);
             }
         }
     }
