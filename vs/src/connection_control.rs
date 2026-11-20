@@ -302,6 +302,25 @@ fn survives_logout(attr: &Attribute) -> bool {
     attr.get_source() == libeval::attribute::SOURCE_ZPR && !attr.get_key().starts_with("user.")
 }
 
+/// Whether `new` lost an attribute value `old` held (zl-zipline#265), so the
+/// live visas granted on it must be re-checked: true when some attribute of
+/// `old` that does not survive a logout ([survives_logout] is false: anything
+/// the visa service did not stamp itself, and everything in `user.`) is
+/// missing from `new`, or has a value `new` lacks.
+///
+/// Attributes the visa service stamps (`zpr.*`) are ignored: `zpr.session`
+/// changes on every authentication, so comparing it would sweep on every
+/// reconnect. Gains are ignored too; only a loss can revoke a visa. An expired
+/// `old` attribute still counts, which costs at most one extra sweep.
+pub(crate) fn attributes_dropped(old: &Actor, new: &Actor) -> bool {
+    old.attrs_iter()
+        .filter(|a| !survives_logout(a))
+        .any(|a| match new.get_attribute(a.get_key()) {
+            Some(kept) => !kept.value_has_all(a.get_value()),
+            None => true,
+        })
+}
+
 /// Dual-clock OIDC credential expiry (zipline#42): the renewal window
 /// `iat + lifetime` (advances on refresh), capped by the fixed per-login
 /// session ceiling (`auth_time + max_auth_age`; `None` = unbounded). The
@@ -1596,6 +1615,12 @@ impl ConnectionControl {
             let _ = renewed.add_identity_key(0, ATTR_KEY_VS_IDENT);
         }
 
+        // The live visas are re-checked after a namespace change, and after a
+        // renewal that keeps the namespaces but lost an attribute value
+        // (zl-zipline#265), e.g. a claim missing from the renewed token.
+        let needs_visa_sweep =
+            user_change != UserNamespaceChange::Keep || attributes_dropped(&actor, &renewed);
+
         if let Err(e) = asm
             .actor_mgr
             .update_actor(&renewed, &asm.policy_service_names())
@@ -1636,8 +1661,8 @@ impl ConnectionControl {
             {
                 error!(target: CC, "failed to disconnect {zpr_addr} after a failed login rollback: {de}");
             }
-            if user_change != UserNamespaceChange::Keep {
-                warn!(target: CC, "write of {zpr_addr}'s namespace change failed ({e}); queueing an attribute-change reconcile");
+            if needs_visa_sweep {
+                warn!(target: CC, "write of {zpr_addr}'s attribute change failed ({e}); queueing an attribute-change reconcile");
                 if let Err(qe) = asm
                     .event_mgr
                     .record_event(crate::event_mgr::VsEvent::TrustedServiceChange)
@@ -1706,10 +1731,13 @@ impl ConnectionControl {
 
         // Visas follow the namespace change (g27 q4): a logout must revoke
         // visas that needed user attributes, and a login can invalidate visas
-        // through a `never allow` on a user attribute. The attribute-change
-        // sweep re-checks every live visa against the stored actors.
-        // ponytail: full sweep of every live visa per login/logout; logins are
-        // rare. Add a per-actor sweep if visa counts make this slow.
+        // through a `never allow` on a user attribute. So does a renewal that
+        // keeps the login but lost an attribute value, such as a claim missing
+        // from the renewed token (zl-zipline#265). The attribute-change sweep
+        // re-checks every live visa against the stored actors.
+        // ponytail: full sweep of every live visa per login, logout or lossy
+        // renewal; these are rare. Add a per-actor sweep if visa counts make
+        // this slow.
         //
         // The sweep uses the CURRENT snapshot, taken after the actor is
         // persisted, and repeats while the policy generation moves under it:
@@ -1722,13 +1750,16 @@ impl ConnectionControl {
         // than block every node authentication and nonce mint for the sweep's
         // duration (#63 review).
         drop(self_reauth_guard);
-        if user_change != UserNamespaceChange::Keep {
-            Self::sweep_visas_after_namespace_change(&asm).await;
+        if needs_visa_sweep {
+            Self::sweep_visas_after_attribute_change(&asm).await;
         }
         Ok(renewed)
     }
 
-    /// Re-check every live visa after a node's login or logout (#63 review):
+    /// Re-check every live visa after an actor's attributes changed in a way
+    /// that can revoke one: a node's login or logout (#63 review), a node
+    /// authentication that replaced an actor holding attributes the new one
+    /// lacks, or a renewal that lost an attribute value (zl-zipline#265). Runs
     /// up to [config::NAMESPACE_SWEEP_ATTEMPTS] attribute-change sweeps, each
     /// under the policy snapshot current when it starts, until one completes
     /// with no failures under a generation that did not move. If none does,
@@ -1736,7 +1767,22 @@ impl ConnectionControl {
     /// reconcile (refresh, then sweep) rather than dropped: the actor is
     /// already persisted, and a visa whose revocation failed must not stay
     /// usable until it expires.
-    async fn sweep_visas_after_namespace_change(asm: &Arc<Assembly>) {
+    ///
+    /// The sweep runs on its own task, which the caller awaits. The callers are
+    /// RPC handlers (`authenticate`, `reauthorize`), and a cancelled RPC drops
+    /// its future: the actor is already persisted, so a sweep dropped half way
+    /// would leave visas live with nothing to redo it.
+    pub(crate) async fn sweep_visas_after_attribute_change(asm: &Arc<Assembly>) {
+        let task = tokio::spawn(Self::sweep_until_complete(asm.clone()));
+        if let Err(e) = task.await {
+            error!(target: CC, "the visa sweep after an attribute change failed: {e}");
+        }
+    }
+
+    /// The body of [Self::sweep_visas_after_attribute_change]: the bounded
+    /// sweep retries, then the fallback reconcile.
+    async fn sweep_until_complete(asm: Arc<Assembly>) {
+        let asm = &asm;
         for _ in 0..config::NAMESPACE_SWEEP_ATTEMPTS {
             let sweep_snap = asm.policy_mgr.get_current_snapshot();
             let failures = revalidate_visas(asm, &sweep_snap, SweepReason::AttributeChange).await;
@@ -1745,13 +1791,13 @@ impl ConnectionControl {
                 return;
             }
         }
-        warn!(target: CC, "visa sweep after a node login/logout did not complete; queueing an attribute-change reconcile");
+        warn!(target: CC, "visa sweep after an attribute change (login, logout, session replacement or renewal with fewer attributes) did not complete; queueing an attribute-change reconcile");
         if let Err(e) = asm
             .event_mgr
             .record_event(crate::event_mgr::VsEvent::TrustedServiceChange)
             .await
         {
-            error!(target: CC, "failed to queue the attribute-change reconcile after a node login/logout: {e}");
+            error!(target: CC, "failed to queue the attribute-change reconcile after an attribute change: {e}");
         }
     }
 
@@ -2710,7 +2756,7 @@ fn a2a_dh_pubkey_claim(key: &PublicKey) -> Option<Attribute> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// g101: stopping a VSS worker never waits on the worker. Its command queue may
@@ -8276,31 +8322,20 @@ mod tests {
         )
     }
 
-    /// Fixture: an RSA-only Zode -- a node actor authenticated through
-    /// `authenticate_node`, stamped with a VS-API session generation (as
-    /// `VSHandleImpl::stamp_new_session` does) and persisted as a node --
-    /// plus the `files` provider docked to it. Returns the node's address
-    /// and bootstrap key.
-    async fn zode_fixture(cn: &str) -> (Arc<Assembly>, ConnectionControl, IpAddr, PKey<Private>) {
-        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
-        zode_fixture_on(asm, cn).await
-    }
-
-    /// As [zode_fixture], on a caller-built assembly (e.g. one whose fake DB
-    /// and event queue the test holds).
-    async fn zode_fixture_on(
-        asm: Arc<Assembly>,
+    /// The node actor a Zode's VS-API authentication builds: authenticated
+    /// through `authenticate_node` with its bootstrap key (so device-only),
+    /// and stamped with the VS-API session generation `session`, as
+    /// `VSHandleImpl::stamp_new_session` does. Not persisted.
+    pub(crate) async fn authenticate_zode(
+        asm: &Arc<Assembly>,
+        cc: &ConnectionControl,
+        privkey: &PKey<Private>,
         cn: &str,
-    ) -> (Arc<Assembly>, ConnectionControl, IpAddr, PKey<Private>) {
-        let (privkey, pubkey_der) = gen_rsa_test_keypair();
-        asm.policy_mgr
-            .update_policy_from_container_bytes(make_zode_oidc_policy(cn, &pubkey_der))
-            .await
-            .expect("zode policy should install");
-        let cc = make_cc("test-vs");
+        session: &str,
+    ) -> Actor {
         let challenge = b"zode-challenge";
         let timestamp = unix_now();
-        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
+        let sig = sign_node_challenge(privkey, timestamp, cn, challenge);
         let mut actor = cc
             .authenticate_node(
                 asm.clone(),
@@ -8314,8 +8349,34 @@ mod tests {
             .await
             .expect("node authentication should succeed");
         actor
-            .add_attribute(Attribute::builder(key::SESSION).value(ZODE_SESSION))
+            .add_attribute(Attribute::builder(key::SESSION).value(session))
             .unwrap();
+        actor
+    }
+
+    /// Fixture: an RSA-only Zode -- a node actor built by
+    /// [authenticate_zode] and persisted as a node -- plus the `files`
+    /// provider docked to it. Returns the node's address and bootstrap key.
+    pub(crate) async fn zode_fixture(
+        cn: &str,
+    ) -> (Arc<Assembly>, ConnectionControl, IpAddr, PKey<Private>) {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        zode_fixture_on(asm, cn).await
+    }
+
+    /// As [zode_fixture], on a caller-built assembly (e.g. one whose fake DB
+    /// and event queue the test holds).
+    pub(crate) async fn zode_fixture_on(
+        asm: Arc<Assembly>,
+        cn: &str,
+    ) -> (Arc<Assembly>, ConnectionControl, IpAddr, PKey<Private>) {
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_zode_oidc_policy(cn, &pubkey_der))
+            .await
+            .expect("zode policy should install");
+        let cc = make_cc("test-vs");
+        let actor = authenticate_zode(&asm, &cc, &privkey, cn, ZODE_SESSION).await;
         let addr = *actor.get_zpr_addr().expect("node has an address");
         asm.actor_mgr
             .add_node(&actor, false, &Default::default())
@@ -8362,7 +8423,7 @@ mod tests {
     }
 
     /// Log the fixture Zode in (gain) and return the renewed actor.
-    async fn zode_login(
+    pub(crate) async fn zode_login(
         asm: &Arc<Assembly>,
         cc: &ConnectionControl,
         addr: IpAddr,
@@ -8401,7 +8462,7 @@ mod tests {
     }
 
     /// Whether `actor` carries any attribute in the `user.` namespace.
-    fn has_user_attrs(actor: &Actor) -> bool {
+    pub(crate) fn has_user_attrs(actor: &Actor) -> bool {
         actor.attrs_iter().any(|a| a.get_key().starts_with("user."))
     }
 
@@ -8548,7 +8609,7 @@ mod tests {
     }
 
     /// Create a live visa held by the Zode for the Zode -> `files` flow.
-    async fn create_zode_files_visa(asm: &Arc<Assembly>, addr: IpAddr) -> u64 {
+    pub(crate) async fn create_zode_files_visa(asm: &Arc<Assembly>, addr: IpAddr) -> u64 {
         use libeval::eval_result::{Direction, Hit};
         use libeval::route::Route;
         let pdesc =
@@ -8624,6 +8685,133 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// zl-zipline#265, gap 2: a renewal that keeps the login (`Keep`) but whose
+    /// token lost the claim a visa needed (`hd` -> `user.domain`) re-checks the
+    /// live visas, so that visa is marked for revocation.
+    #[tokio::test]
+    async fn test_renewal_with_fewer_claims_revokes_visas() {
+        let cn = "zode-265.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let id = create_zode_files_visa(&asm, addr).await;
+
+        // A silent renewal of the same login session: same `auth_time`, a
+        // newer `iat`, and no `hd` claim.
+        let anchors = asm
+            .policy_mgr
+            .get_current_snapshot()
+            .oidc_service_by_id("google")
+            .unwrap()
+            .session_anchors(&addr.to_string())
+            .expect("the login records its session anchors");
+        let secs = |t: SystemTime| t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let mut claims = renewal_claims(secs(anchors.iat) + 1, secs(anchors.auth_time));
+        claims.as_object_mut().unwrap().remove("hd");
+        let renewed = cc
+            .reauthorize_actor(
+                asm.clone(),
+                addr,
+                vec![
+                    make_fresh_ss_blob(&privkey, cn),
+                    AuthBlob::Oidc(OidcBlob {
+                        issuer: OIDC_ISSUER.to_string(),
+                        id_token: mint_signed(claims),
+                        nonce: String::new(),
+                    }),
+                ],
+                &addr,
+                Some(ZODE_SESSION),
+            )
+            .await
+            .expect("a renewal with fewer claims must succeed");
+        assert!(
+            renewed.get_attribute(key::USER_AUTHORITY).is_some(),
+            "the renewal keeps the login"
+        );
+        assert!(renewed.get_attribute("user.domain").is_none());
+
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&addr)
+                .await
+                .unwrap(),
+            vec![id],
+            "the renewal must revoke the visa that needed the lost claim"
+        );
+    }
+
+    /// A node actor holding `attrs`, for the [attributes_dropped] tests.
+    fn actor_with(attrs: Vec<Attribute>) -> Actor {
+        let mut actor = Actor::new();
+        for attr in attrs {
+            actor.add_attribute(attr).unwrap();
+        }
+        actor
+    }
+
+    /// [attributes_dropped] ignores attributes the visa service stamps: a
+    /// fresh session generation, policy generation or VS identity token is
+    /// not a loss.
+    #[test]
+    fn test_attributes_dropped_ignores_vs_stamped_attributes() {
+        let user = || {
+            AttributeSource::new("google")
+                .builder("user.domain")
+                .value("example.com")
+        };
+        let old = actor_with(vec![
+            Attribute::builder(key::SESSION).value("s1"),
+            Attribute::builder(key::VINST).value("1"),
+            Attribute::builder(ATTR_KEY_VS_IDENT).value("token-1"),
+            user(),
+        ]);
+        let new = actor_with(vec![
+            Attribute::builder(key::SESSION).value("s2"),
+            Attribute::builder(ATTR_KEY_VS_IDENT).value("token-2"),
+            user(),
+        ]);
+        assert!(!attributes_dropped(&old, &new));
+    }
+
+    /// [attributes_dropped] is true when a `user.*` attribute is gone, even
+    /// one the visa service stamped (it does not survive a logout either).
+    #[test]
+    fn test_attributes_dropped_user_attribute_gone() {
+        let old = actor_with(vec![
+            Attribute::builder(key::USER_AUTHORITY).value("google"),
+            Attribute::builder(key::SESSION).value("s1"),
+        ]);
+        let new = actor_with(vec![Attribute::builder(key::SESSION).value("s1")]);
+        assert!(attributes_dropped(&old, &new));
+    }
+
+    /// [attributes_dropped] is true when a trusted-service attribute loses one
+    /// of several values.
+    #[test]
+    fn test_attributes_dropped_value_lost() {
+        let hr = AttributeSource::new("hr");
+        let old = actor_with(vec![
+            hr.builder("groups")
+                .values(vec!["engineering".to_string(), "admin".to_string()]),
+        ]);
+        let new = actor_with(vec![hr.builder("groups").value("engineering")]);
+        assert!(attributes_dropped(&old, &new));
+    }
+
+    /// [attributes_dropped] ignores gains: a new attribute or a new value is
+    /// not a loss.
+    #[test]
+    fn test_attributes_dropped_ignores_gains() {
+        let hr = AttributeSource::new("hr");
+        let old = actor_with(vec![hr.builder("groups").value("engineering")]);
+        let new = actor_with(vec![
+            hr.builder("groups")
+                .values(vec!["engineering".to_string(), "admin".to_string()]),
+            hr.builder("user.email").value("jane@example.com"),
+        ]);
+        assert!(!attributes_dropped(&old, &new));
     }
 
     /// Test 6: a valid nonce with a bad token signature is rejected with the
