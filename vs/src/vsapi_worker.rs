@@ -91,8 +91,30 @@ impl AuthenticateUndo {
             }
         }
         if let Some(addr) = self.actor_mgr_add_node {
+            // Removing a committed node leaves its visas (a reconnect keeps the old
+            // ones) to no sweep: the sweep skips visas of an actor it cannot resolve,
+            // and a pass may already have run. Record an obligation naming the node
+            // first, held across the removal (innermost, after the caller's topology
+            // guard), so the reconciler revokes the vanished actor's visas (g234 q6,
+            // zl-zipline#289). A failed record is logged and the removal goes ahead:
+            // keeping a half-authenticated node would be worse.
+            let obligation = match asm
+                .revocations
+                .begin(ObligationKind::Attributes, vec![addr])
+                .await
+            {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    error!(target: API, "failed to record the revocation obligation for undone node {addr}: {e}");
+                    None
+                }
+            };
             let _ = asm.actor_mgr.remove_node(&addr).await;
             let _ = asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await;
+            if obligation.is_some() {
+                drop(obligation);
+                asm.event_mgr.kick_reconcile();
+            }
         }
         if let Some(addr) = self.taken_zpr_addr {
             let _ = asm.net_mgr.release_zpr_addr(addr);
@@ -3388,6 +3410,36 @@ mod tests {
                 result.is_none(),
                 "node should have been removed from actor_mgr by undo"
             );
+        }
+
+        /// Undoing a committed node add removes the actor, so a reconciler pass
+        /// that already ran cannot have judged its visas (a reconnect keeps the
+        /// node's old ones). The undo records an obligation naming the node
+        /// before it removes it; the pass then revokes the visas of the vanished
+        /// actor (g234 q6, zl-zipline#289).
+        #[tokio::test]
+        async fn test_removing_the_node_records_an_obligation() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let addr: IpAddr = "fd5a:5052:90de:1::4".parse().unwrap();
+            let actor = make_node_actor_defexp(
+                "fd5a:5052:90de:1::4",
+                "test-node-4",
+                "[fd5a:5052::104]:1234",
+            );
+            asm.actor_mgr
+                .add_node(&actor, false, &Default::default())
+                .await
+                .unwrap();
+            assert!(asm.revocations.start_pass().await.unwrap().is_empty());
+
+            let mut undo = AuthenticateUndo::default();
+            undo.added_node_to_actor_mgr(&addr);
+            undo.undo(&asm, None).await;
+
+            let pending = asm.revocations.start_pass().await.unwrap();
+            assert_eq!(pending.len(), 1, "the undo must record one obligation");
+            assert_eq!(pending[0].1.kind, crate::db::ObligationKind::Attributes);
+            assert_eq!(pending[0].1.actors, vec![addr]);
         }
 
         #[tokio::test]
