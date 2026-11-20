@@ -38,20 +38,23 @@ impl ReauthRepo {
     }
 
     /// Record the obligation `(vinst, deadline)`. An existing entry for the
-    /// same vinst is overwritten — the newest deadline for a generation wins,
-    /// which only happens if the same vinst is somehow installed twice.
+    /// same vinst is kept: the first deadline for a generation wins, so a
+    /// reconciler pass that runs again for the same install (its revocation
+    /// obligation is retried, zl-zipline#289) cannot postpone enforcement. The
+    /// read-then-write is not atomic; it needs no lock because the only writer
+    /// is the policy pass, which runs on the event worker, one pass at a time.
     pub async fn add_obligation(&self, ob: &ReauthObligation) -> Result<(), StoreError> {
         let deadline_secs = ob
             .deadline
             .duration_since(UNIX_EPOCH)
             .map_err(|_| StoreError::InvalidData("reauth deadline predates the epoch".into()))?
             .as_secs();
+        let field = ob.vinst.to_string();
+        if self.db.hget(KEY_REAUTH_PENDING, &field).await?.is_some() {
+            return Ok(());
+        }
         self.db
-            .hset(
-                KEY_REAUTH_PENDING,
-                &ob.vinst.to_string(),
-                &deadline_secs.to_string(),
-            )
+            .hset(KEY_REAUTH_PENDING, &field, &deadline_secs.to_string())
             .await?;
         Ok(())
     }
@@ -96,6 +99,34 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(secs_from_epoch)
     }
 
+    /// The first deadline recorded for a generation wins (VS#79 Copilot r2): a
+    /// reconciler pass that runs again for the same install (its revocation
+    /// obligation could not be deleted, or a later step failed) must not push the
+    /// re-authentication deadline out on every retry.
+    #[tokio::test]
+    async fn test_first_deadline_wins() {
+        let repo = ReauthRepo::new(Arc::new(FakeDb::new()));
+        repo.add_obligation(&ReauthObligation {
+            vinst: 7,
+            deadline: t(1_000),
+        })
+        .await
+        .unwrap();
+        repo.add_obligation(&ReauthObligation {
+            vinst: 7,
+            deadline: t(2_000),
+        })
+        .await
+        .unwrap();
+        let listed = repo.list_obligations().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].deadline,
+            t(1_000),
+            "the retry must keep the first deadline"
+        );
+    }
+
     /// Obligations round-trip through the store: what was added is listed
     /// back with second precision, and removal prunes exactly one entry.
     #[tokio::test]
@@ -125,30 +156,5 @@ mod tests {
         // Removing an absent entry is a no-op.
         repo.remove_obligation(99).await.unwrap();
         assert_eq!(repo.list_obligations().await.unwrap(), vec![ob2]);
-    }
-
-    /// A second add for the same vinst overwrites the deadline.
-    #[tokio::test]
-    async fn test_add_same_vinst_overwrites() {
-        let repo = ReauthRepo::new(Arc::new(FakeDb::new()));
-        repo.add_obligation(&ReauthObligation {
-            vinst: 5,
-            deadline: t(100),
-        })
-        .await
-        .unwrap();
-        repo.add_obligation(&ReauthObligation {
-            vinst: 5,
-            deadline: t(200),
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            repo.list_obligations().await.unwrap(),
-            vec![ReauthObligation {
-                vinst: 5,
-                deadline: t(200),
-            }]
-        );
     }
 }

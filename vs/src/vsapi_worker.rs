@@ -767,6 +767,7 @@ async fn add_node_serialized(
         Some(addr) => asm.actor_mgr.get_actor_by_zpr_addr(addr).await?,
         None => None,
     };
+    let stored_exists = stored.is_some();
     let attrs_dropped = stored.is_some_and(|stored| attributes_dropped(&stored, &node_actor));
     if !reconnect && let Some(addr) = node_actor.get_zpr_addr() {
         reset_node_state(asm, ops, addr).await?;
@@ -775,9 +776,15 @@ async fn add_node_serialized(
     // holds the guard across the write only -- innermost, inside the topology guard
     // and the node commit lock (zl-zipline#289). The obligation names the node: if
     // the write fails after cleaning the actor up, the reconciler revokes its visas
-    // although the sweep can no longer judge them.
+    // although the sweep can no longer judge them. A Reset that replaces a stored
+    // actor records one too, drop or not: its replacing write deletes the stored
+    // actor first, so a failed one leaves the node's visas with no actor to judge
+    // them by (VS#79 review).
+    // ponytail: a Reset of a known node costs one full sweep; record only once the
+    // write has failed if Resets ever get frequent enough for that to matter.
+    let replaces_stored = !reconnect && stored_exists;
     let obligation = match node_actor.get_zpr_addr() {
-        Some(addr) if attrs_dropped => Some(
+        Some(addr) if attrs_dropped || replaces_stored => Some(
             asm.revocations
                 .begin(ObligationKind::Attributes, vec![*addr])
                 .await?,
@@ -6030,6 +6037,43 @@ mod tests {
                     .await
                     .unwrap(),
                 vec![id]
+            );
+        }
+
+        /// zl-zipline#289 (VS#79 Copilot r2): a `Reset` whose replacing write fails
+        /// deletes the stored actor even when it drops no attribute, and the sweep
+        /// skips visas of an actor it cannot resolve. So a Reset that replaces a
+        /// stored actor records an obligation naming the node before its write, and
+        /// the reconciler revokes the vanished actor's visas.
+        #[tokio::test]
+        async fn test_failed_reset_without_a_drop_records_an_obligation() {
+            use crate::connection_control::tests::{create_zode_files_visa, zode_fixture_on};
+            let (asm, _event_rx, db) =
+                crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+            let cn = "zode-289r.zpr";
+            let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+            create_zode_files_visa(&asm, addr).await;
+            crate::event_mgr::reconcile_obligations(&asm).await;
+
+            let fresh = reauthenticate_zode(&asm, &cc, &privkey, cn, addr).await;
+            db.set_hset_fault(crate::db::FaultMode::Reject); // the replacing write fails
+            let ops = asm.topo_mgr.ops().await;
+            let result = add_node_serialized(&asm, &ops, &fresh, false).await;
+            drop(ops);
+            db.set_hset_fault(crate::db::FaultMode::None);
+            assert!(result.is_err(), "the injected fault fails the write");
+            assert!(
+                asm.actor_mgr
+                    .get_actor_by_zpr_addr(&addr)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the failed replacing write deleted the stored actor"
+            );
+            assert_eq!(
+                attribute_obligation_actors(&asm).await,
+                vec![addr],
+                "the Reset must leave an obligation naming the vanished node"
             );
         }
 

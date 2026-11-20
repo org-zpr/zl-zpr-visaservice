@@ -1135,8 +1135,10 @@ mod tests {
         } else {
             SystemTime::now() - Duration::from_secs((-offset_secs) as u64)
         };
-        ReauthRepo::new(asm.state_db.clone())
-            .add_obligation(&ReauthObligation { vinst, deadline })
+        // Replace any obligation for `vinst`: add keeps the first deadline.
+        let repo = ReauthRepo::new(asm.state_db.clone());
+        repo.remove_obligation(vinst).await.unwrap();
+        repo.add_obligation(&ReauthObligation { vinst, deadline })
             .await
             .unwrap();
     }
