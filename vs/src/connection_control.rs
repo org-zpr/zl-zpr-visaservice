@@ -1732,9 +1732,8 @@ impl ConnectionControl {
         // Visas follow the namespace change (g27 q4): a logout must revoke
         // visas that needed user attributes, and a login can invalidate visas
         // through a `never allow` on a user attribute. So does a renewal that
-        // keeps the login but lost an attribute value -- a claim missing from
-        // the renewed token, or a trusted-service attribute missing at
-        // re-enrichment (zl-zipline#265). The attribute-change sweep
+        // keeps the login but lost an attribute value, such as a claim missing
+        // from the renewed token (zl-zipline#265). The attribute-change sweep
         // re-checks every live visa against the stored actors.
         // ponytail: full sweep of every live visa per login, logout or lossy
         // renewal; these are rare. Add a per-actor sweep if visa counts make
@@ -8352,7 +8351,7 @@ pub(crate) mod tests {
 
     /// As [zode_fixture], on a caller-built assembly (e.g. one whose fake DB
     /// and event queue the test holds).
-    async fn zode_fixture_on(
+    pub(crate) async fn zode_fixture_on(
         asm: Arc<Assembly>,
         cn: &str,
     ) -> (Arc<Assembly>, ConnectionControl, IpAddr, PKey<Private>) {
