@@ -23,7 +23,7 @@ use zpr::write_to::WriteTo;
 use crate::assembly::Assembly;
 use crate::config;
 use crate::connection_control::{
-    CommitRecheck, ConnectionControl, actor_prepared_vinst, policy_moved_error,
+    CommitRecheck, ConnectionControl, actor_prepared_vinst, attributes_dropped, policy_moved_error,
     recheck_before_commit,
 };
 use crate::counters::CounterType;
@@ -699,6 +699,14 @@ async fn mint_login_nonce_for_handle(
 /// lock, so a refused authentication never leaves the old node with its
 /// adapters, visas and topology destroyed (#63 review).
 ///
+/// Returns whether the write dropped attributes the stored actor held
+/// ([attributes_dropped], zl-zipline#265): the fresh node actor is device-only,
+/// so a session replacement drops a logged-in user's login, and its visas must
+/// be re-checked. A first connect (no stored actor) drops nothing. The caller
+/// runs that sweep itself, once it has released the topology guard: the sweep
+/// re-checks every live visa and must not hold up the fleet's topology
+/// operations or node authentications.
+///
 /// The caller holds the topology guard (`ops`, #224's [TopoOps]); this takes
 /// the node commit lock inside it. Lock order: topology lock, then node commit
 /// lock (see `PolicyMgr::node_commit_lock`).
@@ -707,7 +715,7 @@ async fn add_node_serialized(
     ops: &TopoOps<'_>,
     node_actor: &Actor,
     reconnect: bool,
-) -> Result<(), ServiceError> {
+) -> Result<bool, ServiceError> {
     let _guard = asm.policy_mgr.node_commit_lock.lock().await;
     if let Some(addr) = node_actor.get_zpr_addr()
         && recheck_before_commit(asm, addr, None, actor_prepared_vinst(node_actor)).await?
@@ -729,12 +737,19 @@ async fn add_node_serialized(
             }
         }
     }
+    // Read the actor this write replaces before a Reset tears the node down.
+    let stored = match node_actor.get_zpr_addr() {
+        Some(addr) => asm.actor_mgr.get_actor_by_zpr_addr(addr).await?,
+        None => None,
+    };
+    let dropped = stored.is_some_and(|stored| attributes_dropped(&stored, &node_actor));
     if !reconnect && let Some(addr) = node_actor.get_zpr_addr() {
         reset_node_state(asm, ops, addr).await?;
     }
     asm.actor_mgr
         .add_node(&node_actor, reconnect, &asm.policy_service_names())
-        .await
+        .await?;
+    Ok(dropped)
 }
 
 /// A VS-API session of `node` has just started (`authenticate`, or `open` for a
@@ -1679,19 +1694,24 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         // add_node_serialized, under the topology guard held here and the node
         // commit lock it takes, after the generation recheck (#63 review).
         // The add_node call will clean up after ifself if it fails.
-        if let Err(e) = add_node_serialized(&self.asm, &ops, &node_actor, self.reconnect).await {
-            undo.undo(&self.asm, Some(&ops)).await;
-            if let ServiceError::ApiResponse(api) = e {
-                info!(target: API, "authentication of node {:?} refused at commit: {}", &node_cn, api.message);
-                return self.ok_with_authenticate_error(results, api.code.into(), &api.message);
+        let attrs_dropped = match add_node_serialized(&self.asm, &ops, &node_actor, self.reconnect)
+            .await
+        {
+            Ok(dropped) => dropped,
+            Err(e) => {
+                undo.undo(&self.asm, Some(&ops)).await;
+                if let ServiceError::ApiResponse(api) = e {
+                    info!(target: API, "authentication of node {:?} refused at commit: {}", &node_cn, api.message);
+                    return self.ok_with_authenticate_error(results, api.code.into(), &api.message);
+                }
+                error!(target: API, "failed to add authenticated node {:?} to actor db: {}", &node_cn, e);
+                return self.ok_with_authenticate_error(
+                    results,
+                    vsapi::ErrorCode::Internal,
+                    "state update failed",
+                );
             }
-            error!(target: API, "failed to add authenticated node {:?} to actor db: {}", &node_cn, e);
-            return self.ok_with_authenticate_error(
-                results,
-                vsapi::ErrorCode::Internal,
-                "state update failed",
-            );
-        }
+        };
         undo.added_node_to_actor_mgr(&node_zpr_addr);
 
         // TODO: This is a hack: the visa service "actor" needs to know what node it's adapter is docked to.
@@ -1747,6 +1767,16 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
             .topo_mgr
             .clear_failed_pairs_for(&ops, &node_zpr_addr);
         drop(ops);
+
+        // The session replaced a stored actor that held attributes this one
+        // lacks -- typically a logged-in user's login, which a fresh device-only
+        // authentication drops -- so re-check the live visas granted on them
+        // (zl-zipline#265). Outside the topology guard and the node commit lock,
+        // like the logout sweep, and before every later fallible step: an undo
+        // removes the actor, after which a sweep would skip its visas.
+        if attrs_dropped {
+            ConnectionControl::sweep_visas_after_attribute_change(&self.asm).await;
+        }
 
         let evt = VsEvent::ActorJoins(node_zpr_addr);
         if let Err(e) = self.asm.event_mgr.record_event(evt).await {
@@ -5790,6 +5820,115 @@ mod tests {
             assert_eq!(
                 crate::connection_control::substrate_claim(&stored),
                 Some(moved)
+            );
+        }
+
+        /// The fresh, device-only node actor the fixture Zode at `addr` gets when it
+        /// authenticates again, in a new VS-API session. The fixture policy does not
+        /// pin the Zode's address, so its second authentication draws a pool address;
+        /// a deployed Zode's address is pinned and comes back unchanged, so put it
+        /// back.
+        async fn reauthenticate_zode(
+            asm: &Arc<Assembly>,
+            cc: &ConnectionControl,
+            privkey: &openssl::pkey::PKey<openssl::pkey::Private>,
+            cn: &str,
+            addr: IpAddr,
+        ) -> Actor {
+            let mut fresh = crate::connection_control::tests::authenticate_zode(
+                asm,
+                cc,
+                privkey,
+                cn,
+                "zode-session-2",
+            )
+            .await;
+            fresh
+                .add_attribute(Attribute::builder(key::ZPR_ADDR).value(addr.to_string()))
+                .unwrap();
+            fresh
+        }
+
+        /// zl-zipline#265, gap 1: a logged-in Zode's session is replaced by a fresh,
+        /// device-only authentication -- a reconnect (`reconnect`) or a `Reset` (a VS
+        /// restart, a J10 rejoin). The write reports that it dropped attributes, the
+        /// stored actor loses the login, and the sweep `authenticate` then runs
+        /// revokes the visa that needed the login. A `Reset` already tears the Zode's
+        /// own visa state down; the sweep is what revokes such a visa at the other
+        /// nodes on its route.
+        async fn session_replacement_drops_the_login(reconnect: bool) {
+            use crate::connection_control::tests::{
+                create_zode_files_visa, has_user_attrs, zode_fixture, zode_login,
+            };
+            let cn = "zode-265.zpr";
+            let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+            zode_login(&asm, &cc, addr, &privkey, cn).await;
+            let id = create_zode_files_visa(&asm, addr).await;
+
+            let fresh = reauthenticate_zode(&asm, &cc, &privkey, cn, addr).await;
+            let ops = asm.topo_mgr.ops().await;
+            let dropped = add_node_serialized(&asm, &ops, &fresh, reconnect)
+                .await
+                .unwrap();
+            drop(ops);
+            if dropped {
+                ConnectionControl::sweep_visas_after_attribute_change(&asm).await;
+            }
+
+            assert!(dropped, "replacing the login drops attributes");
+            let stored = asm
+                .actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!has_user_attrs(&stored), "the fresh actor has no login");
+            if reconnect {
+                assert_eq!(
+                    asm.visa_mgr
+                        .get_pending_revoke_visa_ids_for_node(&addr)
+                        .await
+                        .unwrap(),
+                    vec![id],
+                    "the sweep must revoke the visa that needed the login"
+                );
+            } else {
+                assert!(!asm.visa_mgr.visa_has_node_refs(id).await);
+            }
+        }
+
+        #[tokio::test]
+        async fn test_session_replacement_revokes_user_visas_on_reconnect() {
+            session_replacement_drops_the_login(true).await;
+        }
+
+        #[tokio::test]
+        async fn test_session_replacement_revokes_user_visas_on_reset() {
+            session_replacement_drops_the_login(false).await;
+        }
+
+        /// zl-zipline#265: a Zode that never logged in authenticates again. The write
+        /// drops nothing, so no sweep runs: a visa policy would now deny (it needs the
+        /// login) is left alone.
+        #[tokio::test]
+        async fn test_reauthentication_without_a_drop_runs_no_sweep() {
+            use crate::connection_control::tests::{create_zode_files_visa, zode_fixture};
+            let cn = "zode-265b.zpr";
+            let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+            create_zode_files_visa(&asm, addr).await;
+
+            let fresh = reauthenticate_zode(&asm, &cc, &privkey, cn, addr).await;
+            let ops = asm.topo_mgr.ops().await;
+            let dropped = add_node_serialized(&asm, &ops, &fresh, true).await.unwrap();
+            drop(ops);
+
+            assert!(!dropped, "a device-only actor replacing a device-only one");
+            assert!(
+                asm.visa_mgr
+                    .get_pending_revoke_visa_ids_for_node(&addr)
+                    .await
+                    .unwrap()
+                    .is_empty()
             );
         }
 
