@@ -211,12 +211,8 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
     // The revocation generation, read before anything the decision rests on (actors,
     // policy, docking): the commit check after the store compares against it
     // (zl-zipline#248, see VisaMgr::check_commit_generation).
-    let generation = asm.revocations.generation();
+    let commit_generation = asm.revocations.generation();
     let (source_actor, dest_actor) = get_actors(&asm, job).await?;
-    // A missing actor is fabricated below for an AAA flow (or the request is denied).
-    // Revocation passes do not re-evaluate AAA visas (`VisaMgr::recheck_visa_allowed`
-    // cannot resolve the fabricated actor), so neither does the commit check.
-    let commit_generation = (source_actor.is_some() && dest_actor.is_some()).then_some(generation);
 
     let (mut source_actor, mut dest_actor) =
         match resolve_actors_or_deny(&asm, job, source_actor, dest_actor).await {
@@ -409,7 +405,7 @@ fn fabricate_aaa_actor(anon_addr: &IpAddr, expiration: SystemTime) -> Actor {
 async fn visa_from_allow(
     asm: Arc<Assembly>,
     job: &VisaRequestJob,
-    commit_generation: Option<u64>,
+    commit_generation: u64,
     hits: &[Hit],
     policy: &Policy,
     default_route: Option<Route>,
@@ -839,6 +835,8 @@ pub(crate) mod race_gate {
         AfterActorWrite,
         /// A disconnect, between recording its obligation and removing the actor.
         BeforeActorRemoval,
+        /// `VisaMgr::get_pending_visas_for_node`, after the pending rows are read.
+        AfterPendingSnapshot,
     }
 
     struct Gate {
@@ -1021,7 +1019,7 @@ mod tests {
         let result = visa_from_allow(
             asm.clone(),
             &job,
-            Some(asm.revocations.generation()),
+            asm.revocations.generation(),
             &hits,
             &policy,
             Some(route),
@@ -1073,7 +1071,7 @@ mod tests {
         let result = visa_from_allow(
             asm.clone(),
             &job,
-            Some(asm.revocations.generation()),
+            asm.revocations.generation(),
             &hits,
             &policy,
             Some(route),

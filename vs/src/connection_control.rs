@@ -8653,6 +8653,155 @@ pub(crate) mod tests {
         assert!(missed.is_empty(), "revocations missed: {missed:#?}");
     }
 
+    /// Request the Zode's visa for `files` (TCP 8000) through the request path.
+    async fn request_files(
+        asm: &Arc<Assembly>,
+        addr: IpAddr,
+    ) -> Result<crate::visareq_worker::VisaDecision, ServiceError> {
+        let pdesc =
+            zpr::vsapi_types::PacketDesc::new_tcp(&addr.to_string(), FILES_ADDR, 40000, FILES_PORT)
+                .unwrap();
+        crate::visareq_worker::process_visa_request_for_test(asm.clone(), addr, pdesc).await
+    }
+
+    /// Record an attribute obligation that changes nothing, as a trusted-service change
+    /// whose new attributes the request path cannot see yet would.
+    async fn record_attribute_obligation(asm: &Assembly) {
+        drop(
+            asm.revocations
+                .begin(crate::db::Obligation::attributes(vec![]))
+                .await
+                .unwrap(),
+        );
+    }
+
+    /// The visas pending install or installed on `addr`.
+    async fn live_visas(asm: &Assembly, addr: &IpAddr) -> Vec<u64> {
+        let mut live = asm
+            .visa_mgr
+            .get_pending_visa_ids_for_node(addr)
+            .await
+            .unwrap();
+        live.extend(
+            asm.visa_mgr
+                .get_installed_visa_ids_for_node(addr)
+                .await
+                .unwrap(),
+        );
+        live
+    }
+
+    /// zl-zipline#248 (codex pass 2, P1, operator decision "refuse on overlap"): a
+    /// reconciler pass that ran while a visa request was in flight refuses the request,
+    /// even if the visa still looks allowed by the state the visa service holds -- a
+    /// trusted-service change's new attributes may not be stored yet -- and leaves no
+    /// copy live. The node re-requests.
+    #[tokio::test]
+    async fn test_a_pass_overlapping_a_request_refuses_it() {
+        use crate::visareq_worker::race_gate;
+        let cn = "zode-248-overlap.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        crate::event_mgr::reconcile_obligations(&asm).await;
+
+        let (parked, resume) = race_gate::arm(addr, race_gate::Point::AfterEval);
+        let request = tokio::spawn({
+            let asm = asm.clone();
+            async move { request_files(&asm, addr).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the request must reach the gate");
+        race_gate::disarm(&addr);
+        record_attribute_obligation(&asm).await;
+        crate::event_mgr::reconcile_obligations(&asm).await;
+        resume.notify_one();
+
+        let outcome = request.await.unwrap();
+        assert!(outcome.is_err(), "the request must be refused");
+        assert!(live_visas(&asm, &addr).await.is_empty(), "no copy is live");
+        assert!(
+            matches!(
+                request_files(&asm, addr).await,
+                Ok(crate::visareq_worker::VisaDecision::Allow(..))
+            ),
+            "the re-request is allowed"
+        );
+    }
+
+    /// zl-zipline#248 (codex pass 2, P1): a visa request that starts while a reconciler
+    /// pass is in flight -- it may read the state before the pass has restamped it, and
+    /// be stored after the pass has listed the visas -- is refused.
+    #[tokio::test]
+    async fn test_a_request_starting_during_a_pass_is_refused() {
+        let cn = "zode-248-in-pass.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        crate::event_mgr::reconcile_obligations(&asm).await;
+
+        record_attribute_obligation(&asm).await;
+        let pass = asm.revocations.start_pass().await.unwrap();
+        let outcome = request_files(&asm, addr).await;
+        drop(pass);
+
+        assert!(outcome.is_err(), "the request must be refused");
+        assert!(live_visas(&asm, &addr).await.is_empty(), "no copy is live");
+    }
+
+    /// zl-zipline#248 (codex pass 2, P1, operator decision "startup full sweep"): a visa
+    /// stored before a restart may have lost its commit hold -- the visa service crashed
+    /// between its store and its commit check -- after a change that should revoke it was
+    /// satisfied. The startup sweep re-checks every live visa, so the first pass after
+    /// start revokes it.
+    #[tokio::test]
+    async fn test_startup_sweep_revokes_a_visa_the_state_no_longer_allows() {
+        let cn = "zode-248-startup.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        crate::event_mgr::reconcile_obligations(&asm).await;
+        assert!(matches!(
+            request_files(&asm, addr).await,
+            Ok(crate::visareq_worker::VisaDecision::Allow(..))
+        ));
+        let ids = live_visas(&asm, &addr).await;
+        assert_eq!(ids.len(), 1, "precondition: the visa is live");
+
+        // The Zode's user attributes are gone with no obligation left for the change, as
+        // when its pass ran before the visa was stored and the visa's commit hold was
+        // lost to a crash.
+        let mut node = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        let user_keys: Vec<String> = node
+            .attrs_iter()
+            .map(|a| a.get_key().to_string())
+            .filter(|k| k.starts_with("user."))
+            .collect();
+        for key in user_keys {
+            node.remove_attribute(&key);
+        }
+        asm.actor_mgr
+            .update_actor(&node, &Default::default())
+            .await
+            .unwrap();
+        crate::event_mgr::reconcile_obligations(&asm).await;
+        assert_eq!(
+            live_visas(&asm, &addr).await,
+            ids,
+            "nothing else revokes it"
+        );
+
+        crate::event_mgr::record_startup_sweep(&asm).await.unwrap();
+        crate::event_mgr::reconcile_obligations(&asm).await;
+        assert!(
+            live_visas(&asm, &addr).await.is_empty(),
+            "the startup sweep revokes it"
+        );
+    }
+
     /// zl-zipline#248 (codex P1): a stored visa is withheld from VSS delivery and from
     /// the fetch by ID until its request's commit check has passed, so a copy the check
     /// would refuse is never pushed meanwhile. Once the request completes, its copies are
@@ -8883,7 +9032,7 @@ pub(crate) mod tests {
                 0,
                 0,
                 SystemTime::now() + Duration::from_secs(3600),
-                None,
+                asm.revocations.generation(),
             )
             .await
             .expect("visa must be created")

@@ -1979,7 +1979,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2163,7 +2163,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2179,7 +2179,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2195,7 +2195,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2522,7 +2522,7 @@ mod tests {
                 policy_version,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2579,7 +2579,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2634,7 +2634,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -3096,7 +3096,8 @@ mod tests {
         assert_eq!(
             pending.len(),
             1,
-            "one obligation must be pending: {pending:?}"
+            "one obligation must be pending: {:?}",
+            *pending
         );
         assert_eq!(pending[0].1.kind, crate::db::ObligationKind::Attributes);
         match event_rx.try_recv() {

@@ -411,10 +411,9 @@ impl VisaMgr {
     /// Once stored, the visa passes two commit checks before it is returned: the route
     /// check ([VisaMgr::revoke_if_route_down]) and, given the revocation generation the
     /// request read before it read its actors and policy (`commit_generation`), the check
-    /// against concurrent revocation ([VisaMgr::check_commit_generation]). `None` skips the
-    /// latter: for visas no revocation pass re-evaluates either (AAA flows), and for test
-    /// fixtures. Until both have passed, the visa is withheld from delivery
-    /// ([VisaMgr::committing]); one refused is revoked and an error returned.
+    /// against concurrent revocation ([VisaMgr::check_commit_generation]). Until both have
+    /// passed, the visa is withheld from delivery ([VisaMgr::committing]); one refused is
+    /// revoked and an error returned.
     ///
     /// This returns a FULL visa.
     pub async fn create_visa(
@@ -428,7 +427,7 @@ impl VisaMgr {
         policy_version: u64,
         vinst: u64,
         expiration_time: SystemTime,
-        commit_generation: Option<u64>,
+        commit_generation: u64,
     ) -> Result<VisaWithMetadata, ServiceError> {
         let path = path_for_flow(asm, &pdesc.five_tuple.source_addr, route).await?;
         let vwmd = self
@@ -472,8 +471,10 @@ impl VisaMgr {
                 egress,
             )
             .await;
-        if let (Ok(()), Some(generation)) = (&checked, commit_generation) {
-            checked = self.check_commit_generation(asm, &vwmd, generation).await;
+        if checked.is_ok() {
+            checked = self
+                .check_commit_generation(asm, vwmd.visa.issuer_id, commit_generation)
+                .await;
         }
         // Checked: deliverable if it passed, revoked (or quarantined) if not.
         self.committing.lock().unwrap().remove(&vwmd.visa.issuer_id);
@@ -529,40 +530,31 @@ impl VisaMgr {
             .await)
     }
 
-    /// Commit check against concurrent revocation (zl-zipline#248), for a visa
-    /// [VisaMgr::create_visa] just stored from a request that read the revocation
+    /// Commit check against concurrent revocation (zl-zipline#248), for visa `visa_id`
+    /// that [VisaMgr::create_visa] just stored from a request that read the revocation
     /// generation `generation` ([crate::revocation::RevocationLedger::generation]) before
     /// it read its actors and policy.
     ///
-    /// A reconciler pass bumps the generation after the write behind each obligation it
-    /// lists has committed, and before it lists the visas. So if the generation has not
-    /// moved, any pass for a write the request did not see lists the visas after this
-    /// one was stored, and revokes it if it must. If it moved, that pass may have listed
-    /// the visas before this one was stored: the visa is re-checked here against the
-    /// current state with [VisaMgr::recheck_visa_allowed], exactly as the pass would.
-    /// Anything but still allowed on the same route (a deny, a moved route, an actor
-    /// that no longer resolves, an error) revokes it and refuses the request.
+    /// If no reconciler pass overlapped the request
+    /// ([crate::revocation::RevocationLedger::no_pass_overlapped]), every pass for a write
+    /// the request did not see lists the visas after this one was stored, and revokes it
+    /// if it must. Otherwise a pass may have read the state or listed the visas before
+    /// this one was stored: the visa is revoked and the request refused, whatever the
+    /// state now says -- the state the visa service holds may not show the change yet
+    /// (a trusted service's new attributes are refreshed only for actors behind live
+    /// visas). The node re-requests.
     async fn check_commit_generation(
         &self,
         asm: &Assembly,
-        vwmd: &VisaWithMetadata,
+        visa_id: u64,
         generation: u64,
     ) -> Result<(), ServiceError> {
-        if asm.revocations.generation() == generation {
+        if asm.revocations.no_pass_overlapped(generation) {
             return Ok(());
         }
-        let visa_id = vwmd.visa.issuer_id;
-        let psnap = asm.policy_mgr.get_current_snapshot();
-        let why = match self.recheck_visa_allowed(asm, &vwmd.metadata, &psnap).await {
-            Ok(VisaRecheck::AllowSameRoute) => return Ok(()),
-            Ok(recheck) => format!(
-                "a revocation pass ran while it was issued and it no longer holds ({recheck:?})"
-            ),
-            Err(e) => {
-                format!("a revocation pass ran while it was issued and rechecking it failed ({e})")
-            }
-        };
-        Err(self.refuse_at_commit(visa_id, &why).await)
+        Err(self
+            .refuse_at_commit(visa_id, "a revocation pass ran while it was issued")
+            .await)
     }
 
     /// Revoke a just-stored visa that must not be handed out, and return the error its
@@ -710,11 +702,27 @@ impl VisaMgr {
         node_addr: &IpAddr,
     ) -> Result<Vec<Visa>, ServiceError> {
         self.retry_quarantined_revocations().await;
-        let visas = self
+        let snapshot = self
             .repo
-            .get_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)?
+            .get_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)?;
+        // Test seam (zl-zipline#248): a commit check finishing after the rows were read.
+        // Compiled out of release.
+        #[cfg(test)]
+        crate::visareq_worker::race_gate::pause_if_gated(
+            node_addr,
+            crate::visareq_worker::race_gate::Point::AfterPendingSnapshot,
+        )
+        .await;
+        // The hold first, then the copy's state read again: a commit check writes its
+        // revoke before it clears the hold, so a copy refused after the rows were read is
+        // either still held or no longer `PendingInstall` here.
+        let visas = snapshot
             .into_iter()
-            .filter(|v| !self.is_withheld(v.issuer_id))
+            .filter(|v| {
+                !self.is_withheld(v.issuer_id)
+                    && self.repo.get_node_visa_state(v.issuer_id, node_addr)
+                        == Some(db::NodeVisaState::PendingInstall)
+            })
             .collect();
         Ok(visas)
     }
@@ -761,12 +769,15 @@ impl VisaMgr {
     /// `PendingInstall` or `Installed`, and not withheld ([VisaMgr::is_withheld]). For visas prepared before
     /// a caller took the topology lock (`register_vss`): one revoked, acknowledged or
     /// quarantined meanwhile must not be granted again.
+    ///
+    /// The hold is checked before the state is read (see
+    /// [VisaMgr::get_pending_visas_for_node]).
     pub fn still_grantable(&self, visa_id: u64, node_addr: &IpAddr) -> bool {
-        let staged = matches!(
-            self.repo.get_node_visa_state(visa_id, node_addr),
-            Some(db::NodeVisaState::PendingInstall | db::NodeVisaState::Installed)
-        );
-        staged && !self.is_withheld(visa_id)
+        !self.is_withheld(visa_id)
+            && matches!(
+                self.repo.get_node_visa_state(visa_id, node_addr),
+                Some(db::NodeVisaState::PendingInstall | db::NodeVisaState::Installed)
+            )
     }
 
     /// The visas among `ids` that `node_addr` may fetch by ID (`visaRequestById`), each
@@ -816,15 +827,20 @@ impl VisaMgr {
     /// never fetchable. These are [VisaMgr::still_grantable]'s states, but the node state
     /// is read once here: a copy turned `PendingRevoke` by a concurrent sweep or link-down
     /// between two reads must not pass as delivered.
+    ///
+    /// The hold is checked before the state is read (see
+    /// [VisaMgr::get_pending_visas_for_node]).
     fn fetchable_by_node(&self, visa_id: u64, node_addr: &IpAddr) -> bool {
-        let deliverable = match self.repo.get_node_visa_state(visa_id, node_addr) {
+        if self.is_withheld(visa_id) {
+            return false;
+        }
+        match self.repo.get_node_visa_state(visa_id, node_addr) {
             Some(db::NodeVisaState::Installed) => true,
             Some(db::NodeVisaState::PendingInstall) => {
                 self.other_hops_installed_if_ingress(visa_id, node_addr)
             }
             _ => false,
-        };
-        deliverable && !self.is_withheld(visa_id)
+        }
     }
 
     /// Whether `visa_id` must not be delivered now: quarantined ([VisaMgr::quarantine]) or
@@ -1006,15 +1022,16 @@ impl VisaMgr {
     /// the node from the record if it is still `PendingRevoke`, then remove the
     /// whole visa once no node references remain.
     ///
-    /// An ack that arrives while the node's copy may still land ([GrantHorizons],
-    /// zl-zipline#248) tears nothing down: the revoke may have overtaken the grant. The
-    /// copy stays `PendingRevoke`, held back until the horizon has passed, and the next
-    /// heartbeat after it sends the revoke once more; that ack tears it down.
-    pub async fn revoke_acked(&self, node_addr: IpAddr, visa_id: u64) {
+    /// The ack of a revoke sent (`sent_at`, taken before the RPC) while the node's copy
+    /// may still land ([GrantHorizons], zl-zipline#248) tears nothing down: the revoke may
+    /// have overtaken the grant, however late its ack is processed. The copy stays
+    /// `PendingRevoke`, held back until the horizon has passed, and the next heartbeat
+    /// after it sends the revoke once more; that ack tears it down.
+    pub async fn revoke_acked(&self, node_addr: IpAddr, visa_id: u64, sent_at: Instant) {
         {
             let mut horizons = self.horizons.lock().unwrap();
             let until = horizons.may_land_until(visa_id, &node_addr);
-            if Instant::now() < until {
+            if sent_at < until {
                 horizons.held.insert((visa_id, node_addr), until);
                 debug!(target: VISA, "visa {visa_id}: revoke acked by {node_addr} while its grant may still land; sending it once more after the grant horizon");
                 return;
@@ -1831,7 +1848,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -1869,7 +1886,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -1920,7 +1937,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -1970,7 +1987,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2056,7 +2073,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2095,7 +2112,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2183,7 +2200,7 @@ mod tests {
         store_node_visa(&mgr, 810, node, db::NodeVisaState::Installed).await;
         assert!(mgr.repo.mark_visa_revoked(810).await.unwrap());
 
-        mgr.revoke_acked(node, 810).await;
+        mgr.revoke_acked(node, 810, Instant::now()).await;
 
         assert!(!mgr.visa_has_node_refs(810).await);
         assert!(mgr.repo.get_visa_by_id(810).is_err());
@@ -2197,7 +2214,7 @@ mod tests {
         let node: IpAddr = NODE_ADDR.parse().unwrap();
         store_node_visa(&mgr, 811, node, db::NodeVisaState::Installed).await;
 
-        mgr.revoke_acked(node, 811).await;
+        mgr.revoke_acked(node, 811, Instant::now()).await;
 
         assert!(mgr.repo.get_visa_by_id(811).is_ok());
         assert!(mgr.visa_has_node_refs(811).await);
@@ -2729,13 +2746,14 @@ mod tests {
     /// revoked ID (a revoke of an ID it does not hold is done, as in core) and acks all of
     /// them. Returns the IDs sent.
     async fn heartbeat_revokes(mgr: &VisaMgr, node: IpAddr, held: &mut HashSet<u64>) -> Vec<u64> {
+        let sent_at = Instant::now();
         let ids = mgr
             .get_pending_revoke_visa_ids_for_node(&node)
             .await
             .unwrap();
         for id in &ids {
             held.remove(id);
-            mgr.revoke_acked(node, *id).await;
+            mgr.revoke_acked(node, *id, sent_at).await;
         }
         ids
     }
@@ -2849,6 +2867,81 @@ mod tests {
         tokio::time::advance(config::GRANT_HORIZON + Duration::from_secs(1)).await;
         assert_eq!(heartbeat_revokes(&mgr, node, &mut held).await, vec![823]);
         assert!(mgr.repo.get_visa_by_id(823).is_err());
+    }
+
+    /// zl-zipline#248 (codex pass 2, P2): the horizon is judged by when the revoke was
+    /// sent, not when its ack is processed. A revoke sent while the copy may still land
+    /// may have been overtaken by the grant however late its ack is processed: it is held,
+    /// and sent once more.
+    #[tokio::test(start_paused = true)]
+    async fn test_revoke_sent_inside_the_horizon_is_held_however_late_its_ack() {
+        let mgr = make_mgr().await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        store_node_visa(&mgr, 825, node, db::NodeVisaState::PendingInstall).await;
+        // Built 20 s after start: the copy may land until 50 s. (The test visa lives 60 s.)
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let visa = mgr.repo.get_visa_by_id(825).unwrap();
+        mgr.actualize_visa_for_target_node(visa, &node)
+            .await
+            .unwrap();
+        mgr.visa_installed(825, &node).await.unwrap();
+        assert!(mgr.mark_visa_revoked(825).await.unwrap());
+
+        let sent_at = Instant::now();
+        assert_eq!(
+            mgr.get_pending_revoke_visa_ids_for_node(&node)
+                .await
+                .unwrap(),
+            vec![825]
+        );
+        // The ack is processed only after the copy's horizon.
+        tokio::time::advance(config::GRANT_HORIZON + Duration::from_secs(1)).await;
+        mgr.revoke_acked(node, 825, sent_at).await;
+
+        assert_eq!(
+            mgr.repo.get_node_visa_state(825, &node),
+            Some(db::NodeVisaState::PendingRevoke),
+            "a revoke sent inside the horizon is not torn down at its ack"
+        );
+        assert_eq!(
+            mgr.get_pending_revoke_visa_ids_for_node(&node)
+                .await
+                .unwrap(),
+            vec![825],
+            "it is sent once more, the horizon having passed"
+        );
+    }
+
+    /// zl-zipline#248 (codex pass 2, P1): a copy whose commit check refuses it after the
+    /// pending rows were read -- the revoke written, then the hold cleared, as
+    /// `create_visa` does -- is not handed out: the hold is checked before the copy's state
+    /// is read again.
+    #[tokio::test]
+    async fn test_a_copy_refused_after_the_pending_snapshot_is_not_handed_out() {
+        use crate::visareq_worker::race_gate;
+        let mgr = make_mgr().await;
+        let node: IpAddr = "fd5a:5052::248:3".parse().unwrap();
+        store_node_visa(&mgr, 826, node, db::NodeVisaState::PendingInstall).await;
+        mgr.committing.lock().unwrap().insert(826);
+
+        let (parked, resume) = race_gate::arm(node, race_gate::Point::AfterPendingSnapshot);
+        let fetch = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.get_pending_visas_for_node(&node).await.unwrap() }
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the fetch must read the pending rows");
+        race_gate::disarm(&node);
+        // The commit check refuses the copy.
+        assert!(mgr.mark_visa_revoked(826).await.unwrap());
+        mgr.committing.lock().unwrap().remove(&826);
+        resume.notify_one();
+
+        assert!(
+            fetch.await.unwrap().is_empty(),
+            "the refused copy is not handed out"
+        );
     }
 
     /// Horizons past their time are pruned by housekeeping.

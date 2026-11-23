@@ -441,11 +441,14 @@ async fn send_pending_revokes(
         return; // Nothing to revoke; skip the RPC.
     }
 
+    // When the revoke left: the grant horizon is judged by it, not by when the ack is
+    // processed (zl-zipline#248, `VisaMgr::revoke_acked`).
+    let sent_at = tokio::time::Instant::now();
     match vss_do_revoke_visas(vss_handle, &ids).await {
         Ok(processed) => {
             // Tear down state for the acked ids (same prefix convention as install).
             for &id in ids.iter().take(processed) {
-                asm.visa_mgr.revoke_acked(*node_addr, id).await;
+                asm.visa_mgr.revoke_acked(*node_addr, id, sent_at).await;
             }
             debug!(target: VSS, "revoked {} of {} pending visas on node {}", processed, ids.len(), node_addr);
         }

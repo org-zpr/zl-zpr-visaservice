@@ -18,7 +18,7 @@ use libeval::eval::EvalContext;
 use crate::actor_attributes::{refresh_actors, restamp_node_services};
 use crate::assembly::Assembly;
 use crate::db::{Obligation, ObligationKind};
-use crate::error::ServiceError;
+use crate::error::{ServiceError, StoreError};
 use crate::logging::targets::EVENT;
 use crate::policy_mgr::PolicySnapshot;
 use crate::topology_mgr::TopoOps;
@@ -104,7 +104,10 @@ pub async fn launch(asm: Arc<Assembly>, mut event_rx: mpsc::Receiver<VsEvent>) {
 /// listed obligations with one sweep under the current state, and deletes them only
 /// if every step completed. Anything short of that leaves the work pending; the
 /// auth-expiry sweeper's loop kicks the next pass. Runs on the event worker only,
-/// so passes never overlap.
+/// so passes never overlap. The pass ends when `pending` drops, on every path out
+/// (a panic included): only then does the generation turn even again
+/// ([crate::revocation::Pass]), so a visa request overlapping any part of the pass
+/// is refused at commit.
 pub(crate) async fn reconcile_obligations(asm: &Arc<Assembly>) {
     let pending = match asm.revocations.start_pass().await {
         Ok(pending) => pending,
@@ -143,6 +146,23 @@ pub(crate) async fn reconcile_obligations(asm: &Arc<Assembly>) {
         // Harmless: the next pass repeats the work and deletes them then.
         error!(target: EVENT, "failed to delete revocation obligations: {e}");
     }
+}
+
+/// Record the startup sweep (zl-zipline#248): one attribute obligation naming no actor,
+/// which the next pass satisfies by sweeping every live visa. Startup records it before
+/// the VS-API listener serves, then kicks the reconciler.
+///
+/// A visa is withheld from delivery while its request's commit check runs
+/// (`VisaMgr::committing`), and that hold lives in memory only: a crash between a visa's
+/// store and its commit check restores the visa `PendingInstall` with no hold, after a
+/// change that should revoke it may already have been satisfied. The startup sweep
+/// re-checks it. The residual gap: a node reconnecting before that first pass ends can
+/// be pushed such a visa, which the pass then revokes.
+pub(crate) async fn record_startup_sweep(asm: &Assembly) -> Result<(), StoreError> {
+    asm.revocations
+        .begin(Obligation::attributes(vec![]))
+        .await
+        .map(drop)
 }
 
 /// How far a pass got ([satisfy_obligations]).
@@ -1275,7 +1295,7 @@ mod tests {
         race_gate::disarm(&node);
         let pass = tokio::spawn({
             let asm = asm.clone();
-            async move { asm.revocations.start_pass().await.unwrap() }
+            async move { asm.revocations.start_pass().await.unwrap().to_vec() }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -2143,7 +2163,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + Duration::from_secs(3600),
-                None,
+                asm.revocations.generation(),
             )
             .await
             .unwrap()
