@@ -38,6 +38,11 @@ pub struct VisaMgr {
     /// or when a link went down (`revoke_visas_over_link`). They are never handed out,
     /// and their revocation is retried on every [VisaMgr::get_pending_visas_for_node].
     quarantine: Arc<Mutex<HashSet<u64>>>,
+    /// Visas stored by [VisaMgr::create_visa] whose commit checks have not finished yet.
+    /// Like quarantined ones, they are withheld from every delivery path (VSS push, fetch
+    /// by ID, grant), so a copy the checks refuse is never handed out meanwhile; unlike
+    /// them, they are visible to revocation passes.
+    committing: Arc<Mutex<HashSet<u64>>>,
     /// When each node's copy of a visa may still land (zl-zipline#248), see
     /// [GrantHorizons].
     horizons: Arc<Mutex<GrantHorizons>>,
@@ -179,6 +184,7 @@ impl VisaMgr {
         VisaMgr {
             repo: db,
             quarantine: Arc::new(Mutex::new(HashSet::new())),
+            committing: Arc::new(Mutex::new(HashSet::new())),
             horizons: Arc::new(Mutex::new(GrantHorizons::new())),
         }
     }
@@ -402,6 +408,14 @@ impl VisaMgr {
     ///
     /// A path is created from the route using the direction inforation in the hit.
     ///
+    /// Once stored, the visa passes two commit checks before it is returned: the route
+    /// check ([VisaMgr::revoke_if_route_down]) and, given the revocation generation the
+    /// request read before it read its actors and policy (`commit_generation`), the check
+    /// against concurrent revocation ([VisaMgr::check_commit_generation]). `None` skips the
+    /// latter: for visas no revocation pass re-evaluates either (AAA flows), and for test
+    /// fixtures. Until both have passed, the visa is withheld from delivery
+    /// ([VisaMgr::committing]); one refused is revoked and an error returned.
+    ///
     /// This returns a FULL visa.
     pub async fn create_visa(
         &self,
@@ -414,6 +428,7 @@ impl VisaMgr {
         policy_version: u64,
         vinst: u64,
         expiration_time: SystemTime,
+        commit_generation: Option<u64>,
     ) -> Result<VisaWithMetadata, ServiceError> {
         let path = path_for_flow(asm, &pdesc.five_tuple.source_addr, route).await?;
         let vwmd = self
@@ -448,15 +463,21 @@ impl VisaMgr {
             }
             None => None,
         };
-        self.revoke_if_route_down(
-            asm,
-            vwmd.visa.issuer_id,
-            &route.links,
-            vwmd.metadata.path.as_deref(),
-            egress,
-        )
-        .await?;
-        Ok(vwmd)
+        let mut checked = self
+            .revoke_if_route_down(
+                asm,
+                vwmd.visa.issuer_id,
+                &route.links,
+                vwmd.metadata.path.as_deref(),
+                egress,
+            )
+            .await;
+        if let (Ok(()), Some(generation)) = (&checked, commit_generation) {
+            checked = self.check_commit_generation(asm, &vwmd, generation).await;
+        }
+        // Checked: deliverable if it passed, revoked (or quarantined) if not.
+        self.committing.lock().unwrap().remove(&vwmd.visa.issuer_id);
+        checked.map(|()| vwmd)
     }
 
     /// Commit-time check for a just-stored visa (zl-zipline#224). A link on its route
@@ -521,7 +542,7 @@ impl VisaMgr {
     /// current state with [VisaMgr::recheck_visa_allowed], exactly as the pass would.
     /// Anything but still allowed on the same route (a deny, a moved route, an actor
     /// that no longer resolves, an error) revokes it and refuses the request.
-    pub(crate) async fn check_commit_generation(
+    async fn check_commit_generation(
         &self,
         asm: &Assembly,
         vwmd: &VisaWithMetadata,
@@ -660,11 +681,22 @@ impl VisaMgr {
             prev_hop: None,
         };
 
+        // A visa a request will commit-check is withheld from delivery from before it is
+        // stored ([VisaMgr::create_visa]); bootstrap visas are installed at once.
+        let checked_at_commit = requester_state == db::NodeVisaState::PendingInstall;
+        if checked_at_commit {
+            self.committing.lock().unwrap().insert(visa_id);
+        }
         // The store also updates the visa state along the path: `requester_state` for the
         // requesting node, pending install for every other node on the path.
-        self.repo
+        if let Err(e) = self
+            .repo
             .store_visa(&visa, metadata.clone(), requester_state)
-            .await?;
+            .await
+        {
+            self.committing.lock().unwrap().remove(&visa_id);
+            return Err(e.into());
+        }
 
         info!("created visa {visa_id}");
         Ok(VisaWithMetadata::new(visa, metadata))
@@ -678,12 +710,11 @@ impl VisaMgr {
         node_addr: &IpAddr,
     ) -> Result<Vec<Visa>, ServiceError> {
         self.retry_quarantined_revocations().await;
-        let quarantined = self.quarantine.lock().unwrap().clone();
         let visas = self
             .repo
             .get_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)?
             .into_iter()
-            .filter(|v| !quarantined.contains(&v.issuer_id))
+            .filter(|v| !self.is_withheld(v.issuer_id))
             .collect();
         Ok(visas)
     }
@@ -727,7 +758,7 @@ impl VisaMgr {
     }
 
     /// Whether `visa_id` may still be granted to `node_addr`: staged there as
-    /// `PendingInstall` or `Installed`, and not quarantined. For visas prepared before
+    /// `PendingInstall` or `Installed`, and not withheld ([VisaMgr::is_withheld]). For visas prepared before
     /// a caller took the topology lock (`register_vss`): one revoked, acknowledged or
     /// quarantined meanwhile must not be granted again.
     pub fn still_grantable(&self, visa_id: u64, node_addr: &IpAddr) -> bool {
@@ -735,7 +766,7 @@ impl VisaMgr {
             self.repo.get_node_visa_state(visa_id, node_addr),
             Some(db::NodeVisaState::PendingInstall | db::NodeVisaState::Installed)
         );
-        staged && !self.is_quarantined(visa_id)
+        staged && !self.is_withheld(visa_id)
     }
 
     /// The visas among `ids` that `node_addr` may fetch by ID (`visaRequestById`), each
@@ -793,12 +824,14 @@ impl VisaMgr {
             }
             _ => false,
         };
-        deliverable && !self.is_quarantined(visa_id)
+        deliverable && !self.is_withheld(visa_id)
     }
 
-    /// Whether `visa_id` is quarantined (see [VisaMgr::quarantine]).
-    fn is_quarantined(&self, visa_id: u64) -> bool {
+    /// Whether `visa_id` must not be delivered now: quarantined ([VisaMgr::quarantine]) or
+    /// not yet through its commit checks ([VisaMgr::committing]).
+    fn is_withheld(&self, visa_id: u64) -> bool {
         self.quarantine.lock().unwrap().contains(&visa_id)
+            || self.committing.lock().unwrap().contains(&visa_id)
     }
 
     /// Quarantine a visa whose revocation write failed: it is never handed out by
@@ -889,10 +922,15 @@ impl VisaMgr {
     /// CAS moves the copy to `PendingRevoke` and goes out over VSS; if it overtakes the
     /// reply, the grant horizon ([VisaMgr::revoke_acked]) sends it once more.
     pub async fn grant_copy(&self, visa_id: u64, node_addr: &IpAddr) -> Result<bool, ServiceError> {
-        if self.is_quarantined(visa_id) {
+        if self.is_withheld(visa_id) {
             return Ok(false);
         }
-        self.install_cas(visa_id, node_addr).await
+        if self.install_cas(visa_id, node_addr).await? {
+            return Ok(true);
+        }
+        // Already `Installed`: a VSS push delivered the copy first, so handing it out
+        // again grants nothing new.
+        Ok(self.repo.get_node_visa_state(visa_id, node_addr) == Some(db::NodeVisaState::Installed))
     }
 
     /// The `PendingInstall -> Installed` CAS behind [VisaMgr::visa_installed] and
@@ -1793,6 +1831,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
+                None,
             )
             .await
             .unwrap();
@@ -1830,6 +1869,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
+                None,
             )
             .await
             .unwrap();
@@ -1880,6 +1920,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
+                None,
             )
             .await
             .unwrap();
@@ -1929,6 +1970,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
+                None,
             )
             .await
             .unwrap();
@@ -2014,6 +2056,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
+                None,
             )
             .await
             .unwrap();
@@ -2052,6 +2095,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
+                None,
             )
             .await
             .unwrap();
@@ -2094,6 +2138,39 @@ mod tests {
             .get_visa_ids_for_node_by_state(&node, db::NodeVisaState::PendingRevoke)
             .unwrap();
         assert_eq!(revoke_ids, vec![800]);
+    }
+
+    /// grant_copy (zl-zipline#248): a copy staged `PendingInstall` is granted (and becomes
+    /// `Installed`); one already `Installed` -- a VSS push delivered it first -- is granted
+    /// too (codex P2); a revoked copy, a quarantined visa or an unstaged node is refused.
+    #[tokio::test]
+    async fn test_grant_copy() {
+        let mgr = make_mgr().await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        store_node_visa(&mgr, 830, node, db::NodeVisaState::PendingInstall).await;
+        assert!(mgr.grant_copy(830, &node).await.unwrap());
+        assert_eq!(
+            mgr.repo.get_node_visa_state(830, &node),
+            Some(db::NodeVisaState::Installed)
+        );
+        assert!(
+            mgr.grant_copy(830, &node).await.unwrap(),
+            "already installed"
+        );
+
+        store_node_visa(&mgr, 831, node, db::NodeVisaState::PendingInstall).await;
+        assert!(mgr.mark_visa_revoked(831).await.unwrap());
+        assert!(!mgr.grant_copy(831, &node).await.unwrap(), "revoked");
+
+        store_node_visa(&mgr, 832, node, db::NodeVisaState::PendingInstall).await;
+        mgr.quarantine(832);
+        assert!(!mgr.grant_copy(832, &node).await.unwrap(), "quarantined");
+
+        let other: IpAddr = "fd5a:5052::99".parse().unwrap();
+        assert!(
+            !mgr.grant_copy(830, &other).await.unwrap(),
+            "not staged there"
+        );
     }
 
     /// revoke_acked drops the node ref and then removes the now-orphaned visa (past the

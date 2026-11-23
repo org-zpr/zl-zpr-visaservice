@@ -8653,6 +8653,76 @@ pub(crate) mod tests {
         assert!(missed.is_empty(), "revocations missed: {missed:#?}");
     }
 
+    /// zl-zipline#248 (codex P1): a stored visa is withheld from VSS delivery and from
+    /// the fetch by ID until its request's commit check has passed, so a copy the check
+    /// would refuse is never pushed meanwhile. Once the request completes, its copies are
+    /// deliverable.
+    #[tokio::test]
+    async fn test_a_visa_is_withheld_from_delivery_until_its_commit_check() {
+        use crate::visareq_worker::{VisaDecision, process_visa_request_for_test, race_gate};
+        let cn = "zode-248-hold.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        crate::event_mgr::reconcile_obligations(&asm).await;
+
+        let (parked, resume) = race_gate::arm(addr, race_gate::Point::AfterStore);
+        let request = tokio::spawn({
+            let asm = asm.clone();
+            let pdesc = zpr::vsapi_types::PacketDesc::new_tcp(
+                &addr.to_string(),
+                FILES_ADDR,
+                40000,
+                FILES_PORT,
+            )
+            .unwrap();
+            async move { process_visa_request_for_test(asm, addr, pdesc).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the request must reach the store");
+        race_gate::disarm(&addr);
+        let ids = asm.visa_mgr.list_all_visa_ids().await.unwrap();
+        assert_eq!(ids.len(), 1, "the visa is stored");
+        assert!(
+            asm.visa_mgr
+                .get_pending_visas_for_node(&addr)
+                .await
+                .unwrap()
+                .is_empty(),
+            "not pushed before its commit check"
+        );
+        assert!(
+            asm.visa_mgr
+                .visas_for_node_by_ids(&addr, &ids)
+                .await
+                .unwrap()
+                .is_empty(),
+            "not fetchable before its commit check"
+        );
+        resume.notify_one();
+
+        assert!(matches!(
+            request.await.unwrap(),
+            Ok(VisaDecision::Allow(..))
+        ));
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_visa_ids_for_node(&addr)
+                .await
+                .unwrap(),
+            ids,
+            "deliverable once the request completed"
+        );
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_visas_for_node(&addr)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     /// Policy decision for the Zode reaching `files` (TCP 8000).
     async fn zode_may_reach_files(asm: &Arc<Assembly>, addr: IpAddr) -> bool {
         let node = asm
@@ -8813,6 +8883,7 @@ pub(crate) mod tests {
                 0,
                 0,
                 SystemTime::now() + Duration::from_secs(3600),
+                None,
             )
             .await
             .expect("visa must be created")

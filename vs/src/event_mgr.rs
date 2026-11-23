@@ -2143,6 +2143,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + Duration::from_secs(3600),
+                None,
             )
             .await
             .unwrap()

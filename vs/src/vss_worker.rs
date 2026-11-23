@@ -148,7 +148,7 @@ pub async fn vss_worker_loop(
                             break;
                         }
                         VssCmd::PushVisas(visas, resp_tx) => {
-                            if let Err(e) = resp_tx.send(vss_do_push_visas(&vss_handle, &visas).await) {
+                            if let Err(e) = resp_tx.send(push_queued_visas(&asm, &node_addr.ip(), &vss_handle, visas).await) {
                                 error!(target: VSS, "failed to send response for push-visas command: {:?}", e);
                                 asm.counters.incr(CounterType::VssErrors);
                             }
@@ -657,6 +657,29 @@ async fn vss_do_visa_ops(
     }
 }
 
+/// Push the visas of a [VssCmd::PushVisas] command, which may have waited in the
+/// worker's queue, to the node at `node`; returns the number positively ack'd.
+///
+/// A copy that is no longer grantable -- revoked, acknowledged gone or withheld while
+/// the command waited -- is dropped first (zl-zipline#248). This worker task also sends
+/// the node's revokes, so a revoke marked after this check goes out after the push and
+/// cannot overtake it, however long the command waited.
+async fn push_queued_visas(
+    asm: &Assembly,
+    node: &IpAddr,
+    vss_handle: &v1::v_s_s_handle::Client,
+    visas: Vec<Visa>,
+) -> Result<usize, VssSyncError> {
+    let grantable: Vec<Visa> = visas
+        .into_iter()
+        .filter(|v| asm.visa_mgr.still_grantable(v.issuer_id, node))
+        .collect();
+    if grantable.is_empty() {
+        return Ok(0);
+    }
+    vss_do_push_visas(vss_handle, &grantable).await
+}
+
 /// Push visa grants to the node, returning the number positively ack'd.
 async fn vss_do_push_visas(
     vss_handle: &v1::v_s_s_handle::Client,
@@ -1041,6 +1064,35 @@ mod tests {
         tokio::task::spawn_local(client_rpc);
 
         handle
+    }
+
+    /// zl-zipline#248 (codex P1): a copy revoked while its push waited in the worker's
+    /// queue is not sent. The worker sends revokes from the same task, so a revoke marked
+    /// after this check goes out after the push and cannot overtake it. The stub VSS
+    /// implements no visa ops, so any push RPC would fail.
+    #[tokio::test]
+    async fn test_queued_push_of_a_revoked_copy_is_not_sent() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let cn = "zode-248-push.zpr";
+                let (asm, _cc, addr, _privkey) =
+                    crate::connection_control::tests::zode_fixture(cn).await;
+                let id = crate::connection_control::tests::create_zode_files_visa(&asm, addr).await;
+                let visa = asm.visa_mgr.get_visa_by_id(id).await.unwrap().unwrap();
+                assert!(asm.visa_mgr.mark_visa_revoked(id).await.unwrap());
+                let handle = start_stub(StubVss {
+                    seen: Rc::new(RefCell::new(Vec::new())),
+                    ack_ok: true,
+                    processed: 0,
+                    error_msg: None,
+                });
+
+                let pushed = push_queued_visas(&asm, &addr, &handle, vec![visa]).await;
+
+                assert_eq!(pushed.ok(), Some(0), "nothing is sent for a revoked copy");
+            })
+            .await;
     }
 
     /// An ok ack with `processed = n` maps to `Ok(n)`, and the node saw exactly

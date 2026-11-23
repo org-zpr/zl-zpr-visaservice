@@ -213,6 +213,10 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
     // (zl-zipline#248, see VisaMgr::check_commit_generation).
     let generation = asm.revocations.generation();
     let (source_actor, dest_actor) = get_actors(&asm, job).await?;
+    // A missing actor is fabricated below for an AAA flow (or the request is denied).
+    // Revocation passes do not re-evaluate AAA visas (`VisaMgr::recheck_visa_allowed`
+    // cannot resolve the fabricated actor), so neither does the commit check.
+    let commit_generation = (source_actor.is_some() && dest_actor.is_some()).then_some(generation);
 
     let (mut source_actor, mut dest_actor) =
         match resolve_actors_or_deny(&asm, job, source_actor, dest_actor).await {
@@ -342,7 +346,7 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
             visa_from_allow(
                 asm.clone(),
                 job,
-                generation,
+                commit_generation,
                 &hits,
                 &policy,
                 default_route,
@@ -405,7 +409,7 @@ fn fabricate_aaa_actor(anon_addr: &IpAddr, expiration: SystemTime) -> Actor {
 async fn visa_from_allow(
     asm: Arc<Assembly>,
     job: &VisaRequestJob,
-    generation: u64,
+    commit_generation: Option<u64>,
     hits: &[Hit],
     policy: &Policy,
     default_route: Option<Route>,
@@ -454,12 +458,8 @@ async fn visa_from_allow(
             policy_version,
             vinst,
             expiration,
+            commit_generation,
         )
-        .await?;
-    // A revocation pass that ran since `generation` was read may have missed this visa:
-    // re-check it before anything is handed out or pushed (zl-zipline#248).
-    asm.visa_mgr
-        .check_commit_generation(&asm, &visawmd, generation)
         .await?;
 
     // Clone the visa for the requesting node before moving visawmd into the background task.
@@ -1021,7 +1021,7 @@ mod tests {
         let result = visa_from_allow(
             asm.clone(),
             &job,
-            asm.revocations.generation(),
+            Some(asm.revocations.generation()),
             &hits,
             &policy,
             Some(route),
@@ -1073,7 +1073,7 @@ mod tests {
         let result = visa_from_allow(
             asm.clone(),
             &job,
-            asm.revocations.generation(),
+            Some(asm.revocations.generation()),
             &hits,
             &policy,
             Some(route),

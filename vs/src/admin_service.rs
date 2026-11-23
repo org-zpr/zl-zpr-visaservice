@@ -1979,6 +1979,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                None,
             )
             .await
             .unwrap();
@@ -2162,6 +2163,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                None,
             )
             .await
             .unwrap();
@@ -2177,6 +2179,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                None,
             )
             .await
             .unwrap();
@@ -2192,6 +2195,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                None,
             )
             .await
             .unwrap();
@@ -2518,6 +2522,7 @@ mod tests {
                 policy_version,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                None,
             )
             .await
             .unwrap();
@@ -2574,6 +2579,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                None,
             )
             .await
             .unwrap();
@@ -2628,6 +2634,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                None,
             )
             .await
             .unwrap();
