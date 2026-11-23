@@ -148,20 +148,25 @@ pub mod tests {
         vreq_tx_chan: Option<mpsc::Sender<VisaRequestJob>>,
     ) -> (Assembly, mpsc::Receiver<VsEvent>, Arc<FakeDb>) {
         let db = Arc::new(FakeDb::new());
-        let (asm, event_rx) = new_assembly_on(db.clone(), vreq_tx_chan).await;
+        let (asm, event_rx) = new_assembly_on(db.clone(), vreq_tx_chan, false).await;
         (asm, event_rx, db)
     }
 
     /// A new assembly over an existing [FakeDb]: what a visa service restart sees
-    /// (state is hydrated from the DB; in-memory state starts empty).
+    /// (state is hydrated from the DB; in-memory state starts empty). Like a visa
+    /// service started without a policy file, it loads the stored policy
+    /// (`PolicyMgr::new_from_state`).
     pub async fn new_assembly_on_db(db: Arc<FakeDb>) -> (Assembly, mpsc::Receiver<VsEvent>) {
-        new_assembly_on(db, None).await
+        new_assembly_on(db, None, true).await
     }
 
-    /// The body of the helpers above: an assembly over `db_handle`.
+    /// The body of the helpers above: an assembly over `db_handle`. Its policy
+    /// manager loads the stored policy if `from_state`, or else installs the
+    /// default test policy.
     async fn new_assembly_on(
         db_handle: Arc<FakeDb>,
         vreq_tx_chan: Option<mpsc::Sender<VisaRequestJob>>,
+        from_state: bool,
     ) -> (Assembly, mpsc::Receiver<VsEvent>) {
         let vreq_tx = if let Some(tx) = vreq_tx_chan {
             tx
@@ -186,24 +191,43 @@ pub mod tests {
         // Shared with the PolicyMgr below so it can publish policy-declared stores.
         let ts_mgr = Arc::new(TrustedServicesMgr::new());
 
+        let vs_addr = crate::config::VSConfig::default().get_vs_addr();
+        let policy_actor_repo = Arc::new(ActorRepo::new(db_handle.clone()));
+        let resolver = Arc::new(FakeResolver::ip_only());
+        let policy_mgr = if from_state {
+            PolicyMgr::new_from_state(
+                policy_repo,
+                resolver,
+                ts_mgr.clone(),
+                PathBuf::from("."),
+                PathBuf::from("."),
+                policy_actor_repo,
+                None,
+                vs_addr,
+            )
+            .await
+        } else {
+            PolicyMgr::new_with_initial_policy(
+                policy_container_bytes,
+                policy_repo,
+                resolver,
+                ts_mgr.clone(),
+                PathBuf::from("."),
+                PathBuf::from("."),
+                policy_actor_repo,
+                None,
+                vs_addr,
+            )
+            .await
+        }
+        .expect("failed to initialize PolicyMgr");
+
         let asm = Assembly {
             config: VSConfig::default(),
             counters: counters.clone(),
             system_start_time: std::time::Instant::now(),
             cc: ConnectionControl::new("vs_ident".to_string()),
-            policy_mgr: PolicyMgr::new_with_initial_policy(
-                policy_container_bytes,
-                policy_repo,
-                Arc::new(FakeResolver::ip_only()),
-                ts_mgr.clone(),
-                PathBuf::from("."),
-                PathBuf::from("."),
-                Arc::new(ActorRepo::new(db_handle.clone())),
-                None,
-                crate::config::VSConfig::default().get_vs_addr(),
-            )
-            .await
-            .expect("failed to initialize PolicyMgr"),
+            policy_mgr,
             actor_mgr: Arc::new(ActorMgr::new(actor_repo, node_repo, counters)),
             state_db: db_handle.clone(),
             vreq_chan: vreq_tx,
