@@ -983,12 +983,25 @@ impl VisaMgr {
         if self.is_withheld(visa_id) {
             return Ok(false);
         }
-        if self.install_cas(visa_id, node_addr).await? {
-            return Ok(true);
-        }
-        // Already `Installed`: a VSS push delivered the copy first, so handing it out
-        // again grants nothing new.
-        Ok(self.repo.get_node_visa_state(visa_id, node_addr) == Some(db::NodeVisaState::Installed))
+        // Test seam (zl-zipline#248): a revocation landing while the grant waits for the
+        // store. Compiled out of release.
+        #[cfg(test)]
+        crate::visareq_worker::race_gate::pause_if_gated(
+            node_addr,
+            crate::visareq_worker::race_gate::Point::InsideGrant,
+        )
+        .await;
+        let installed = self.install_cas(visa_id, node_addr).await?
+            // Already `Installed`: a VSS push delivered the copy first, so handing it out
+            // again grants nothing new.
+            || self.repo.get_node_visa_state(visa_id, node_addr)
+                == Some(db::NodeVisaState::Installed);
+        // Checked again after the CAS (codex pass 4): a revocation whose write failed
+        // while the grant waited for the store quarantines the visa but leaves the copy
+        // `PendingInstall`, so the CAS still applies. The copy then stays `Installed`
+        // without going out; the quarantine retry marks it `PendingRevoke`, and the node,
+        // not holding it, acks the revoke.
+        Ok(installed && !self.is_withheld(visa_id))
     }
 
     /// The `PendingInstall -> Installed` CAS behind [VisaMgr::visa_installed] and
@@ -2243,6 +2256,39 @@ mod tests {
             !mgr.grant_copy(830, &other).await.unwrap(),
             "not staged there"
         );
+    }
+
+    /// zl-zipline#248 (codex pass 4, P1): a visa quarantined while the grant waits for the
+    /// install CAS -- a revocation whose write failed, leaving the copy `PendingInstall` --
+    /// is not handed out, whether the CAS then applies or a VSS push installed the copy
+    /// first.
+    #[tokio::test]
+    async fn test_a_copy_quarantined_while_the_grant_waits_is_not_handed_out() {
+        use crate::visareq_worker::race_gate;
+        let mgr = make_mgr().await;
+        let node: IpAddr = "fd5a:5052::248:4".parse().unwrap();
+        for (visa_id, pushed_meanwhile) in [(833u64, false), (834u64, true)] {
+            store_node_visa(&mgr, visa_id, node, db::NodeVisaState::PendingInstall).await;
+            let (parked, resume) = race_gate::arm(node, race_gate::Point::InsideGrant);
+            let grant = tokio::spawn({
+                let mgr = mgr.clone();
+                async move { mgr.grant_copy(visa_id, &node).await.unwrap() }
+            });
+            tokio::time::timeout(Duration::from_secs(5), parked.notified())
+                .await
+                .expect("the grant must pass its first withheld check");
+            race_gate::disarm(&node);
+            if pushed_meanwhile {
+                mgr.visa_installed(visa_id, &node).await.unwrap();
+            }
+            // The revocation's write failed: quarantined, the node state unchanged.
+            mgr.quarantine(visa_id);
+            resume.notify_one();
+            assert!(
+                !grant.await.unwrap(),
+                "visa {visa_id} (pushed meanwhile: {pushed_meanwhile}) is quarantined"
+            );
+        }
     }
 
     /// revoke_acked drops the node ref and then removes the now-orphaned visa (past the

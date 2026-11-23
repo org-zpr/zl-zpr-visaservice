@@ -831,6 +831,9 @@ pub(crate) mod race_gate {
         /// The `visaRequest` and `registerVss` handlers, after the visas are
         /// prepared and before `VisaMgr::grant_copy` decides to hand them out.
         BeforeGrant,
+        /// `VisaMgr::grant_copy`, after its first withheld check and before the install
+        /// CAS.
+        InsideGrant,
         /// `reauthorize_actor`, right after the actor write.
         AfterActorWrite,
         /// A disconnect, between recording its obligation and removing the actor.
