@@ -18,7 +18,7 @@ use libeval::eval::EvalContext;
 use crate::actor_attributes::{refresh_actors, restamp_node_services};
 use crate::assembly::Assembly;
 use crate::db::{Obligation, ObligationKind};
-use crate::error::{ServiceError, StoreError};
+use crate::error::ServiceError;
 use crate::logging::targets::EVENT;
 use crate::policy_mgr::PolicySnapshot;
 use crate::topology_mgr::TopoOps;
@@ -146,23 +146,6 @@ pub(crate) async fn reconcile_obligations(asm: &Arc<Assembly>) {
         // Harmless: the next pass repeats the work and deletes them then.
         error!(target: EVENT, "failed to delete revocation obligations: {e}");
     }
-}
-
-/// Record the startup sweep (zl-zipline#248): one attribute obligation naming no actor,
-/// which the next pass satisfies by sweeping every live visa. Startup records it before
-/// the VS-API listener serves, then kicks the reconciler.
-///
-/// A visa is withheld from delivery while its request's commit check runs
-/// (`VisaMgr::committing`), and that hold lives in memory only: a crash between a visa's
-/// store and its commit check restores the visa `PendingInstall` with no hold, after a
-/// change that should revoke it may already have been satisfied. The startup sweep
-/// re-checks it. The residual gap: a node reconnecting before that first pass ends can
-/// be pushed such a visa, which the pass then revokes.
-pub(crate) async fn record_startup_sweep(asm: &Assembly) -> Result<(), StoreError> {
-    asm.revocations
-        .begin(Obligation::attributes(vec![]))
-        .await
-        .map(drop)
 }
 
 /// How far a pass got ([satisfy_obligations]).
@@ -1210,6 +1193,69 @@ mod tests {
             "the restarted visa service must revoke the departed node's visa"
         );
         assert!(pending(&restarted).await.is_empty());
+    }
+
+    /// zl-zipline#248 (codex pass 3, P1, operator decision "persist the hold"): a request
+    /// reads its state, a disconnect and its pass then finish, and the request stores its
+    /// visa -- one no pass will see, as its actor is gone. The visa service crashes before
+    /// the commit check, which would have refused it. After the restart the visa must not
+    /// be deliverable.
+    #[tokio::test]
+    async fn test_uncommitted_visa_of_a_vanished_actor_is_not_delivered_after_a_restart() {
+        use crate::connection_control::tests::{
+            create_zode_files_visa_read_at, zode_fixture_on, zode_login,
+        };
+        use crate::visareq_worker::race_gate;
+        let cn = "zode-248-crash.zpr";
+        let (asm, event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        std::mem::forget(event_rx);
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        reconcile_obligations(&asm).await;
+
+        // The request has read its state; the disconnect and its pass run.
+        let generation = asm.revocations.generation();
+        asm.cc
+            .disconnect(asm.clone(), addr, DisconnectReason::Admin)
+            .await
+            .unwrap();
+        reconcile_obligations(&asm).await;
+        assert!(
+            pending(&asm).await.is_empty(),
+            "the disconnect is satisfied"
+        );
+
+        // The request stores its visa, and the visa service crashes before the commit
+        // check.
+        let (parked, _resume) = race_gate::arm(addr, race_gate::Point::AfterStore);
+        let request = tokio::spawn({
+            let asm = asm.clone();
+            async move { create_zode_files_visa_read_at(&asm, addr, generation).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the request reaches the store");
+        race_gate::disarm(&addr);
+        request.abort();
+        let _ = request.await;
+        let ids = asm.visa_mgr.list_all_visa_ids().await.unwrap();
+        assert_eq!(ids.len(), 1, "precondition: the visa was stored");
+        drop(asm); // the "crash"
+
+        let (restarted, _event_rx) = crate::assembly::tests::new_assembly_on_db(db).await;
+        let restarted = Arc::new(restarted);
+        restarted.visa_mgr.revoke_uncommitted_visas().await;
+        reconcile_obligations(&restarted).await;
+        assert!(
+            restarted
+                .visa_mgr
+                .get_pending_visas_for_node(&addr)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the uncommitted visa must not be deliverable after the restart"
+        );
     }
 
     /// Test 2 (zl-zipline#290, VS#79 Copilot): the policy pass disconnects a node

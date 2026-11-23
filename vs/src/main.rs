@@ -464,19 +464,19 @@ async fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    // Re-check every live visa once: a visa stored before a crash may have lost its
-    // in-memory commit hold (zl-zipline#248, see event_mgr::record_startup_sweep).
-    // Without the obligation nothing would revoke such a visa, so startup fails
-    // closed if it cannot be recorded.
-    if let Err(e) = event_mgr::record_startup_sweep(&asm).await {
-        error!(target: MAIN, "failed to record the startup visa sweep: {}", e);
-        return std::process::ExitCode::FAILURE;
+    // Revoke every visa the previous run stored but never commit-checked: it crashed in
+    // between (zl-zipline#248). Such a visa is withheld from delivery whatever happens
+    // here (its persisted mark), so one whose revoke cannot be written is only logged;
+    // the next start revokes it again.
+    let quarantined = asm.visa_mgr.revoke_uncommitted_visas().await;
+    if quarantined > 0 {
+        warn!(target: MAIN, "{quarantined} uncommitted visa(s) could not be revoked; they stay withheld");
     }
     js.spawn_local(signal_worker::launch(asm.clone()));
     js.spawn_local(event_mgr::launch(asm.clone(), event_rx));
     // Satisfy the revocation obligations a previous run left pending (a crash, or a
     // sweep that had not completed), including a policy pass it cut short
-    // (zl-zipline#289), and the startup sweep. The auth-expiry sweeper re-kicks from
+    // (zl-zipline#289). The auth-expiry sweeper re-kicks from
     // here on.
     asm.event_mgr.kick_reconcile();
 
