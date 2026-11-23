@@ -208,6 +208,10 @@ async fn process_visa_request_job(asm: Arc<Assembly>, job: VisaRequestJob) {
 
 /// Run visa request.
 async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaRequestResult {
+    // The revocation generation, read before anything the decision rests on (actors,
+    // policy, docking): the commit check after the store compares against it
+    // (zl-zipline#248, see VisaMgr::check_commit_generation).
+    let commit_generation = asm.revocations.generation();
     let (source_actor, dest_actor) = get_actors(&asm, job).await?;
 
     let (mut source_actor, mut dest_actor) =
@@ -286,7 +290,7 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
     // mutates the connection table, standing in for a disconnect/reconnect that
     // lands mid-await -- deterministic, no timing games. Compiled out of release.
     #[cfg(test)]
-    race_gate::pause_if_gated(&job.requesting_node).await;
+    race_gate::pause_if_gated(&job.requesting_node, race_gate::Point::AfterRefresh).await;
 
     // Docking-node resolution, routing, and policy eval all live in the shared
     // core (used by the Phase 2 sweep too). Actor resolution above stays
@@ -331,9 +335,14 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
                 );
                 return Ok(VisaDecision::Deny(DenyCode::NoMatch));
             }
+            // Test seam (zl-zipline#248): a revocation landing between the
+            // evaluation and the store. Compiled out of release.
+            #[cfg(test)]
+            race_gate::pause_if_gated(&job.requesting_node, race_gate::Point::AfterEval).await;
             visa_from_allow(
                 asm.clone(),
                 job,
+                commit_generation,
                 &hits,
                 &policy,
                 default_route,
@@ -353,9 +362,9 @@ pub(crate) async fn process_visa_request_for_test(
     asm: Arc<Assembly>,
     requesting_node: IpAddr,
     pkt: PacketDesc,
-) -> VisaDecision {
+) -> VisaRequestResult {
     let (job, _rx) = VisaRequestJob::new(requesting_node, pkt);
-    process_visa_request(asm, &job).await.unwrap()
+    process_visa_request(asm, &job).await
 }
 
 /// Fabricate an AAA actor for an anonymous endpoint at the given address.
@@ -396,6 +405,7 @@ fn fabricate_aaa_actor(anon_addr: &IpAddr, expiration: SystemTime) -> Actor {
 async fn visa_from_allow(
     asm: Arc<Assembly>,
     job: &VisaRequestJob,
+    commit_generation: u64,
     hits: &[Hit],
     policy: &Policy,
     default_route: Option<Route>,
@@ -444,6 +454,7 @@ async fn visa_from_allow(
             policy_version,
             vinst,
             expiration,
+            commit_generation,
         )
         .await?;
 
@@ -794,11 +805,11 @@ async fn get_actors(
     Ok((source_actor, dest_actor))
 }
 
-/// Test-only rendezvous for racing docking-state changes against an in-flight
-/// request (zipline#183 review, Codex P1). A test arms a gate for its (unique)
-/// requesting-node address; `process_visa_request` parks at the gate after the
-/// attribute-refresh awaits, the test mutates docking state, then resumes it.
-/// Keyed by requesting node so concurrently-running tests never trip each
+/// Test-only rendezvous for racing state changes against an in-flight request
+/// or write (zipline#183 review, Codex P1; zl-zipline#248). A test arms a gate
+/// for its (unique) node address at one named [Point]; the code under test parks
+/// when it reaches that point for that node, the test mutates state, then
+/// resumes it. Keyed by node so concurrently-running tests never trip each
 /// other's gates. Compiled only into test builds.
 #[cfg(test)]
 pub(crate) mod race_gate {
@@ -808,7 +819,34 @@ pub(crate) mod race_gate {
 
     use tokio::sync::Notify;
 
+    /// Where a gated request or write parks.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Point {
+        /// `process_visa_request`, after the actors are read and refreshed.
+        AfterRefresh,
+        /// `process_visa_request`, after the policy evaluation allowed the flow.
+        AfterEval,
+        /// `VisaMgr::create_visa`, right after the visa is stored.
+        AfterStore,
+        /// The `visaRequest` and `registerVss` handlers, after the visas are
+        /// prepared and before `VisaMgr::grant_copy` decides to hand them out.
+        BeforeGrant,
+        /// `VisaMgr::grant_copy`, after its first withheld check and before the install
+        /// CAS.
+        InsideGrant,
+        /// `VisaMgr::visas_for_node_by_ids`, after a copy passed the fetch check and
+        /// before it is built.
+        AfterFetchCheck,
+        /// `reauthorize_actor`, right after the actor write.
+        AfterActorWrite,
+        /// A disconnect, between recording its obligation and removing the actor.
+        BeforeActorRemoval,
+        /// `VisaMgr::get_pending_visas_for_node`, after the pending rows are read.
+        AfterPendingSnapshot,
+    }
+
     struct Gate {
+        point: Point,
         parked: Arc<Notify>,
         resume: Arc<Notify>,
     }
@@ -818,16 +856,17 @@ pub(crate) mod race_gate {
         GATES.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// Arm a gate for requests from `node`. Returns `(parked, resume)`: await
-    /// `parked.notified()` to learn the request has reached the gate, then
+    /// Arm a gate at `point` for `node`. Returns `(parked, resume)`: await
+    /// `parked.notified()` to learn the code has reached the gate, then
     /// `resume.notify_one()` to let it continue. Single-permit `Notify`
     /// semantics make both directions race-free regardless of arrival order.
-    pub(crate) fn arm(node: IpAddr) -> (Arc<Notify>, Arc<Notify>) {
+    pub(crate) fn arm(node: IpAddr, point: Point) -> (Arc<Notify>, Arc<Notify>) {
         let parked = Arc::new(Notify::new());
         let resume = Arc::new(Notify::new());
         gates().lock().unwrap().insert(
             node,
             Gate {
+                point,
                 parked: parked.clone(),
                 resume: resume.clone(),
             },
@@ -840,13 +879,14 @@ pub(crate) mod race_gate {
         gates().lock().unwrap().remove(node);
     }
 
-    /// Called from `process_visa_request`: if a gate is armed for this
-    /// requesting node, signal the test and wait to be resumed. No-op (and
-    /// lock-only cost) for every other request.
-    pub(crate) async fn pause_if_gated(node: &IpAddr) {
+    /// Called at `point`: if a gate is armed there for `node`, signal the test
+    /// and wait to be resumed. No-op (and lock-only cost) otherwise.
+    pub(crate) async fn pause_if_gated(node: &IpAddr, point: Point) {
         let armed = {
             let map = gates().lock().unwrap();
-            map.get(node).map(|g| (g.parked.clone(), g.resume.clone()))
+            map.get(node)
+                .filter(|g| g.point == point)
+                .map(|g| (g.parked.clone(), g.resume.clone()))
         };
         if let Some((parked, resume)) = armed {
             parked.notify_one();
@@ -985,6 +1025,7 @@ mod tests {
         let result = visa_from_allow(
             asm.clone(),
             &job,
+            asm.revocations.generation(),
             &hits,
             &policy,
             Some(route),
@@ -1036,6 +1077,7 @@ mod tests {
         let result = visa_from_allow(
             asm.clone(),
             &job,
+            asm.revocations.generation(),
             &hits,
             &policy,
             Some(route),
@@ -1804,7 +1846,7 @@ mod tests {
         let pkt =
             PacketDesc::new_tcp("fd5a:5052:4100::a", "fd5a:5052:4100::b", 12345, 8080).unwrap();
 
-        let (parked, resume) = race_gate::arm(n1);
+        let (parked, resume) = race_gate::arm(n1, race_gate::Point::AfterRefresh);
 
         // Request from N1, which docks source A at submission time, for a
         // policy-allowed flow.

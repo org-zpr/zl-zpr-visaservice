@@ -104,7 +104,10 @@ pub async fn launch(asm: Arc<Assembly>, mut event_rx: mpsc::Receiver<VsEvent>) {
 /// listed obligations with one sweep under the current state, and deletes them only
 /// if every step completed. Anything short of that leaves the work pending; the
 /// auth-expiry sweeper's loop kicks the next pass. Runs on the event worker only,
-/// so passes never overlap.
+/// so passes never overlap. The pass ends when `pending` drops, on every path out
+/// (a panic included): only then does the generation turn even again
+/// ([crate::revocation::Pass]), so a visa request overlapping any part of the pass
+/// is refused at commit.
 pub(crate) async fn reconcile_obligations(asm: &Arc<Assembly>) {
     let pending = match asm.revocations.start_pass().await {
         Ok(pending) => pending,
@@ -1192,6 +1195,69 @@ mod tests {
         assert!(pending(&restarted).await.is_empty());
     }
 
+    /// zl-zipline#248 (codex pass 3, P1, operator decision "persist the hold"): a request
+    /// reads its state, a disconnect and its pass then finish, and the request stores its
+    /// visa -- one no pass will see, as its actor is gone. The visa service crashes before
+    /// the commit check, which would have refused it. After the restart the visa must not
+    /// be deliverable.
+    #[tokio::test]
+    async fn test_uncommitted_visa_of_a_vanished_actor_is_not_delivered_after_a_restart() {
+        use crate::connection_control::tests::{
+            create_zode_files_visa_read_at, zode_fixture_on, zode_login,
+        };
+        use crate::visareq_worker::race_gate;
+        let cn = "zode-248-crash.zpr";
+        let (asm, event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        std::mem::forget(event_rx);
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        reconcile_obligations(&asm).await;
+
+        // The request has read its state; the disconnect and its pass run.
+        let generation = asm.revocations.generation();
+        asm.cc
+            .disconnect(asm.clone(), addr, DisconnectReason::Admin)
+            .await
+            .unwrap();
+        reconcile_obligations(&asm).await;
+        assert!(
+            pending(&asm).await.is_empty(),
+            "the disconnect is satisfied"
+        );
+
+        // The request stores its visa, and the visa service crashes before the commit
+        // check.
+        let (parked, _resume) = race_gate::arm(addr, race_gate::Point::AfterStore);
+        let request = tokio::spawn({
+            let asm = asm.clone();
+            async move { create_zode_files_visa_read_at(&asm, addr, generation).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the request reaches the store");
+        race_gate::disarm(&addr);
+        request.abort();
+        let _ = request.await;
+        let ids = asm.visa_mgr.list_all_visa_ids().await.unwrap();
+        assert_eq!(ids.len(), 1, "precondition: the visa was stored");
+        drop(asm); // the "crash"
+
+        let (restarted, _event_rx) = crate::assembly::tests::new_assembly_on_db(db).await;
+        let restarted = Arc::new(restarted);
+        restarted.visa_mgr.revoke_uncommitted_visas().await;
+        reconcile_obligations(&restarted).await;
+        assert!(
+            restarted
+                .visa_mgr
+                .get_pending_visas_for_node(&addr)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the uncommitted visa must not be deliverable after the restart"
+        );
+    }
+
     /// Test 2 (zl-zipline#290, VS#79 Copilot): the policy pass disconnects a node
     /// the new policy rejects, and the node's visa revoke cannot be written. The
     /// policy obligation completes, but the disconnect's own obligation stays
@@ -1259,7 +1325,7 @@ mod tests {
             .collect();
         asm.revocations.complete(&setup).await.unwrap();
 
-        let (parked, resume) = race_gate::arm(node);
+        let (parked, resume) = race_gate::arm(node, race_gate::Point::BeforeActorRemoval);
         let disconnect = tokio::spawn({
             let asm = asm.clone();
             async move {
@@ -1275,7 +1341,7 @@ mod tests {
         race_gate::disarm(&node);
         let pass = tokio::spawn({
             let asm = asm.clone();
-            async move { asm.revocations.start_pass().await.unwrap() }
+            async move { asm.revocations.start_pass().await.unwrap().to_vec() }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -2143,6 +2209,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + Duration::from_secs(3600),
+                asm.revocations.generation(),
             )
             .await
             .unwrap()
@@ -2240,8 +2307,9 @@ mod tests {
         }
 
         let pkt = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:3000::2", 1234, 80).unwrap();
-        let VisaDecision::Allow(visa, _) =
-            process_visa_request_for_test(asm.clone(), node_a, pkt).await
+        let VisaDecision::Allow(visa, _) = process_visa_request_for_test(asm.clone(), node_a, pkt)
+            .await
+            .unwrap()
         else {
             panic!("precondition: the stale services allow the visa");
         };

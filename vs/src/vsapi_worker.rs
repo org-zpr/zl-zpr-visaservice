@@ -1930,6 +1930,15 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             )
             .await;
 
+        // Test seam (zl-zipline#248): a revoke landing between the preparation and
+        // the grant. Compiled out of release.
+        #[cfg(test)]
+        crate::visareq_worker::race_gate::pause_if_gated(
+            node_zpr_addr,
+            crate::visareq_worker::race_gate::Point::BeforeGrant,
+        )
+        .await;
+
         // Topology operation lock (see TopoOps), taken after the visa preparation
         // above (which can wait on the visa request queue and remote attribute
         // services, so it stays outside): the caller's liveness is rechecked under it
@@ -1950,18 +1959,8 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         }
         // A superseded handle is told to re-authenticate (above) before it hears
         // about a preparation failure.
-        // The visas were prepared before the guard: drop any revoked, acknowledged or
-        // quarantined meanwhile (a link-down report can revoke one while preparation
-        // waits), so a revoked visa is never granted again.
         let initial_visas = match prepared {
-            Ok(visas) => visas
-                .into_iter()
-                .filter(|v| {
-                    self.asm
-                        .visa_mgr
-                        .still_grantable(v.issuer_id, node_zpr_addr)
-                })
-                .collect::<Vec<_>>(),
+            Ok(visas) => visas,
             Err(e) => {
                 error!(target: API, "failed to initialize node VSS for {:?}: {}", self.node.get_cn(), e);
                 let res_builder = res.get().init_res();
@@ -1975,6 +1974,43 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             }
         };
 
+        // The atomic grant (zl-zipline#248): the visas were prepared before the guard,
+        // and one may have been revoked, acknowledged or quarantined meanwhile (a
+        // link-down report can revoke one while preparation waits). One store step per
+        // visa decides whether it goes out, before the reply is built; it also releases
+        // the ingress (relay-side) copy of the VSS visa to the relay's VSS push (ingress
+        // last, gate g89 q4). If any is refused, the call fails with an internal error,
+        // as a visa revoked at commit does: the node calls register_vss again and gets a
+        // new VSS visa (J5b).
+        //
+        // TODO: Improve vsapi by adding a way for node to request its installed visas.
+        // https://github.com/org-zpr/zpr-visaservice/issues/108
+        for visa in &initial_visas {
+            let granted = match self
+                .asm
+                .visa_mgr
+                .grant_copy(visa.issuer_id, node_zpr_addr)
+                .await
+            {
+                Ok(granted) => granted,
+                Err(e) => {
+                    error!(target: API, "failed to grant visa {} to {:?}: {}", visa.issuer_id, self.node.get_cn(), e);
+                    false
+                }
+            };
+            if !granted {
+                warn!(target: API, "visa {} for {:?} was revoked before it was granted; failing register_vss", visa.issuer_id, self.node.get_cn());
+                let res_builder = res.get().init_res();
+                let mut err_builder = res_builder.init_error();
+                write_error(
+                    &mut err_builder,
+                    vsapi::ErrorCode::Internal,
+                    "failed to initialize node VSS",
+                );
+                return Ok(());
+            }
+        }
+
         let res_builder = res.get().init_res();
         let mut ok_builder = res_builder.initn_ok(initial_visas.len() as u32);
 
@@ -1983,25 +2019,6 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
 
             let vop = VisaOp::Grant(visa.clone());
             vop.write_to(&mut vop_builder);
-        }
-
-        // Now assume that our reply will make it to the node and mark its VSS visa as
-        // installed. That also releases the ingress (relay-side) copy of the visa to the
-        // relay's VSS push (ingress last, gate g89 q4). A node whose call fails calls
-        // register_vss again and gets a new VSS visa (J5b).
-        //
-        // TODO: Improve vsapi by adding a way for node to request its installed visas.
-        // https://github.com/org-zpr/zpr-visaservice/issues/108
-
-        for visa in &initial_visas {
-            if let Err(e) = self
-                .asm
-                .visa_mgr
-                .visa_installed(visa.issuer_id, node_zpr_addr)
-                .await
-            {
-                warn!(target: API, "failed to mark visa {} as installed on {:?}: {}", visa.issuer_id, self.node.get_cn(), e);
-            }
         }
 
         // Finally, update DB with node vss
@@ -2645,19 +2662,45 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         {
             Ok(decision) => match decision {
                 VisaDecision::Allow(visa, _route) => {
-                    // TODO: Do something with the route
-                    let res_builder = response.get().init_resp();
-                    let mut visa_bldr = res_builder.init_allow();
-                    visa.write_to(&mut visa_bldr);
-
-                    // Set visa as installed in our state
-                    if let Err(e) = self
+                    // Test seam (zl-zipline#248): a revoke landing between the
+                    // commit and the grant. Compiled out of release.
+                    #[cfg(test)]
+                    crate::visareq_worker::race_gate::pause_if_gated(
+                        requestor_addr,
+                        crate::visareq_worker::race_gate::Point::BeforeGrant,
+                    )
+                    .await;
+                    // The atomic grant (zl-zipline#248): one store step decides
+                    // whether the copy goes out, before the reply is built. A copy
+                    // revoked since its commit is not handed out; the reply is the
+                    // internal error a visa revoked at commit gets, and the node
+                    // re-requests.
+                    let granted = match self
                         .asm
                         .visa_mgr
-                        .visa_installed(visa.issuer_id, requestor_addr)
+                        .grant_copy(visa.issuer_id, requestor_addr)
                         .await
                     {
-                        error!(target: API, "failed to update visa {} as installed on {}: {}", visa.issuer_id, requestor_addr, e);
+                        Ok(granted) => granted,
+                        Err(e) => {
+                            error!(target: API, "failed to grant visa {} to {}: {}", visa.issuer_id, requestor_addr, e);
+                            false
+                        }
+                    };
+                    if granted {
+                        // TODO: Do something with the route
+                        let res_builder = response.get().init_resp();
+                        let mut visa_bldr = res_builder.init_allow();
+                        visa.write_to(&mut visa_bldr);
+                    } else {
+                        warn!(target: API, "visa {} for {} was revoked before it was granted; not handing it out", visa.issuer_id, requestor_addr);
+                        let res_builder = response.get().init_resp();
+                        let mut err_builder = res_builder.init_error();
+                        write_error(
+                            &mut err_builder,
+                            vsapi::ErrorCode::Internal,
+                            "visa request processing failed",
+                        );
                     }
                 }
                 VisaDecision::Deny(denial_reason) => {
@@ -3045,6 +3088,117 @@ fn connect_auth_expires(actor: &Actor) -> SystemTime {
 mod tests {
     use super::*;
     use capnp::message::Builder;
+
+    /// zl-zipline#248 window 1: a visa revoked between its commit and the grant is
+    /// not handed out. The `visaRequest` reply carries no visa: it is the internal
+    /// error a visa revoked at commit gets (gate q5), and the node re-requests.
+    #[tokio::test]
+    async fn visa_request_revoked_before_the_grant_carries_no_visa() {
+        use crate::connection_control::tests::{
+            FILES_ADDR, FILES_PORT, zode_fixture_on, zode_login,
+        };
+        use crate::visareq_worker::race_gate;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let cn = "zode-248-w1.zpr";
+                let (vreq_tx, vreq_rx) = tokio::sync::mpsc::channel(8);
+                let asm =
+                    Arc::new(crate::assembly::tests::new_assembly_for_tests(Some(vreq_tx)).await);
+                tokio::spawn(crate::visareq_worker::launch_arena(asm.clone(), vreq_rx, 1));
+                let (asm, cc, addr, privkey) = zode_fixture_on(asm, cn).await;
+                zode_login(&asm, &cc, addr, &privkey, cn).await;
+                let actor = asm
+                    .actor_mgr
+                    .get_actor_by_zpr_addr(&addr)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let handle: vsapi::v_s_handle::Client =
+                    capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), actor));
+                let pdesc =
+                    PacketDesc::new_tcp(&addr.to_string(), FILES_ADDR, 40000, FILES_PORT).unwrap();
+                let mut req = handle.visa_request_request();
+                pdesc.write_to(&mut req.get().init_req().init_packet());
+
+                let (parked, resume) = race_gate::arm(addr, race_gate::Point::BeforeGrant);
+                let call = tokio::task::spawn_local(async move {
+                    let resp = req.send().promise.await.unwrap();
+                    match resp.get().unwrap().get_resp().unwrap().which().unwrap() {
+                        vsapi::visa_response::Which::Allow(_) => "allow".to_string(),
+                        vsapi::visa_response::Which::Deny(_) => "deny".to_string(),
+                        vsapi::visa_response::Which::Error(e) => {
+                            format!("error {:?}", e.unwrap().get_code().unwrap())
+                        }
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(5), parked.notified())
+                    .await
+                    .expect("the request must reach the grant");
+                race_gate::disarm(&addr);
+                let ids = asm.visa_mgr.list_all_visa_ids().await.unwrap();
+                assert_eq!(ids.len(), 1, "the request committed one visa");
+                assert!(asm.visa_mgr.mark_visa_revoked(ids[0]).await.unwrap());
+                resume.notify_one();
+
+                assert_eq!(call.await.unwrap(), "error Internal");
+            })
+            .await;
+    }
+
+    /// zl-zipline#248 window 1 for `registerVss`: a VSS visa revoked between its
+    /// preparation and the grant is not handed out (an internal error; the node
+    /// calls `registerVss` again and gets a new one, J5b).
+    #[tokio::test]
+    async fn register_vss_revoked_before_the_grant_carries_no_visa() {
+        use crate::visareq_worker::race_gate;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, _relay, zode) = crate::core_visas::tests::build_net().await;
+                let actor = asm
+                    .actor_mgr
+                    .get_actor_by_zpr_addr(&zode)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let handle: vsapi::v_s_handle::Client =
+                    capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), actor));
+                let mut req = handle.register_vss_request();
+                {
+                    let mut sa = req.get().init_addr();
+                    zode.write_to(&mut sa.reborrow().init_addr());
+                    sa.set_port(crate::core_visas::tests::VSS_PORT);
+                }
+
+                let (parked, resume) = race_gate::arm(zode, race_gate::Point::BeforeGrant);
+                let call = tokio::task::spawn_local(async move {
+                    let resp = req.send().promise.await.unwrap();
+                    match resp.get().unwrap().get_res().unwrap().which().unwrap() {
+                        vsapi::result::Which::Ok(visas) => {
+                            format!("ok with {} visa(s)", visas.unwrap().len())
+                        }
+                        vsapi::result::Which::Error(e) => {
+                            format!("error {:?}", e.unwrap().get_code().unwrap())
+                        }
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(5), parked.notified())
+                    .await
+                    .expect("the call must reach the grant");
+                race_gate::disarm(&zode);
+                for id in asm
+                    .visa_mgr
+                    .get_pending_visa_ids_for_node(&zode)
+                    .await
+                    .unwrap()
+                {
+                    assert!(asm.visa_mgr.mark_visa_revoked(id).await.unwrap());
+                }
+                resume.notify_one();
+
+                assert_eq!(call.await.unwrap(), "error Internal");
+            })
+            .await;
+    }
 
     /// The authExpires an endpoint gets back must be its authentication
     /// expiry, not the ZPR-address lease. With a user authority expiring in
@@ -7114,6 +7268,40 @@ mod tests {
                             .unwrap()
                             .is_empty()
                     );
+                })
+                .await;
+        }
+
+        /// zl-zipline#248: a bootstrap mint is not policy-evaluated, so the request path's
+        /// commit check does not cover it. It is judged on the peering instead, and
+        /// `requestBootstrapVisas` holds the topology lock ([TopoOps]) from that check through
+        /// the mint: a policy install or a revocation pass, which commit under the same lock,
+        /// lands wholly before it or wholly after it. While another holder has the lock, the
+        /// request mints nothing.
+        #[tokio::test]
+        async fn bootstrap_mint_waits_for_the_topology_lock() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, relay, zode) = join_net_unconnected_joiner().await;
+                    let handle = handle_for(&asm, &relay).await;
+                    let held = asm.topo_mgr.ops().await;
+                    let call =
+                        tokio::task::spawn_local(async move { request(&handle, "zode.zpr").await });
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    assert!(
+                        !call.is_finished(),
+                        "the request waits for the topology lock"
+                    );
+                    assert!(
+                        asm.visa_mgr
+                            .get_visa_ids_for_actors(&[zode])
+                            .await
+                            .unwrap()
+                            .is_empty(),
+                        "nothing is minted while another holder has the lock"
+                    );
+                    drop(held);
+                    assert!(call.await.unwrap().is_ok(), "then the mint goes ahead");
                 })
                 .await;
         }

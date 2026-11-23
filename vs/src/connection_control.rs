@@ -1694,7 +1694,11 @@ impl ConnectionControl {
         // Test seam (zl-zipline#289): a gated test parks here, right after the
         // write, and cancels the RPC. Compiled out of release.
         #[cfg(test)]
-        crate::visareq_worker::race_gate::pause_if_gated(&zpr_addr).await;
+        crate::visareq_worker::race_gate::pause_if_gated(
+            &zpr_addr,
+            crate::visareq_worker::race_gate::Point::AfterActorWrite,
+        )
+        .await;
 
         // PR #42 review (P1): re-check the denylist now that the renewal is
         // persisted. A revocation landing between the pre-check above and
@@ -2486,7 +2490,11 @@ impl ConnectionControl {
         // Test seam (zl-zipline#290): a gated test parks here, between the record
         // and the removal. Compiled out of release.
         #[cfg(test)]
-        crate::visareq_worker::race_gate::pause_if_gated(&zpr_addr).await;
+        crate::visareq_worker::race_gate::pause_if_gated(
+            &zpr_addr,
+            crate::visareq_worker::race_gate::Point::BeforeActorRemoval,
+        )
+        .await;
 
         match asm.actor_mgr.remove_actor_by_zpr_addr(&zpr_addr).await {
             Ok(()) => {
@@ -8214,9 +8222,9 @@ pub(crate) mod tests {
     /// The VS-API session generation the fixture stamps on the node actor.
     const ZODE_SESSION: &str = "zode-session-1";
     /// Address of the actor providing the `files` service.
-    const FILES_ADDR: &str = "fd5a:5052:4000::f";
+    pub(crate) const FILES_ADDR: &str = "fd5a:5052:4000::f";
     /// Port of the `files` service.
-    const FILES_PORT: u16 = 8000;
+    pub(crate) const FILES_PORT: u16 = 8000;
 
     /// Policy for a Zode with OIDC login: the node CN's bootstrap key, one
     /// NODE join policy providing the `google` OIDC trusted service and the
@@ -8492,7 +8500,10 @@ pub(crate) mod tests {
         let id = create_zode_files_visa(&asm, addr).await;
         crate::event_mgr::reconcile_obligations(&asm).await;
 
-        let (parked, _resume) = crate::visareq_worker::race_gate::arm(addr);
+        let (parked, _resume) = crate::visareq_worker::race_gate::arm(
+            addr,
+            crate::visareq_worker::race_gate::Point::AfterActorWrite,
+        );
         let cc = Arc::new(cc);
         let logout = tokio::spawn({
             let (asm, cc) = (asm.clone(), cc.clone());
@@ -8522,6 +8533,341 @@ pub(crate) mod tests {
                 .unwrap(),
             vec![id],
             "the cancelled logout's visa must be revoked"
+        );
+    }
+
+    /// A revocation source racing an in-flight visa request (zl-zipline#248 window 2).
+    #[derive(Clone, Copy, Debug)]
+    enum RevocationSource {
+        /// The Zode logs out: it loses the user attribute the policy needs.
+        Logout,
+        /// The `files` provider disconnects (zl-zipline#290's disconnect obligation).
+        Disconnect,
+        /// A policy without the `files` allow is installed.
+        PolicyInstall,
+    }
+
+    /// Park the Zode's request for `files` at `point`, run `source` and its reconciler
+    /// pass, then resume. Returns the request's outcome and the IDs of the visas still
+    /// pending install or installed on the Zode.
+    async fn request_racing(
+        source: RevocationSource,
+        point: crate::visareq_worker::race_gate::Point,
+        cn: &str,
+    ) -> (String, Vec<u64>) {
+        use crate::visareq_worker::{VisaDecision, process_visa_request_for_test, race_gate};
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        crate::event_mgr::reconcile_obligations(&asm).await;
+        assert!(
+            zode_may_reach_files(&asm, addr).await,
+            "the login allows files"
+        );
+
+        let (parked, resume) = race_gate::arm(addr, point);
+        let request = tokio::spawn({
+            let asm = asm.clone();
+            let pdesc = zpr::vsapi_types::PacketDesc::new_tcp(
+                &addr.to_string(),
+                FILES_ADDR,
+                40000,
+                FILES_PORT,
+            )
+            .unwrap();
+            async move { process_visa_request_for_test(asm, addr, pdesc).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the request must reach the gate");
+        race_gate::disarm(&addr);
+        match source {
+            RevocationSource::Logout => {
+                zode_logout(&asm, &cc, addr, &privkey, cn).await;
+            }
+            RevocationSource::Disconnect => asm
+                .cc
+                .disconnect(
+                    asm.clone(),
+                    FILES_ADDR.parse().unwrap(),
+                    vsapi::DisconnectReason::Admin,
+                )
+                .await
+                .unwrap(),
+            RevocationSource::PolicyInstall => {
+                asm.policy_mgr
+                    .update_policy_from_container_bytes(
+                        crate::test_helpers::make_allow_policy_for_tcp_service("other", 1),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        crate::event_mgr::reconcile_obligations(&asm).await;
+        resume.notify_one();
+
+        let outcome = match request.await.unwrap() {
+            Ok(VisaDecision::Allow(..)) => "Allow".to_string(),
+            Ok(VisaDecision::Deny(code)) => format!("Deny({code:?})"),
+            Err(e) => format!("Err({e})"),
+        };
+        let mut live = asm
+            .visa_mgr
+            .get_pending_visa_ids_for_node(&addr)
+            .await
+            .unwrap();
+        live.extend(
+            asm.visa_mgr
+                .get_installed_visa_ids_for_node(&addr)
+                .await
+                .unwrap(),
+        );
+        (outcome, live)
+    }
+
+    /// zl-zipline#248 window 2: a logout, a disconnect or a policy install that lands
+    /// while a visa request is in flight -- after its actors are read, after its
+    /// evaluation, or after its store -- and whose reconciler pass runs before the
+    /// request resumes, never leaves the request's visa in force: the request is
+    /// refused and no copy is pending or installed. A trusted-service change records
+    /// the same attribute obligation as a logout; a link-down report is caught by the
+    /// commit-time route check (zl-zipline#224, `revoke_if_route_down`).
+    #[tokio::test]
+    async fn test_revocation_racing_a_visa_request_is_never_missed() {
+        use crate::visareq_worker::race_gate::Point;
+        let mut missed = Vec::new();
+        let mut i = 0;
+        for source in [
+            RevocationSource::Logout,
+            RevocationSource::Disconnect,
+            RevocationSource::PolicyInstall,
+        ] {
+            for point in [Point::AfterRefresh, Point::AfterEval, Point::AfterStore] {
+                i += 1;
+                let cn = format!("zode-248-w2-{i}.zpr");
+                let (outcome, live) = request_racing(source, point, &cn).await;
+                if outcome == "Allow" || !live.is_empty() {
+                    missed.push(format!("{source:?} at {point:?}: {outcome}, live {live:?}"));
+                }
+            }
+        }
+        assert!(missed.is_empty(), "revocations missed: {missed:#?}");
+    }
+
+    /// Request the Zode's visa for `files` (TCP 8000) through the request path.
+    async fn request_files(
+        asm: &Arc<Assembly>,
+        addr: IpAddr,
+    ) -> Result<crate::visareq_worker::VisaDecision, ServiceError> {
+        let pdesc =
+            zpr::vsapi_types::PacketDesc::new_tcp(&addr.to_string(), FILES_ADDR, 40000, FILES_PORT)
+                .unwrap();
+        crate::visareq_worker::process_visa_request_for_test(asm.clone(), addr, pdesc).await
+    }
+
+    /// Record an attribute obligation that changes nothing, as a trusted-service change
+    /// whose new attributes the request path cannot see yet would.
+    async fn record_attribute_obligation(asm: &Assembly) {
+        drop(
+            asm.revocations
+                .begin(crate::db::Obligation::attributes(vec![]))
+                .await
+                .unwrap(),
+        );
+    }
+
+    /// The visas pending install or installed on `addr`.
+    async fn live_visas(asm: &Assembly, addr: &IpAddr) -> Vec<u64> {
+        let mut live = asm
+            .visa_mgr
+            .get_pending_visa_ids_for_node(addr)
+            .await
+            .unwrap();
+        live.extend(
+            asm.visa_mgr
+                .get_installed_visa_ids_for_node(addr)
+                .await
+                .unwrap(),
+        );
+        live
+    }
+
+    /// zl-zipline#248 (codex pass 2, P1, operator decision "refuse on overlap"): a
+    /// reconciler pass that ran while a visa request was in flight refuses the request,
+    /// even if the visa still looks allowed by the state the visa service holds -- a
+    /// trusted-service change's new attributes may not be stored yet -- and leaves no
+    /// copy live. The node re-requests.
+    #[tokio::test]
+    async fn test_a_pass_overlapping_a_request_refuses_it() {
+        use crate::visareq_worker::race_gate;
+        let cn = "zode-248-overlap.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        crate::event_mgr::reconcile_obligations(&asm).await;
+
+        let (parked, resume) = race_gate::arm(addr, race_gate::Point::AfterEval);
+        let request = tokio::spawn({
+            let asm = asm.clone();
+            async move { request_files(&asm, addr).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the request must reach the gate");
+        race_gate::disarm(&addr);
+        record_attribute_obligation(&asm).await;
+        crate::event_mgr::reconcile_obligations(&asm).await;
+        resume.notify_one();
+
+        let outcome = request.await.unwrap();
+        assert!(outcome.is_err(), "the request must be refused");
+        assert!(live_visas(&asm, &addr).await.is_empty(), "no copy is live");
+        assert!(
+            matches!(
+                request_files(&asm, addr).await,
+                Ok(crate::visareq_worker::VisaDecision::Allow(..))
+            ),
+            "the re-request is allowed"
+        );
+    }
+
+    /// zl-zipline#248 (codex pass 2, P1): a visa request that starts while a reconciler
+    /// pass is in flight -- it may read the state before the pass has restamped it, and
+    /// be stored after the pass has listed the visas -- is refused.
+    #[tokio::test]
+    async fn test_a_request_starting_during_a_pass_is_refused() {
+        let cn = "zode-248-in-pass.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        crate::event_mgr::reconcile_obligations(&asm).await;
+
+        record_attribute_obligation(&asm).await;
+        let pass = asm.revocations.start_pass().await.unwrap();
+        let outcome = request_files(&asm, addr).await;
+        drop(pass);
+
+        assert!(outcome.is_err(), "the request must be refused");
+        assert!(live_visas(&asm, &addr).await.is_empty(), "no copy is live");
+    }
+
+    /// zl-zipline#248 (codex pass 3, P2, operator decision "persist the hold"): a visa
+    /// refused at commit whose revoke cannot be written is quarantined, in memory only.
+    /// The refusal leaves it marked uncommitted in the store, so after a restart it is
+    /// revoked at startup, before any reconciler pass and before a node can connect.
+    #[tokio::test]
+    async fn test_refused_visa_whose_revoke_failed_is_not_delivered_after_a_restart() {
+        use crate::visareq_worker::race_gate;
+        let cn = "zode-248-refused-restart.zpr";
+        let (asm, event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        std::mem::forget(event_rx);
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        crate::event_mgr::reconcile_obligations(&asm).await;
+
+        // A pass overlaps the request, so its commit check refuses the visa, and the
+        // revoke write fails.
+        let generation = asm.revocations.generation();
+        record_attribute_obligation(&asm).await;
+        let pass = asm.revocations.start_pass().await.unwrap();
+        let (parked, resume) = race_gate::arm(addr, race_gate::Point::AfterStore);
+        let request = tokio::spawn({
+            let asm = asm.clone();
+            async move { create_zode_files_visa_read_at(&asm, addr, generation).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the request reaches the store");
+        race_gate::disarm(&addr);
+        db.set_key_fault("visa:", crate::db::FaultMode::Reject);
+        resume.notify_one();
+        let outcome = request.await.unwrap();
+        db.set_key_fault("visa:", crate::db::FaultMode::None);
+        drop(pass);
+        assert!(outcome.is_err(), "the request is refused");
+        drop(asm); // the "crash": the quarantine is lost
+
+        let (restarted, _event_rx) = crate::assembly::tests::new_assembly_on_db(db).await;
+        let restarted = Arc::new(restarted);
+        // What startup does before the workers and the VS-API listener start; no
+        // reconciler pass has run yet.
+        restarted.visa_mgr.revoke_uncommitted_visas().await;
+        assert!(
+            restarted
+                .visa_mgr
+                .get_pending_visas_for_node(&addr)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the refused visa must not be deliverable after the restart"
+        );
+    }
+
+    /// zl-zipline#248 (codex P1): a stored visa is withheld from VSS delivery and from
+    /// the fetch by ID until its request's commit check has passed, so a copy the check
+    /// would refuse is never pushed meanwhile. Once the request completes, its copies are
+    /// deliverable.
+    #[tokio::test]
+    async fn test_a_visa_is_withheld_from_delivery_until_its_commit_check() {
+        use crate::visareq_worker::{VisaDecision, process_visa_request_for_test, race_gate};
+        let cn = "zode-248-hold.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        crate::event_mgr::reconcile_obligations(&asm).await;
+
+        let (parked, resume) = race_gate::arm(addr, race_gate::Point::AfterStore);
+        let request = tokio::spawn({
+            let asm = asm.clone();
+            let pdesc = zpr::vsapi_types::PacketDesc::new_tcp(
+                &addr.to_string(),
+                FILES_ADDR,
+                40000,
+                FILES_PORT,
+            )
+            .unwrap();
+            async move { process_visa_request_for_test(asm, addr, pdesc).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the request must reach the store");
+        race_gate::disarm(&addr);
+        let ids = asm.visa_mgr.list_all_visa_ids().await.unwrap();
+        assert_eq!(ids.len(), 1, "the visa is stored");
+        assert!(
+            asm.visa_mgr
+                .get_pending_visas_for_node(&addr)
+                .await
+                .unwrap()
+                .is_empty(),
+            "not pushed before its commit check"
+        );
+        assert!(
+            asm.visa_mgr
+                .visas_for_node_by_ids(&addr, &ids)
+                .await
+                .unwrap()
+                .is_empty(),
+            "not fetchable before its commit check"
+        );
+        resume.notify_one();
+
+        assert!(matches!(
+            request.await.unwrap(),
+            Ok(VisaDecision::Allow(..))
+        ));
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_visa_ids_for_node(&addr)
+                .await
+                .unwrap(),
+            ids,
+            "deliverable once the request completed"
+        );
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_visas_for_node(&addr)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -8669,6 +9015,20 @@ pub(crate) mod tests {
 
     /// Create a live visa held by the Zode for the Zode -> `files` flow.
     pub(crate) async fn create_zode_files_visa(asm: &Arc<Assembly>, addr: IpAddr) -> u64 {
+        create_zode_files_visa_read_at(asm, addr, asm.revocations.generation())
+            .await
+            .expect("visa must be created")
+            .visa
+            .issuer_id
+    }
+
+    /// As [create_zode_files_visa], for a request that read the revocation generation
+    /// `generation` before its actors and policy; returns the outcome of `create_visa`.
+    pub(crate) async fn create_zode_files_visa_read_at(
+        asm: &Arc<Assembly>,
+        addr: IpAddr,
+        generation: u64,
+    ) -> Result<crate::visa_mgr::VisaWithMetadata, ServiceError> {
         use libeval::eval_result::{Direction, Hit};
         use libeval::route::Route;
         let pdesc =
@@ -8685,11 +9045,9 @@ pub(crate) mod tests {
                 0,
                 0,
                 SystemTime::now() + Duration::from_secs(3600),
+                generation,
             )
             .await
-            .expect("visa must be created")
-            .visa
-            .issuer_id
     }
 
     /// Test 5: a visa the user attribute allowed is marked for revocation by

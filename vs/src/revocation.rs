@@ -26,6 +26,15 @@
 //! its write already committed or abandoned: a pass never deletes an
 //! obligation whose write lands after the pass read the state.
 //!
+//! # The generation
+//!
+//! The generation is a sequence lock over passes (zl-zipline#248): a pass that
+//! lists obligations bumps it at its start, making it odd, and again when it
+//! ends ([Pass] drops), making it even. A visa request reads it before it reads
+//! anything its decision rests on, and commits its visa only if no pass
+//! overlapped it ([RevocationLedger::no_pass_overlapped]): the generation was
+//! even then and is unchanged after the store.
+//!
 //! # Lock rule
 //!
 //! The guard is always the innermost of the visa service's coordination
@@ -52,6 +61,32 @@ pub struct RevocationLedger {
     repo: RevocationRepo,
     barrier: RwLock<()>,
     generation: AtomicU64,
+}
+
+/// A reconciler pass in progress ([RevocationLedger::start_pass]): derefs to the
+/// obligations it listed. Dropping it ends the pass -- on every exit, a panic
+/// included -- by bumping the generation back to even, if the pass bumped it at
+/// its start. Drop it only once the pass has recorded every revocation.
+pub struct Pass<'ledger> {
+    pending: Vec<(u64, Obligation)>,
+    ledger: &'ledger RevocationLedger,
+}
+
+impl std::ops::Deref for Pass<'_> {
+    type Target = Vec<(u64, Obligation)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pending
+    }
+}
+
+impl Drop for Pass<'_> {
+    fn drop(&mut self) {
+        // start_pass bumped only for a non-empty list.
+        if !self.pending.is_empty() {
+            self.ledger.generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Held by a writer from the moment its obligation is recorded until its
@@ -82,16 +117,20 @@ impl RevocationLedger {
     }
 
     /// Start a reconciler pass: wait until no writer holds a guard, list the
-    /// pending obligations and, if there are any, bump the generation, then
-    /// release the barrier. Every listed obligation's write has committed or
-    /// been abandoned by the time this returns.
-    pub async fn start_pass(&self) -> Result<Vec<(u64, Obligation)>, StoreError> {
+    /// pending obligations and, if there are any, bump the generation (to odd),
+    /// then release the barrier. Every listed obligation's write has committed or
+    /// been abandoned by the time this returns. The pass ends when the returned
+    /// [Pass] is dropped.
+    pub async fn start_pass(&self) -> Result<Pass<'_>, StoreError> {
         let _write = self.barrier.write().await;
         let pending = self.repo.list().await?;
         if !pending.is_empty() {
             self.generation.fetch_add(1, Ordering::SeqCst);
         }
-        Ok(pending)
+        Ok(Pass {
+            pending,
+            ledger: self,
+        })
     }
 
     /// Delete the obligations `seqs` once a pass has satisfied them.
@@ -102,16 +141,26 @@ impl RevocationLedger {
         Ok(())
     }
 
-    /// The revocation generation: bumped (SeqCst) under the exclusive barrier
-    /// at the start of every reconciler pass that lists at least one
-    /// obligation -- after every write whose obligation it lists has
-    /// committed, and before the pass reads any visa. A visa request that
-    /// reads it before reading its actors and policy and again after storing
-    /// its visa knows, if it moved, that a revocation may have missed the visa
-    /// (zl-zipline#248 builds on this; keep the name and semantics).
-    #[allow(dead_code)] // read by zl-zipline#248
+    /// The revocation generation (SeqCst): bumped to odd under the exclusive
+    /// barrier at the start of every reconciler pass that lists at least one
+    /// obligation -- after every write whose obligation it lists has committed,
+    /// and before the pass reads any state -- and back to even when that pass
+    /// ends. Odd means a pass is in progress. A visa request reads it before it
+    /// reads its actors and policy (zl-zipline#248, see
+    /// [RevocationLedger::no_pass_overlapped]).
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Whether no reconciler pass overlapped a visa request that read
+    /// [RevocationLedger::generation] `start` before it read anything its decision
+    /// rests on, called after its visa is stored: no pass was in progress then
+    /// (`start` even) and none started since (unchanged). Then every pass for a
+    /// write the request did not see starts after the store, and lists the visa.
+    /// Otherwise a pass may have read the state, or listed the visas, before the
+    /// visa was stored, and the request must not commit it (`VisaMgr::create_visa`).
+    pub fn no_pass_overlapped(&self, start: u64) -> bool {
+        start.is_multiple_of(2) && self.generation() == start
     }
 }
 
@@ -122,17 +171,23 @@ mod tests {
     use std::time::Duration;
 
     /// The barrier: while a writer holds its guard a pass cannot start; once
-    /// the guard is dropped the pass lists the obligation and the generation
-    /// has moved.
+    /// the guard is dropped the pass lists the obligation, and the generation
+    /// is odd while the pass runs and even again once it ended. A request that
+    /// read the generation before the pass sees it overlapped.
     #[tokio::test]
     async fn test_pass_waits_for_the_guard_and_bumps_the_generation() {
         let ledger = Arc::new(RevocationLedger::new(Arc::new(FakeDb::new())));
         let guard = ledger.begin(Obligation::attributes(vec![])).await.unwrap();
         let before = ledger.generation();
+        assert!(ledger.no_pass_overlapped(before));
 
         let pass = tokio::spawn({
             let ledger = ledger.clone();
-            async move { ledger.start_pass().await.unwrap() }
+            async move {
+                let pass = ledger.start_pass().await.unwrap();
+                let during = ledger.generation();
+                (pass.to_vec(), during)
+            }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -142,9 +197,15 @@ mod tests {
         assert_eq!(ledger.generation(), before);
 
         drop(guard);
-        let listed = pass.await.unwrap();
+        let (listed, during) = pass.await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(ledger.generation(), before + 1);
+        assert_eq!(during, before + 1, "odd while the pass runs");
+        assert!(
+            !ledger.no_pass_overlapped(during),
+            "a request starting meanwhile"
+        );
+        assert_eq!(ledger.generation(), before + 2, "even once it ended");
+        assert!(!ledger.no_pass_overlapped(before), "a request spanning it");
 
         // Completing deletes it; the next pass lists nothing.
         ledger.complete(&[listed[0].0]).await.unwrap();

@@ -1006,6 +1006,7 @@ pub async fn try_create_sweep_visa_on_route(
             0,
             vinst,
             SystemTime::now() + DEFAULT_EXPIRES,
+            asm.revocations.generation(),
         )
         .await?;
     Ok(vwmd.visa.issuer_id)

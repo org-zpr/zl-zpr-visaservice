@@ -19,7 +19,8 @@ pub use node::{Node, NodeRepo};
 pub use policy::PolicyRepo;
 pub use reauth::{ReauthObligation, ReauthRepo};
 pub use revocation::{Obligation, ObligationKind, RevocationRepo};
-pub use visa::{NodeVisaState, VisaMetadata, VisaRepo};
+pub(crate) use visa::PURGE_MIN_INTERVAL;
+pub use visa::{CommitState, NodeVisaState, VisaMetadata, VisaRepo};
 
 #[cfg(test)]
 pub use db_fake::{FakeDb, FaultMode};
