@@ -128,11 +128,7 @@ pub(crate) async fn reconcile_obligations(asm: &Arc<Assembly>) {
                 .iter()
                 .flat_map(|(_, ob)| ob.actors.iter().copied())
                 .collect();
-            if let Err(e) = asm
-                .revocations
-                .begin(ObligationKind::Attributes, actors)
-                .await
-            {
+            if let Err(e) = asm.revocations.begin(Obligation::attributes(actors)).await {
                 error!(target: EVENT, "failed to record the pending sweep: {e}; the policy step will run again");
                 return;
             }
@@ -160,8 +156,10 @@ enum PassOutcome {
 }
 
 /// The work of one pass over `pending`, in order:
-/// 1. if any obligation is a policy install, the policy pass ([policy_pass]) against
-///    the current policy;
+/// 0. a policy obligation's policy is published first ([catch_up_policy]); one whose
+///    install never stored its policy is satisfied with nothing to do;
+/// 1. if any other obligation is a policy install, the policy pass ([policy_pass])
+///    against the current policy;
 /// 2. the attribute refresh of the actors behind live visas, then the sweep of every
 ///    live visa ([revalidate_visas]) -- an actor without a live visa is re-checked
 ///    lazily, by the revision check on its next visa request; every refresh must be
@@ -172,9 +170,23 @@ enum PassOutcome {
 ///    the sweep skips visas whose actor it cannot resolve, and an actor is gone when
 ///    a failed write cleaned it up or an undo removed it.
 async fn satisfy_obligations(asm: &Arc<Assembly>, pending: &[(u64, Obligation)]) -> PassOutcome {
+    let Some(published) = catch_up_policy(asm, pending).await else {
+        return PassOutcome::Pending;
+    };
+    // A policy obligation whose vinst is still above the published one belongs to an
+    // install whose write never landed: it changed nothing, so it is satisfied
+    // without a policy pass (which would move the re-authentication deadline).
+    let landed = |ob: &Obligation| ob.vinst.is_none_or(|vinst| vinst <= published);
+    let never_landed = pending.iter().filter(|(_, ob)| !landed(ob)).count();
+    if never_landed > 0 {
+        info!(target: EVENT, "reconcile: dropping {never_landed} policy obligation(s) whose install was never stored");
+    }
+    if never_landed == pending.len() {
+        return PassOutcome::Satisfied;
+    }
     let policy_step = pending
         .iter()
-        .any(|(_, ob)| ob.kind == ObligationKind::Policy);
+        .any(|(_, ob)| ob.kind == ObligationKind::Policy && landed(ob));
     if policy_step {
         match policy_pass(asm).await {
             Ok(true) => {}
@@ -222,6 +234,22 @@ async fn satisfy_obligations(asm: &Arc<Assembly>, pending: &[(u64, Obligation)])
     }
 }
 
+/// Step 0 of [satisfy_obligations] (zl-zipline#290): a policy obligation completes
+/// only once the policy it names is published. If the published vinst is below the
+/// highest vinst a listed policy obligation names, catch up with the store
+/// ([crate::policy_mgr::PolicyMgr::catch_up_with_store]): publish a policy whose
+/// write landed but was never published. Returns the published vinst after that,
+/// or `None` if the catch-up failed (everything stays pending).
+async fn catch_up_policy(asm: &Arc<Assembly>, pending: &[(u64, Obligation)]) -> Option<u64> {
+    if let Some(target) = pending.iter().filter_map(|(_, ob)| ob.vinst).max()
+        && let Err(e) = asm.policy_mgr.catch_up_with_store(target).await
+    {
+        error!(target: EVENT, "reconcile: failed to catch up with the stored policy: {e}");
+        return None;
+    }
+    Some(asm.policy_mgr.get_current_snapshot().vinst())
+}
+
 /// Step 3 of [satisfy_obligations]: revoke every visa of each actor named in
 /// `pending` that no longer exists. False if an actor lookup or the visa listing
 /// failed.
@@ -249,7 +277,11 @@ async fn revoke_visas_of_vanished_actors(
     // A visa whose revoke cannot be recorded is quarantined in memory for retry
     // ([crate::visa_mgr::VisaMgr::revoke_visa_ids]), which a restart loses, and the
     // sweep skips it (its actor is gone): keep the obligation until it is persisted.
-    match asm.visa_mgr.remove_visas_for_actors(&vanished).await {
+    match asm
+        .visa_mgr
+        .remove_visas_for_vanished_actors(&vanished)
+        .await
+    {
         Ok(0) => true,
         Ok(quarantined) => {
             warn!(target: EVENT, "reconcile: {quarantined} revoke(s) of vanished actors' visas not persisted; kept pending");
@@ -855,7 +887,7 @@ mod tests {
     async fn record_attribute_obligation(asm: &Assembly, actors: Vec<IpAddr>) {
         drop(
             asm.revocations
-                .begin(crate::db::ObligationKind::Attributes, actors)
+                .begin(Obligation::attributes(actors))
                 .await
                 .unwrap(),
         );
@@ -1096,16 +1128,428 @@ mod tests {
         );
     }
 
+    // ---- zl-zipline#290: durable disconnect revocation, policy catch-up ----
+
+    /// The Zode fixture logged in, holding a visa to `files`, with every setup
+    /// obligation settled. Returns the assembly, the Zode's address, the visa and
+    /// the fake DB.
+    async fn zode_with_visa(cn: &str) -> (Arc<Assembly>, IpAddr, u64, Arc<crate::db::FakeDb>) {
+        use crate::connection_control::tests::{
+            create_zode_files_visa, zode_fixture_on, zode_login,
+        };
+        let (asm, event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        std::mem::forget(event_rx);
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let id = create_zode_files_visa(&asm, addr).await;
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty(), "setup settled");
+        (asm, addr, id, db)
+    }
+
+    /// Whether the visa `id` is marked for revocation on `node`.
+    async fn revoke_pending(asm: &Assembly, node: &IpAddr, id: u64) -> bool {
+        asm.visa_mgr
+            .get_pending_revoke_visa_ids_for_node(node)
+            .await
+            .unwrap()
+            .contains(&id)
+    }
+
+    /// Test 1 (zl-zipline#290): a disconnect whose visa revoke cannot be written
+    /// leaves the revoke only in the in-memory quarantine, and the visa service
+    /// then restarts. The disconnect recorded an obligation naming the departed
+    /// node, so the restarted visa service revokes the visa.
+    #[tokio::test]
+    async fn test_disconnect_with_a_failed_revoke_survives_a_restart() {
+        let (asm, addr, id, db) = zode_with_visa("zode-290a.zpr").await;
+
+        db.set_key_fault("visa:", crate::db::FaultMode::Reject); // visa writes only
+        asm.cc
+            .disconnect(asm.clone(), addr, DisconnectReason::Admin)
+            .await
+            .unwrap();
+        db.set_key_fault("visa:", crate::db::FaultMode::None);
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .is_none(),
+            "the actor is gone"
+        );
+        assert!(!revoke_pending(&asm, &addr, id).await, "the revoke failed");
+        drop(asm); // the "crash": the quarantine is lost
+
+        let (restarted, _event_rx) = crate::assembly::tests::new_assembly_on_db(db).await;
+        let restarted = Arc::new(restarted);
+        reconcile_obligations(&restarted).await;
+        assert!(
+            revoke_pending(&restarted, &addr, id).await,
+            "the restarted visa service must revoke the departed node's visa"
+        );
+        assert!(pending(&restarted).await.is_empty());
+    }
+
+    /// Test 2 (zl-zipline#290, VS#79 Copilot): the policy pass disconnects a node
+    /// the new policy rejects, and the node's visa revoke cannot be written. The
+    /// policy obligation completes, but the disconnect's own obligation stays
+    /// pending, and once the store recovers the next pass revokes the visa.
+    #[tokio::test]
+    async fn test_policy_pass_disconnect_with_a_failed_revoke_stays_pending() {
+        use crate::test_helpers::policy_with_peerings_and_node_cns;
+        let (asm, addr, id, db) = zode_with_visa("zode-290b.zpr").await;
+        // The only join policy admits another node.
+        let other: IpAddr = "fd5a:5052::2".parse().unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(policy_with_peerings_and_node_cns(
+                &[],
+                &[(other, "node-other")],
+            ))
+            .await
+            .unwrap();
+
+        db.set_key_fault("visa:", crate::db::FaultMode::Reject);
+        reconcile_obligations(&asm).await;
+        db.set_key_fault("visa:", crate::db::FaultMode::None);
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .is_none(),
+            "the policy pass disconnected the node"
+        );
+        let left = pending(&asm).await;
+        assert!(
+            left.iter().any(|ob| ob.actors.contains(&addr)),
+            "the disconnect's obligation naming the node stays pending: {left:?}"
+        );
+
+        reconcile_obligations(&asm).await;
+        assert!(revoke_pending(&asm, &addr, id).await);
+        assert!(pending(&asm).await.is_empty());
+    }
+
+    /// Test 3 (zl-zipline#290): the disconnect records its obligation before it
+    /// removes the actor and holds the guard across the removal, so a pass that
+    /// lists the obligation never finds the actor still there (it would sweep,
+    /// skip nothing and complete before the removal lands).
+    #[tokio::test]
+    async fn test_disconnect_holds_its_guard_across_the_actor_removal() {
+        use crate::visareq_worker::race_gate;
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = "fd5a:5052::290".parse().unwrap();
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp("fd5a:5052::290", "node-290", "[fd5a:5052::1290]:1234"),
+                false,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let setup: Vec<u64> = asm
+            .revocations
+            .start_pass()
+            .await
+            .unwrap()
+            .iter()
+            .map(|(seq, _)| *seq)
+            .collect();
+        asm.revocations.complete(&setup).await.unwrap();
+
+        let (parked, resume) = race_gate::arm(node);
+        let disconnect = tokio::spawn({
+            let asm = asm.clone();
+            async move {
+                asm.cc
+                    .disconnect(asm.clone(), node, DisconnectReason::Admin)
+                    .await
+            }
+        });
+        // Recorded, not yet removed.
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the disconnect must reach the actor removal");
+        race_gate::disarm(&node);
+        let pass = tokio::spawn({
+            let asm = asm.clone();
+            async move { asm.revocations.start_pass().await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !pass.is_finished(),
+            "a pass must wait for the disconnect's guard"
+        );
+
+        resume.notify_one();
+        let listed = pass.await.unwrap();
+        assert!(
+            listed.iter().any(|(_, ob)| ob.actors.contains(&node)),
+            "the pass lists the disconnect's obligation"
+        );
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&node)
+                .await
+                .unwrap()
+                .is_none(),
+            "by then the actor record is gone"
+        );
+        disconnect.await.unwrap().unwrap();
+    }
+
+    /// zl-zipline#290 (local codex P1): a departed node can rejoin before the pass for
+    /// its disconnect has run. Its new bootstrap visas are minted from the relay's
+    /// peering before it has an actor, so the vanished-actor step leaves them alone
+    /// (the sweep re-checks them against the peering) while it revokes the departed
+    /// actor's own visas; revoking them would cut the joiner off from the visa
+    /// service it is authenticating with.
+    #[tokio::test]
+    async fn test_vanished_actor_step_spares_a_rejoining_nodes_bootstrap_visas() {
+        use libeval::eval_result::Direction;
+        let (asm, addr, id, _db) = zode_with_visa("zode-290d.zpr").await;
+        asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await.unwrap();
+
+        // The node rejoins through a relay: bootstrap visas, no actor yet.
+        let relay: IpAddr = "fd5a:5052::1".parse().unwrap();
+        let policy = asm.policy_mgr.get_current();
+        let bootstrap = asm
+            .visa_mgr
+            .mint_bootstrap_visa(&asm, &policy, &addr, &relay, Direction::Forward)
+            .await
+            .unwrap()
+            .issuer_id;
+
+        assert_eq!(
+            asm.visa_mgr
+                .remove_visas_for_vanished_actors(&[addr])
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            revoke_pending(&asm, &addr, id).await,
+            "the old visa is revoked"
+        );
+        assert!(
+            !revoke_pending(&asm, &relay, bootstrap).await
+                && !revoke_pending(&asm, &addr, bootstrap).await,
+            "the joiner's bootstrap visa must stay"
+        );
+    }
+
+    /// Test 4 (zl-zipline#290, gate q4): a disconnect whose obligation cannot be
+    /// recorded still tears the actor down (logged): it fails closed on the node,
+    /// and its visas wait for their expiry.
+    #[tokio::test]
+    async fn test_disconnect_tears_down_when_its_obligation_cannot_be_recorded() {
+        let (asm, addr, _id, db) = zode_with_visa("zode-290c.zpr").await;
+
+        db.set_key_fault("revoke:", crate::db::FaultMode::Reject);
+        asm.cc
+            .disconnect(asm.clone(), addr, DisconnectReason::Admin)
+            .await
+            .unwrap();
+        db.set_key_fault("revoke:", crate::db::FaultMode::None);
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .is_none(),
+            "the actor is torn down anyway"
+        );
+        assert!(pending(&asm).await.is_empty(), "no obligation was recorded");
+    }
+
+    /// The sweep assembly under a node join policy (vinst 2) that keeps both nodes,
+    /// with a visa seeded at that vinst -- so a sweep under vinst 2 considers it
+    /// current and keeps it -- and every setup obligation settled. A newer policy's
+    /// sweep re-checks the visa and revokes it (the policy has no communication
+    /// rule). Returns the assembly, node A, the visa and the fake DB.
+    async fn swept_visa_under_node_policy() -> (Arc<Assembly>, IpAddr, u64, Arc<crate::db::FakeDb>)
+    {
+        let (asm, node_a, db) = crate::test_helpers::build_sweep_asm_with_db(false).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+        reconcile_obligations(&asm).await;
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        let id = create_sweep_visa(&asm, &node_a, vinst).await;
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty(), "setup settled");
+        assert!(
+            !revoke_pending(&asm, &node_a, id).await,
+            "the visa is current"
+        );
+        (asm, node_a, id, db)
+    }
+
+    /// Whether a re-authentication obligation for `vinst` is recorded.
+    async fn reauth_recorded(asm: &Assembly, vinst: u64) -> bool {
+        crate::db::ReauthRepo::new(asm.state_db.clone())
+            .list_obligations()
+            .await
+            .unwrap()
+            .iter()
+            .any(|ob| ob.vinst == vinst)
+    }
+
+    /// The stored policy's vinst.
+    async fn stored_vinst(asm: &Assembly) -> u64 {
+        crate::db::PolicyRepo::new(asm.state_db.clone())
+            .get_current_identifier()
+            .await
+            .unwrap()
+            .unwrap()
+            .vinst
+    }
+
+    /// Install the next policy while the policy write is faulted with `mode`; the
+    /// install fails. Returns the vinst it was assigned.
+    async fn install_with_policy_fault(
+        asm: &Assembly,
+        db: &crate::db::FakeDb,
+        mode: crate::db::FaultMode,
+    ) -> u64 {
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst() + 1;
+        db.set_key_fault("policy:current", mode);
+        let installed = asm
+            .policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy_version(None, 2))
+            .await;
+        db.set_key_fault("policy:current", crate::db::FaultMode::None);
+        assert!(installed.is_err(), "the install reports failure");
+        vinst
+    }
+
+    /// Test 5 (zl-zipline#290, VS#79 Copilot): the policy write lands but its reply
+    /// is lost, so the install fails without publishing. The pass catches up with
+    /// the stored policy and runs the policy pass for it: the visa the new policy
+    /// denies is revoked, its re-authentication obligation is recorded, and nothing
+    /// is left pending.
+    #[tokio::test]
+    async fn test_policy_write_landed_unpublished_is_caught_up() {
+        let (asm, node_a, id, db) = swept_visa_under_node_policy().await;
+        let vinst =
+            install_with_policy_fault(&asm, &db, crate::db::FaultMode::ApplyThenError).await;
+        assert_eq!(stored_vinst(&asm).await, vinst, "the write landed");
+        assert_eq!(asm.policy_mgr.get_current_snapshot().vinst(), vinst - 1);
+
+        reconcile_obligations(&asm).await;
+        assert_eq!(
+            asm.policy_mgr.get_current_snapshot().vinst(),
+            vinst,
+            "the stored policy is published"
+        );
+        assert!(revoke_pending(&asm, &node_a, id).await, "its sweep ran");
+        assert!(reauth_recorded(&asm, vinst).await, "its policy pass ran");
+        assert!(pending(&asm).await.is_empty());
+    }
+
+    /// Test 6 (zl-zipline#290): as test 5, but the visa service restarts before any
+    /// pass. The restart loads the stored policy, and the pass for it runs (green
+    /// before the fix too: the startup half of the catch-up rule).
+    #[tokio::test]
+    async fn test_policy_write_landed_unpublished_then_restart() {
+        let (asm, node_a, id, db) = swept_visa_under_node_policy().await;
+        let vinst =
+            install_with_policy_fault(&asm, &db, crate::db::FaultMode::ApplyThenError).await;
+        drop(asm);
+
+        let (restarted, _event_rx) = crate::assembly::tests::new_assembly_on_db(db).await;
+        let restarted = Arc::new(restarted);
+        assert_eq!(restarted.policy_mgr.get_current_snapshot().vinst(), vinst);
+        reconcile_obligations(&restarted).await;
+        assert!(revoke_pending(&restarted, &node_a, id).await);
+        assert!(reauth_recorded(&restarted, vinst).await);
+        assert!(pending(&restarted).await.is_empty());
+    }
+
+    /// Test 6b (zl-zipline#290, VS#79 Copilot): as test 5, then a pass, then a
+    /// restart. The pass must have run the policy pass for the stored policy: the
+    /// restarted visa service has no obligation left to run it.
+    #[tokio::test]
+    async fn test_policy_write_landed_unpublished_pass_then_restart() {
+        let (asm, node_a, id, db) = swept_visa_under_node_policy().await;
+        let vinst =
+            install_with_policy_fault(&asm, &db, crate::db::FaultMode::ApplyThenError).await;
+        reconcile_obligations(&asm).await;
+        drop(asm);
+
+        let (restarted, _event_rx) = crate::assembly::tests::new_assembly_on_db(db).await;
+        let restarted = Arc::new(restarted);
+        reconcile_obligations(&restarted).await;
+        assert!(
+            reauth_recorded(&restarted, vinst).await,
+            "the policy pass for the stored policy ran"
+        );
+        assert!(revoke_pending(&restarted, &node_a, id).await);
+        assert!(pending(&restarted).await.is_empty());
+    }
+
+    /// Test 7 (zl-zipline#290): the policy write never landed. Its obligation
+    /// changed nothing: the pass drops it without a policy pass (no
+    /// re-authentication obligation, so no deadline moved), and the published
+    /// policy stays.
+    #[tokio::test]
+    async fn test_policy_write_never_landed_drops_the_obligation() {
+        let (asm, node_a, id, db) = swept_visa_under_node_policy().await;
+        let vinst = install_with_policy_fault(&asm, &db, crate::db::FaultMode::Reject).await;
+        assert_eq!(
+            stored_vinst(&asm).await,
+            vinst - 1,
+            "the write never landed"
+        );
+        assert!(!pending(&asm).await.is_empty());
+
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty());
+        assert_eq!(asm.policy_mgr.get_current_snapshot().vinst(), vinst - 1);
+        assert!(!reauth_recorded(&asm, vinst).await, "no policy pass ran");
+        assert!(!revoke_pending(&asm, &node_a, id).await);
+    }
+
+    /// Test 8 (zl-zipline#290): a catch-up that cannot read the stored policy
+    /// keeps every obligation pending, and the next pass catches up.
+    #[tokio::test]
+    async fn test_policy_catch_up_read_error_keeps_the_obligation() {
+        let (asm, node_a, id, db) = swept_visa_under_node_policy().await;
+        let vinst =
+            install_with_policy_fault(&asm, &db, crate::db::FaultMode::ApplyThenError).await;
+
+        db.set_key_fault("policy:current", crate::db::FaultMode::Reject); // reads fail
+        reconcile_obligations(&asm).await;
+        db.set_key_fault("policy:current", crate::db::FaultMode::None);
+        assert!(!pending(&asm).await.is_empty(), "kept pending");
+        assert_eq!(asm.policy_mgr.get_current_snapshot().vinst(), vinst - 1);
+        assert!(!reauth_recorded(&asm, vinst).await);
+
+        reconcile_obligations(&asm).await;
+        assert_eq!(asm.policy_mgr.get_current_snapshot().vinst(), vinst);
+        assert!(revoke_pending(&asm, &node_a, id).await);
+        assert!(pending(&asm).await.is_empty());
+    }
+
     /// Build a policy container whose single join policy marks connections as
     /// nodes. `provides` is the set of services a node must offer to stay valid
     /// (`None` = no service requirement). Conditions are empty, so the policy
     /// matches any actor's claims.
     fn make_node_join_policy(provides: Option<Vec<Service>>) -> Vec<u8> {
+        make_node_join_policy_version(provides, 1)
+    }
+
+    /// As [make_node_join_policy], at policy `version`: a different container
+    /// with the same rules.
+    fn make_node_join_policy_version(provides: Option<Vec<Service>>, version: u64) -> Vec<u8> {
         let mut msg = capnp::message::Builder::new_default();
         {
             let mut policy_bldr = msg.init_root::<capnp_policy::policy::Builder>();
             policy_bldr.set_created("2024-01-01T00:00:00Z");
-            policy_bldr.set_version(1);
+            policy_bldr.set_version(version);
             policy_bldr.set_metadata("");
             let mut jp_list = policy_bldr.reborrow().init_join_policies(1);
             let mut jp_bldr = jp_list.reborrow().get(0);

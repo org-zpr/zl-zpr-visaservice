@@ -690,7 +690,53 @@ impl PolicyMgr {
         // Assign the new vinst while the policy Arc is still uniquely held.
         let vinst = self.state.load().policy.vinst() + 1;
         loaded.set_vinst(vinst);
+        self.commit_policy(&loaded, true).await?;
+        Ok(vinst)
+    }
 
+    /// Bring the published policy up to the stored one, for the reconciler's policy
+    /// step (zl-zipline#290). A policy install's write can land in the store and
+    /// still fail to return (a lost reply, a cancelled admin request), so the
+    /// install never publishes it; its obligation, recorded before the write, names
+    /// its vinst. While the published vinst is below `target`, the highest vinst a
+    /// pending policy obligation names, this re-reads the store under `update_lock`:
+    /// - a stored vinst above the published one is a write that landed unpublished:
+    ///   it is published here, exactly as the install would have;
+    /// - otherwise the writes never landed, and nothing is done: the caller drops
+    ///   the obligations whose vinst is still above the published one.
+    ///
+    /// An error (the store cannot be read, the stored policy cannot be built) leaves
+    /// the published policy as it was; the caller keeps the obligations pending.
+    pub async fn catch_up_with_store(&self, target: u64) -> Result<(), ServiceError> {
+        let _guard = self.update_lock.lock().await;
+        let published = self.state.load().policy.vinst();
+        if published >= target {
+            return Ok(());
+        }
+        let stored = self.repo.get_current_identifier().await?;
+        let Some(stored) = stored.filter(|s| s.vinst > published) else {
+            info!(target: MAIN, "policy vinst={target} was never stored; published vinst={published} stays");
+            return Ok(());
+        };
+        warn!(target: MAIN, "policy vinst={} was stored but not published (published vinst={published}); publishing it", stored.vinst);
+        let mut loaded = self
+            .repo
+            .get_current_loaded_policy(&config::POLICY_MIN_VERSION)
+            .await?;
+        loaded.set_vinst(stored.vinst);
+        self.commit_policy(&loaded, false).await
+    }
+
+    /// Build `loaded`'s state and publish it: the tail an install and a catch-up
+    /// ([Self::catch_up_with_store]) share. The caller holds `update_lock` and has
+    /// set `loaded`'s vinst. An install (`install`) also records the policy
+    /// obligation and writes the policy to the store before it publishes; a
+    /// catch-up publishes what the store already holds.
+    async fn commit_policy(
+        &self,
+        loaded: &LoadedPolicy,
+        install: bool,
+    ) -> Result<(), ServiceError> {
         // Resolve topology before swapping in the new state so a failed update leaves
         // the current policy, container, and topology untouched. The new policy,
         // container, and links swap in together as one PolicyState. The live state is
@@ -703,7 +749,7 @@ impl PolicyMgr {
         let previous = self.state.load_full();
         let candidate = Self::build_state(
             &self.resolver,
-            &loaded,
+            loaded,
             &self.file_ts_dir,
             &self.ts_secrets_dir,
             &self.actor_repo,
@@ -727,22 +773,30 @@ impl PolicyMgr {
         // `node_commit_lock` field) -> the revocation guard.
         let _commit = self.node_commit_lock.lock().await;
 
-        // The new policy can make live visas unacceptable: record the policy
-        // obligation durably before anything is written, and hold its guard until
-        // the install is published, so the reconciler's pass for it reads the new
-        // policy (zl-zipline#289). A failed record fails the install (fail closed).
-        // The caller kicks the reconciler once this returns.
-        let _obligation = match self.revocations.get() {
-            Some(ledger) => Some(
-                ledger
-                    .begin(crate::db::ObligationKind::Policy, Vec::new())
-                    .await?,
-            ),
-            None => None,
+        // The new policy can make live visas unacceptable: an install records the
+        // policy obligation, naming its vinst, durably before anything is written,
+        // and holds its guard until the policy is published, so the reconciler's
+        // pass for it reads the new policy (zl-zipline#289). A failed record fails
+        // the install (fail closed). The write can land and still return an error;
+        // the reconciler then publishes the stored policy before its policy step
+        // ([Self::catch_up_with_store], zl-zipline#290). The caller kicks the
+        // reconciler once this returns, whatever the outcome.
+        let _obligation = if install {
+            let guard = match self.revocations.get() {
+                Some(ledger) => Some(
+                    ledger
+                        .begin(crate::db::Obligation::policy(loaded.policy().vinst()))
+                        .await?,
+                ),
+                None => None,
+            };
+            self.repo.set_current_policy(loaded, false).await?;
+            guard
+        } else {
+            None
         };
-        self.repo.set_current_policy(&loaded, false).await?;
         self.publish(candidate.commit(Some(&previous), self.oidc_refresh));
-        Ok(vinst)
+        Ok(())
     }
 
     /// A consistent snapshot of policy, container, and resolved links taken in

@@ -38,7 +38,7 @@ use zpr::vsapi_types::{
 use crate::assembly::Assembly;
 use crate::auth;
 use crate::config;
-use crate::db::ObligationKind;
+use crate::db::Obligation;
 use crate::error::ServiceError;
 use crate::logging::targets::CC;
 use crate::login_nonce::LoginNonceStore;
@@ -1635,7 +1635,7 @@ impl ConnectionControl {
         let obligation = if needs_visa_sweep {
             Some(
                 asm.revocations
-                    .begin(ObligationKind::Attributes, vec![zpr_addr])
+                    .begin(Obligation::attributes(vec![zpr_addr]))
                     .await?,
             )
         } else {
@@ -2431,6 +2431,11 @@ impl ConnectionControl {
     }
 
     /// Body of [Self::disconnect_locked]; sets `vss` to the node's VSS worker handle.
+    ///
+    /// Before it removes the actor record it records a revocation obligation naming
+    /// the actor ([crate::revocation]), and holds the guard across the removal only;
+    /// it kicks the reconciler once the teardown is done. The inline visa revoke
+    /// stays the fast path; the obligation makes it durable (zl-zipline#290).
     async fn teardown_actor(
         &self,
         ops: &TopoOps<'_>,
@@ -2454,6 +2459,35 @@ impl ConnectionControl {
             warn!(target: CC, "disconnect for addr {zpr_addr} but no actor found in database");
         }
 
+        // The departed actor's visas are revoked inline below, but a revoke whose
+        // write fails is only quarantined in memory, which a restart loses, and no
+        // sweep can judge the visas of an actor that is gone. So record an
+        // obligation naming the actor first, and hold its guard across the removal
+        // only (zl-zipline#290): the reconciler then revokes every visa of the
+        // vanished actor and keeps the obligation until each revoke is persisted.
+        // The guard is innermost (after the topology guard and the node commit
+        // lock), and no caller holds a guard of its own: `reauthorize_actor` drops
+        // its guard before it disconnects, and the policy pass, the auth sweeps,
+        // the departure check and the admin endpoint hold none. A failed record is
+        // logged and the teardown goes ahead (gate q4): keeping the actor would be
+        // worse, and its visas then wait for their expiry.
+        let obligation = match asm
+            .revocations
+            .begin(Obligation::attributes(vec![zpr_addr]))
+            .await
+        {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                error!(target: CC, "failed to record the revocation obligation for disconnected actor {zpr_addr}: {e}; tearing it down anyway");
+                None
+            }
+        };
+
+        // Test seam (zl-zipline#290): a gated test parks here, between the record
+        // and the removal. Compiled out of release.
+        #[cfg(test)]
+        crate::visareq_worker::race_gate::pause_if_gated(&zpr_addr).await;
+
         match asm.actor_mgr.remove_actor_by_zpr_addr(&zpr_addr).await {
             Ok(()) => {
                 // Purge recorded trusted-service revisions before the address returns to
@@ -2469,6 +2503,8 @@ impl ConnectionControl {
                 error!(target: CC, "failed to remove disconnected actor with addr {zpr_addr} from actor db: {e}");
             }
         };
+        let recorded = obligation.is_some();
+        drop(obligation);
         drop(removal_guard);
 
         let mut removed_zpr_addrs = Vec::new();
@@ -2510,10 +2546,23 @@ impl ConnectionControl {
             error!(target: CC, "failed to remove visas for disconnected actor at addr {zpr_addr}: {e}");
         }
 
+        // The reconciler satisfies the obligation; when the inline revoke above
+        // succeeded, it finds nothing left to revoke and completes it.
+        if recorded {
+            asm.event_mgr.kick_reconcile();
+        }
+
         if asm.net_mgr.is_managed_address(&zpr_addr) {
             // De-allocating an address may error but it only indicates that the
             // address is not part of our pool.  We just log that if it occurs
             // and call the "disconnect" successful anyway.
+            // ponytail: the address is free again before the reconciler has run.
+            // If the inline revoke failed and an actor holds the address again
+            // before the next pass (a new actor from the pool, or the same node at
+            // its pinned address), the pass finds an actor there and sweeps the old
+            // visas against it instead of revoking them all. Name the departed
+            // session's visa IDs in the obligation if that ever matters
+            // (zl-zipline#290, gate g240 q6).
             if let Err(e) = asm.net_mgr.release_zpr_addr(zpr_addr) {
                 warn!(target: CC, "failed to release managed ZPR addr {zpr_addr} for actor disconnect: {e}");
             }

@@ -984,7 +984,9 @@ impl VisaMgr {
     /// waiting for TTL.
     ///
     /// Returns the number of visas whose revocation could not be persisted (quarantined
-    /// in memory only, see [VisaMgr::revoke_visa_ids]).
+    /// in memory only, see [VisaMgr::revoke_visa_ids]). A caller that must know the
+    /// revocation is durable records an obligation instead, or as well (a disconnect,
+    /// zl-zipline#290): the reconciler keeps it until this returns 0.
     pub async fn remove_visas_for_actors(
         &self,
         actor_addrs: &[IpAddr],
@@ -993,6 +995,28 @@ impl VisaMgr {
             return Ok(0);
         }
         let ids = self.get_visa_ids_for_actors(actor_addrs).await?;
+        Ok(self.revoke_visa_ids(&ids).await)
+    }
+
+    /// As [VisaMgr::remove_visas_for_actors], for actors that have vanished, but leaving
+    /// out bootstrap visas ([BOOTSTRAP_VISA_ZPL]). A joiner's bootstrap visas are minted
+    /// from the relay's peering before the joiner has an actor, so a departed node that
+    /// is rejoining has them while its old actor is gone: revoking them would cut it off
+    /// from the visa service it authenticates with. The sweep re-checks them against
+    /// the peering instead (zl-zipline#290).
+    ///
+    /// Returns the number of visas quarantined, as [VisaMgr::revoke_visa_ids] does.
+    pub async fn remove_visas_for_vanished_actors(
+        &self,
+        actor_addrs: &[IpAddr],
+    ) -> Result<u32, ServiceError> {
+        let mut ids = self.get_visa_ids_for_actors(actor_addrs).await?;
+        ids.retain(|id| {
+            !self
+                .repo
+                .get_visa_metadata_by_id(*id)
+                .is_ok_and(|md| md.zpl == BOOTSTRAP_VISA_ZPL)
+        });
         Ok(self.revoke_visa_ids(&ids).await)
     }
 
@@ -1005,7 +1029,8 @@ impl VisaMgr {
     ///
     /// Returns the number of visas quarantined: a caller that must know the revocation
     /// is durable (the reconciler, zl-zipline#289) treats any as a failure, because a
-    /// restart loses the in-memory quarantine.
+    /// restart loses the in-memory quarantine. A caller that only revokes as a fast
+    /// path, such as a disconnect, records an obligation first (zl-zipline#290).
     pub async fn revoke_visa_ids(&self, ids: &[u64]) -> u32 {
         let mut quarantined = 0u32;
         for &id in ids {
