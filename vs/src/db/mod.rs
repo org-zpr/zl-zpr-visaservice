@@ -8,6 +8,7 @@ mod link;
 mod node;
 mod policy;
 mod reauth;
+mod revocation;
 mod visa;
 
 pub use actor::{ActorRepo, Role, ServiceEntry};
@@ -17,6 +18,7 @@ pub use link::LinkRepo;
 pub use node::{Node, NodeRepo};
 pub use policy::PolicyRepo;
 pub use reauth::{ReauthObligation, ReauthRepo};
+pub use revocation::{Obligation, ObligationKind, RevocationRepo};
 pub use visa::{NodeVisaState, VisaMetadata, VisaRepo};
 
 #[cfg(test)]
