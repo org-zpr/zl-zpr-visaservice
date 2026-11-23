@@ -2556,11 +2556,13 @@ impl ConnectionControl {
             // De-allocating an address may error but it only indicates that the
             // address is not part of our pool.  We just log that if it occurs
             // and call the "disconnect" successful anyway.
-            // ponytail: the address returns to the pool before the reconciler has
-            // run. If the inline revoke failed and the address goes to a new actor
-            // before the next pass, the pass finds an actor there and sweeps the
-            // old visas against it instead of revoking them all; hold the address
-            // until the obligation completes if that ever matters (zl-zipline#290).
+            // ponytail: the address is free again before the reconciler has run.
+            // If the inline revoke failed and an actor holds the address again
+            // before the next pass (a new actor from the pool, or the same node at
+            // its pinned address), the pass finds an actor there and sweeps the old
+            // visas against it instead of revoking them all. Name the departed
+            // session's visa IDs in the obligation if that ever matters
+            // (zl-zipline#290, gate g240 q6).
             if let Err(e) = asm.net_mgr.release_zpr_addr(zpr_addr) {
                 warn!(target: CC, "failed to release managed ZPR addr {zpr_addr} for actor disconnect: {e}");
             }
