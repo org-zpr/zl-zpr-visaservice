@@ -834,6 +834,9 @@ pub(crate) mod race_gate {
         /// `VisaMgr::grant_copy`, after its first withheld check and before the install
         /// CAS.
         InsideGrant,
+        /// `VisaMgr::visas_for_node_by_ids`, after a copy passed the fetch check and
+        /// before it is built.
+        AfterFetchCheck,
         /// `reauthorize_actor`, right after the actor write.
         AfterActorWrite,
         /// A disconnect, between recording its obligation and removing the actor.

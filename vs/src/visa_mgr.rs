@@ -221,10 +221,7 @@ impl VisaMgr {
         mut visa: Visa,
         target_node: &IpAddr,
     ) -> Result<Visa, ServiceError> {
-        self.horizons.lock().unwrap().handed_out.insert(
-            (visa.issuer_id, *target_node),
-            Instant::now() + config::GRANT_HORIZON,
-        );
+        self.record_grant_horizon(visa.issuer_id, target_node);
         let md = self.repo.get_visa_metadata_by_id(visa.issuer_id)?;
 
         let Some(path) = md.path.as_ref() else {
@@ -806,6 +803,19 @@ impl VisaMgr {
         }
     }
 
+    /// Record that a copy of `visa_id` for `node` may land there until one
+    /// [config::GRANT_HORIZON] from now ([GrantHorizons]). A path that decides whether a
+    /// copy goes out must record this before it decides: a revoke acked between the
+    /// decision and the record would otherwise find no horizon and be torn down, while
+    /// the copy still goes out after it.
+    fn record_grant_horizon(&self, visa_id: u64, node: &IpAddr) {
+        self.horizons
+            .lock()
+            .unwrap()
+            .handed_out
+            .insert((visa_id, *node), Instant::now() + config::GRANT_HORIZON);
+    }
+
     /// Whether `visa_id` may still be granted to `node_addr`: staged there as
     /// `PendingInstall` or `Installed`, and not withheld ([VisaMgr::is_withheld]). For visas prepared before
     /// a caller took the topology lock (`register_vss`): one revoked, acknowledged or
@@ -841,10 +851,24 @@ impl VisaMgr {
     ) -> Result<Vec<Visa>, ServiceError> {
         let mut visas = Vec::with_capacity(ids.len());
         for &id in ids {
+            // The horizon goes first ([VisaMgr::record_grant_horizon]); building the copy
+            // records it again, later. Only for a copy staged on the node, so a node
+            // asking for arbitrary IDs cannot grow the horizon map.
+            if self.repo.get_node_visa_state(id, node_addr).is_some() {
+                self.record_grant_horizon(id, node_addr);
+            }
             if !self.fetchable_by_node(id, node_addr) {
                 debug!(target: VISA, "node {node_addr} requested visa {id}: not deliverable to it");
                 continue;
             }
+            // Test seam (zl-zipline#248): a revoke sent and acked while the fetched copy
+            // is being built. Compiled out of release.
+            #[cfg(test)]
+            crate::visareq_worker::race_gate::pause_if_gated(
+                node_addr,
+                crate::visareq_worker::race_gate::Point::AfterFetchCheck,
+            )
+            .await;
             match self.get_visa_with_metadata_by_id(id).await? {
                 Some(vwm) => match self
                     .actualize_visa_for_target_node(vwm.visa, node_addr)
@@ -2289,6 +2313,43 @@ mod tests {
                 "visa {visa_id} (pushed meanwhile: {pushed_meanwhile}) is quarantined"
             );
         }
+    }
+
+    /// zl-zipline#248 (Copilot, VS#81): a copy that passed the fetch-by-ID check may
+    /// still go out after a revoke sent and acked meanwhile, so that ack is held and the
+    /// revoke sent once more: the copy's horizon is published before the check, not
+    /// only once the copy is built.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_revoke_acked_while_a_fetched_copy_is_built_is_held() {
+        use crate::visareq_worker::race_gate;
+        let mgr = make_mgr().await;
+        let node: IpAddr = "fd5a:5052::248:5".parse().unwrap();
+        let next: IpAddr = "fd5a:5052::248:6".parse().unwrap();
+        // A second hop keeps the visa alive when `node`'s copy is torn down.
+        store_path_visa(&mgr, 835, vec![node, next], db::NodeVisaState::Installed).await;
+        // Past the startup floor: only the fetch's own horizon can hold the ack.
+        tokio::time::advance(config::GRANT_HORIZON + Duration::from_secs(1)).await;
+
+        let (parked, resume) = race_gate::arm(node, race_gate::Point::AfterFetchCheck);
+        let fetch = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.visas_for_node_by_ids(&node, &[835]).await.unwrap() }
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the fetch must pass its check");
+        race_gate::disarm(&node);
+        assert!(mgr.mark_visa_revoked(835).await.unwrap());
+        mgr.revoke_acked(node, 835, Instant::now()).await;
+        resume.notify_one();
+
+        let fetched: Vec<u64> = fetch.await.unwrap().iter().map(|v| v.issuer_id).collect();
+        assert_eq!(fetched, vec![835], "the copy passed the check and goes out");
+        assert_eq!(
+            mgr.repo.get_node_visa_state(835, &node),
+            Some(db::NodeVisaState::PendingRevoke),
+            "the ack is held: the fetched copy may land after the revoke"
+        );
     }
 
     /// revoke_acked drops the node ref and then removes the now-orphaned visa (past the
