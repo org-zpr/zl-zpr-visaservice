@@ -169,37 +169,7 @@ impl DbConnection for RedisDb {
 
     async fn atomic_pipeline(&self, ops: &[DbOp]) -> DbResult<()> {
         let mut conn = self.mgr.clone();
-        let mut piper = redis::pipe();
-        for op in ops {
-            match op {
-                DbOp::Del(key) => {
-                    piper.del(key);
-                }
-                DbOp::SetBin { key, value } => {
-                    piper.set(key, value.as_slice());
-                }
-                DbOp::SRem { set_key, member } => {
-                    piper.srem(set_key, member);
-                }
-                DbOp::HSet {
-                    hash_key,
-                    field,
-                    value,
-                } => {
-                    piper.hset(hash_key, field, value);
-                }
-                DbOp::HSetMultiple {
-                    hash_key,
-                    field_values,
-                } => {
-                    piper.hset_multiple(hash_key, field_values);
-                }
-                DbOp::Expire { key, seconds } => {
-                    piper.expire(key, *seconds);
-                }
-            }
-        }
-        let _: () = piper.query_async(&mut conn).await?;
+        let _: () = pipeline_of(ops).query_async(&mut conn).await?;
         Ok(())
     }
 
@@ -285,5 +255,63 @@ impl DbConnection for RedisDb {
 
         // Note: LUA script returns 2 when lock doesn't exist to begin with.
         Ok(released)
+    }
+}
+
+/// The redis pipeline for [DbConnection::atomic_pipeline]: `ops` in order, as one
+/// MULTI/EXEC transaction, so a dropped connection or a crash never leaves part of
+/// them applied (zl-zipline#290).
+fn pipeline_of(ops: &[DbOp]) -> redis::Pipeline {
+    let mut piper = redis::pipe();
+    piper.atomic();
+    for op in ops {
+        match op {
+            DbOp::Del(key) => {
+                piper.del(key);
+            }
+            DbOp::SetBin { key, value } => {
+                piper.set(key, value.as_slice());
+            }
+            DbOp::SRem { set_key, member } => {
+                piper.srem(set_key, member);
+            }
+            DbOp::HSet {
+                hash_key,
+                field,
+                value,
+            } => {
+                piper.hset(hash_key, field, value);
+            }
+            DbOp::HSetMultiple {
+                hash_key,
+                field_values,
+            } => {
+                piper.hset_multiple(hash_key, field_values);
+            }
+            DbOp::Expire { key, seconds } => {
+                piper.expire(key, *seconds);
+            }
+        }
+    }
+    piper
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// zl-zipline#290 (local codex P1): `atomic_pipeline` must be atomic, as its
+    /// callers rely on (e.g. a policy write's container, `phash` and `vinst`), so it
+    /// is sent as one MULTI/EXEC transaction, not as separate commands.
+    #[test]
+    fn test_atomic_pipeline_is_a_transaction() {
+        let packed = pipeline_of(&[DbOp::HSet {
+            hash_key: "policy:current".into(),
+            field: "vinst".into(),
+            value: "2".into(),
+        }])
+        .get_packed_pipeline();
+        let text = String::from_utf8_lossy(&packed);
+        assert!(text.contains("MULTI") && text.contains("EXEC"), "{text}");
     }
 }
