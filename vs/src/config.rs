@@ -131,6 +131,19 @@ pub const MAX_VISA_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60); // 24
 /// one second the visa store's seconds-granularity TTL truncates to zero and drops it.
 pub const MIN_VISA_LIFETIME: Duration = Duration::from_secs(30);
 
+/// How long after the visa service builds a node's copy of a visa for delivery that copy
+/// may still reach the node and be installed there (zl-zipline#248). A revoke the node
+/// acknowledges inside this horizon may have overtaken the grant (the node treats a
+/// revoke of a visa it does not hold as done), so the visa service keeps the copy
+/// `PendingRevoke` and sends the revoke once more after the horizon (see
+/// `VisaMgr::revoke_acked`). For the first `GRANT_HORIZON` after start, every copy counts
+/// as inside its horizon: a reply sent just before a restart can still arrive.
+///
+/// The contract this relies on: a node discards a VS-API reply that arrives after its RPC
+/// timeout, and that timeout stays under `GRANT_HORIZON` (core: `DEFAULT_RPC_TIMEOUT`,
+/// 10 s). A VSS push is ordered with the revokes on its connection once sent.
+pub const GRANT_HORIZON: Duration = Duration::from_secs(30);
+
 /// How long before a trusted-service attribute expires the visa-request path re-queries
 /// its source (zl-zipline#275). A visa cannot outlive the attributes it was granted on,
 /// and one that would live under [MIN_VISA_LIFETIME] is denied, so an attribute refreshed

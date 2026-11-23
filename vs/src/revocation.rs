@@ -108,8 +108,7 @@ impl RevocationLedger {
     /// committed, and before the pass reads any visa. A visa request that
     /// reads it before reading its actors and policy and again after storing
     /// its visa knows, if it moved, that a revocation may have missed the visa
-    /// (zl-zipline#248 builds on this; keep the name and semantics).
-    #[allow(dead_code)] // read by zl-zipline#248
+    /// (zl-zipline#248, `VisaMgr::check_commit_generation`).
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
     }

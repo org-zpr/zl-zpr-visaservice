@@ -453,7 +453,9 @@ mod tests {
         for pkt in [syn_pkt, reply_pkt] {
             assert!(
                 matches!(
-                    process_visa_request_for_test(asm.clone(), relay, pkt).await,
+                    process_visa_request_for_test(asm.clone(), relay, pkt)
+                        .await
+                        .unwrap(),
                     VisaDecision::Deny(_)
                 ),
                 "no bootstrap visa is minted from traffic"

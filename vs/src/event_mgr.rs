@@ -1259,7 +1259,7 @@ mod tests {
             .collect();
         asm.revocations.complete(&setup).await.unwrap();
 
-        let (parked, resume) = race_gate::arm(node);
+        let (parked, resume) = race_gate::arm(node, race_gate::Point::BeforeActorRemoval);
         let disconnect = tokio::spawn({
             let asm = asm.clone();
             async move {
@@ -2240,8 +2240,9 @@ mod tests {
         }
 
         let pkt = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:3000::2", 1234, 80).unwrap();
-        let VisaDecision::Allow(visa, _) =
-            process_visa_request_for_test(asm.clone(), node_a, pkt).await
+        let VisaDecision::Allow(visa, _) = process_visa_request_for_test(asm.clone(), node_a, pkt)
+            .await
+            .unwrap()
         else {
             panic!("precondition: the stale services allow the visa");
         };
