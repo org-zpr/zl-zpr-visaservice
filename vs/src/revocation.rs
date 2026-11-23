@@ -5,8 +5,10 @@
 //!
 //! A state write that can make live visas unacceptable -- a policy install, an
 //! actor losing attributes (logout, a session replacement, a lossy renewal), a
-//! trusted-service change -- records a revocation obligation durably
-//! ([RevocationLedger::begin]) BEFORE it writes. One reconciler
+//! trusted-service change, a disconnect removing an actor (zl-zipline#290) --
+//! records a revocation obligation durably ([RevocationLedger::begin]) BEFORE it
+//! writes. A policy obligation names the vinst it installs, and the reconciler
+//! completes it only once that vinst is published. One reconciler
 //! (`event_mgr::reconcile_obligations`, on the event worker) satisfies the
 //! obligations: it runs the sweep and deletes them only when the sweep
 //! completed with no failure. The auth-expiry sweeper's loop re-kicks it
@@ -35,13 +37,12 @@
 //! lock whose holder is itself waiting in [RevocationLedger::begin] would
 //! deadlock with the pass.
 
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{RwLock, RwLockReadGuard};
 
-use crate::db::{DbConnection, Obligation, ObligationKind, RevocationRepo};
+use crate::db::{DbConnection, Obligation, RevocationRepo};
 use crate::error::StoreError;
 
 /// The durable obligation store plus the barrier and generation that order
@@ -69,17 +70,14 @@ impl RevocationLedger {
         }
     }
 
-    /// Record an obligation of `kind` for `actors` and return the guard the
-    /// caller holds across its state write. A failed record is returned as an
-    /// error: the caller must then not write (fail closed), because nothing
-    /// would revoke what the write invalidates.
-    pub async fn begin(
-        &self,
-        kind: ObligationKind,
-        actors: Vec<IpAddr>,
-    ) -> Result<ObligationGuard<'_>, StoreError> {
+    /// Record `obligation` and return the guard the caller holds across its state
+    /// write. A failed record is returned as an error: the caller must then not
+    /// write (fail closed), because nothing would revoke what the write
+    /// invalidates. The one exception is a disconnect, which tears down anyway
+    /// (`ConnectionControl::teardown_actor`).
+    pub async fn begin(&self, obligation: Obligation) -> Result<ObligationGuard<'_>, StoreError> {
         let read = self.barrier.read().await;
-        self.repo.add(&Obligation { kind, actors }).await?;
+        self.repo.add(&obligation).await?;
         Ok(ObligationGuard { _read: read })
     }
 
@@ -129,10 +127,7 @@ mod tests {
     #[tokio::test]
     async fn test_pass_waits_for_the_guard_and_bumps_the_generation() {
         let ledger = Arc::new(RevocationLedger::new(Arc::new(FakeDb::new())));
-        let guard = ledger
-            .begin(ObligationKind::Attributes, vec![])
-            .await
-            .unwrap();
+        let guard = ledger.begin(Obligation::attributes(vec![])).await.unwrap();
         let before = ledger.generation();
 
         let pass = tokio::spawn({

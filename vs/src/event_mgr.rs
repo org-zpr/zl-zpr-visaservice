@@ -128,11 +128,7 @@ pub(crate) async fn reconcile_obligations(asm: &Arc<Assembly>) {
                 .iter()
                 .flat_map(|(_, ob)| ob.actors.iter().copied())
                 .collect();
-            if let Err(e) = asm
-                .revocations
-                .begin(ObligationKind::Attributes, actors)
-                .await
-            {
+            if let Err(e) = asm.revocations.begin(Obligation::attributes(actors)).await {
                 error!(target: EVENT, "failed to record the pending sweep: {e}; the policy step will run again");
                 return;
             }
@@ -160,8 +156,10 @@ enum PassOutcome {
 }
 
 /// The work of one pass over `pending`, in order:
-/// 1. if any obligation is a policy install, the policy pass ([policy_pass]) against
-///    the current policy;
+/// 0. a policy obligation's policy is published first ([catch_up_policy]); one whose
+///    install never stored its policy is satisfied with nothing to do;
+/// 1. if any other obligation is a policy install, the policy pass ([policy_pass])
+///    against the current policy;
 /// 2. the attribute refresh of the actors behind live visas, then the sweep of every
 ///    live visa ([revalidate_visas]) -- an actor without a live visa is re-checked
 ///    lazily, by the revision check on its next visa request; every refresh must be
@@ -172,9 +170,23 @@ enum PassOutcome {
 ///    the sweep skips visas whose actor it cannot resolve, and an actor is gone when
 ///    a failed write cleaned it up or an undo removed it.
 async fn satisfy_obligations(asm: &Arc<Assembly>, pending: &[(u64, Obligation)]) -> PassOutcome {
+    let Some(published) = catch_up_policy(asm, pending).await else {
+        return PassOutcome::Pending;
+    };
+    // A policy obligation whose vinst is still above the published one belongs to an
+    // install whose write never landed: it changed nothing, so it is satisfied
+    // without a policy pass (which would move the re-authentication deadline).
+    let landed = |ob: &Obligation| ob.vinst.is_none_or(|vinst| vinst <= published);
+    let never_landed = pending.iter().filter(|(_, ob)| !landed(ob)).count();
+    if never_landed > 0 {
+        info!(target: EVENT, "reconcile: dropping {never_landed} policy obligation(s) whose install was never stored");
+    }
+    if never_landed == pending.len() {
+        return PassOutcome::Satisfied;
+    }
     let policy_step = pending
         .iter()
-        .any(|(_, ob)| ob.kind == ObligationKind::Policy);
+        .any(|(_, ob)| ob.kind == ObligationKind::Policy && landed(ob));
     if policy_step {
         match policy_pass(asm).await {
             Ok(true) => {}
@@ -220,6 +232,22 @@ async fn satisfy_obligations(asm: &Arc<Assembly>, pending: &[(u64, Obligation)])
     } else {
         unfinished
     }
+}
+
+/// Step 0 of [satisfy_obligations] (zl-zipline#290): a policy obligation completes
+/// only once the policy it names is published. If the published vinst is below the
+/// highest vinst a listed policy obligation names, catch up with the store
+/// ([crate::policy_mgr::PolicyMgr::catch_up_with_store]): publish a policy whose
+/// write landed but was never published. Returns the published vinst after that,
+/// or `None` if the catch-up failed (everything stays pending).
+async fn catch_up_policy(asm: &Arc<Assembly>, pending: &[(u64, Obligation)]) -> Option<u64> {
+    if let Some(target) = pending.iter().filter_map(|(_, ob)| ob.vinst).max()
+        && let Err(e) = asm.policy_mgr.catch_up_with_store(target).await
+    {
+        error!(target: EVENT, "reconcile: failed to catch up with the stored policy: {e}");
+        return None;
+    }
+    Some(asm.policy_mgr.get_current_snapshot().vinst())
 }
 
 /// Step 3 of [satisfy_obligations]: revoke every visa of each actor named in
@@ -855,7 +883,7 @@ mod tests {
     async fn record_attribute_obligation(asm: &Assembly, actors: Vec<IpAddr>) {
         drop(
             asm.revocations
-                .begin(crate::db::ObligationKind::Attributes, actors)
+                .begin(Obligation::attributes(actors))
                 .await
                 .unwrap(),
         );

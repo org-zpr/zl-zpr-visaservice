@@ -41,13 +41,47 @@ pub enum ObligationKind {
 
 /// A pending revocation obligation: sweep the live visas because of `kind`,
 /// and revoke every visa of each actor in `actors` that no longer exists.
+/// Build one with [Obligation::policy] or [Obligation::attributes].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Obligation {
     pub kind: ObligationKind,
-    /// ZPR addresses of the actors whose attributes the write changed. Empty
-    /// when the write is not about particular actors (a policy install, a
-    /// trusted-service change).
+    /// ZPR addresses of the actors whose attributes the write changed, or that a
+    /// disconnect removed. Empty when the write is not about particular actors (a
+    /// policy install, a trusted-service change).
     pub actors: Vec<IpAddr>,
+    /// The vinst a policy install assigned: `Some` exactly when `kind` is
+    /// [ObligationKind::Policy]. The reconciler completes a policy obligation only
+    /// once that vinst is published, or drops it if the install's write never
+    /// landed (zl-zipline#290).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vinst: Option<u64>,
+}
+
+impl Obligation {
+    /// The obligation of a policy install that assigned `vinst`.
+    pub fn policy(vinst: u64) -> Self {
+        Obligation {
+            kind: ObligationKind::Policy,
+            actors: Vec::new(),
+            vinst: Some(vinst),
+        }
+    }
+
+    /// The obligation of a write that changed the attributes of `actors`, or
+    /// removed them (empty: of no particular actor).
+    pub fn attributes(actors: Vec<IpAddr>) -> Self {
+        Obligation {
+            kind: ObligationKind::Attributes,
+            actors,
+            vinst: None,
+        }
+    }
+
+    /// Whether a policy obligation carries its vinst and only a policy obligation
+    /// does. A stored record that is not is treated as unparseable.
+    fn is_well_formed(&self) -> bool {
+        self.vinst.is_some() == (self.kind == ObligationKind::Policy)
+    }
 }
 
 pub struct RevocationRepo {
@@ -86,9 +120,11 @@ impl RevocationRepo {
         let map = self.db.hgetall(KEY_REVOKE_PENDING.to_string()).await?;
         let mut obligations = Vec::with_capacity(map.len());
         for (seq_str, json) in map {
-            let (Ok(seq), Ok(ob)) = (
+            let (Ok(seq), Some(ob)) = (
                 seq_str.parse::<u64>(),
-                serde_json::from_str::<Obligation>(&json),
+                serde_json::from_str::<Obligation>(&json)
+                    .ok()
+                    .filter(Obligation::is_well_formed),
             ) else {
                 tracing::error!(
                     "dropping unparseable revocation obligation: seq={seq_str} value={json}"
@@ -126,14 +162,8 @@ mod tests {
         let repo = RevocationRepo::new(Arc::new(FakeDb::new()));
         assert!(repo.list().await.unwrap().is_empty());
 
-        let policy = Obligation {
-            kind: ObligationKind::Policy,
-            actors: vec![],
-        };
-        let attrs = Obligation {
-            kind: ObligationKind::Attributes,
-            actors: vec![addr("fd5a:5052:3000::1")],
-        };
+        let policy = Obligation::policy(7);
+        let attrs = Obligation::attributes(vec![addr("fd5a:5052:3000::1")]);
         let s1 = repo.add(&policy).await.unwrap();
         let s2 = repo.add(&attrs).await.unwrap();
         assert!(s2 > s1);
@@ -152,15 +182,31 @@ mod tests {
         assert!(s3 > s2);
     }
 
-    /// An unparseable record is dropped from the store, not returned.
+    /// An unparseable record is dropped from the store, not returned: so is a
+    /// policy record without its vinst and an attribute record with one
+    /// (zl-zipline#290).
     #[tokio::test]
     async fn test_unparseable_obligation_is_dropped() {
         let db = Arc::new(FakeDb::new());
         let repo = RevocationRepo::new(db.clone());
         db.hset(KEY_REVOKE_PENDING, "7", "not json").await.unwrap();
-        db.hset(KEY_REVOKE_PENDING, "x", r#"{"kind":"policy","actors":[]}"#)
+        db.hset(
+            KEY_REVOKE_PENDING,
+            "x",
+            r#"{"kind":"policy","actors":[],"vinst":3}"#,
+        )
+        .await
+        .unwrap();
+        db.hset(KEY_REVOKE_PENDING, "8", r#"{"kind":"policy","actors":[]}"#)
             .await
             .unwrap();
+        db.hset(
+            KEY_REVOKE_PENDING,
+            "9",
+            r#"{"kind":"attributes","actors":[],"vinst":3}"#,
+        )
+        .await
+        .unwrap();
         assert!(repo.list().await.unwrap().is_empty());
         assert!(
             db.hgetall(KEY_REVOKE_PENDING.to_string())

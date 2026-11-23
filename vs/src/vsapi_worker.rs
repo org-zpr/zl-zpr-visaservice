@@ -27,7 +27,7 @@ use crate::connection_control::{
     recheck_before_commit,
 };
 use crate::counters::CounterType;
-use crate::db::ObligationKind;
+use crate::db::Obligation;
 use crate::error::ServiceError;
 use crate::event_mgr::VsEvent;
 use crate::link_state::validate_snapshot;
@@ -100,7 +100,7 @@ impl AuthenticateUndo {
             // keeping a half-authenticated node would be worse.
             let obligation = match asm
                 .revocations
-                .begin(ObligationKind::Attributes, vec![addr])
+                .begin(Obligation::attributes(vec![addr]))
                 .await
             {
                 Ok(guard) => Some(guard),
@@ -786,7 +786,7 @@ async fn add_node_serialized(
     let obligation = match node_actor.get_zpr_addr() {
         Some(addr) if attrs_dropped || replaces_stored => Some(
             asm.revocations
-                .begin(ObligationKind::Attributes, vec![*addr])
+                .begin(Obligation::attributes(vec![*addr]))
                 .await?,
         ),
         _ => None,
@@ -3994,6 +3994,19 @@ mod tests {
         const ADAPTER: &str = "fd5a:5052:4000::a";
         const AAA: &str = "fd5a:5052:5000::1";
 
+        /// The next queued event that is not a reconciler kick: a disconnect kicks
+        /// the reconciler for the revocation obligation it records (zl-zipline#290).
+        fn try_recv_skipping_reconcile(
+            rx: &mut tokio::sync::mpsc::Receiver<VsEvent>,
+        ) -> Result<VsEvent, tokio::sync::mpsc::error::TryRecvError> {
+            loop {
+                match rx.try_recv() {
+                    Ok(VsEvent::Reconcile) => continue,
+                    other => return other,
+                }
+            }
+        }
+
         /// Assembly with event receiver, nodes A and B in the actor db, and
         /// the capnp handle node A holds from its authenticate call.
         async fn build_two_node_asm() -> (
@@ -4268,7 +4281,7 @@ mod tests {
                             .is_none(),
                         "the self-disconnected node must be removed"
                     );
-                    match event_rx.try_recv() {
+                    match try_recv_skipping_reconcile(&mut event_rx) {
                         Ok(VsEvent::ActorLeaves(addr, _)) => assert_eq!(addr, node_a_addr),
                         other => panic!("expected ActorLeaves for the node, got {other:?}"),
                     }
@@ -4299,7 +4312,7 @@ mod tests {
                             .is_none(),
                         "the self-disconnected node must be removed"
                     );
-                    match event_rx.try_recv() {
+                    match try_recv_skipping_reconcile(&mut event_rx) {
                         Ok(VsEvent::ActorLeaves(addr, _)) => assert_eq!(addr, node_a_addr),
                         other => panic!("expected ActorLeaves for the node, got {other:?}"),
                     }
@@ -4343,7 +4356,7 @@ mod tests {
                         None,
                         "the adapter's docking entry must be gone"
                     );
-                    match event_rx.try_recv() {
+                    match try_recv_skipping_reconcile(&mut event_rx) {
                         Ok(VsEvent::ActorLeaves(addr, _)) => assert_eq!(addr, adapter_addr),
                         other => panic!("expected ActorLeaves for the adapter, got {other:?}"),
                     }

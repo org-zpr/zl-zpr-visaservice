@@ -39,7 +39,7 @@ use crate::admin_apikeys::Permission;
 use crate::apikey::ApiKey;
 use crate::assembly::Assembly;
 use crate::counters::CounterType;
-use crate::db::{ObligationKind, Role};
+use crate::db::{Obligation, Role};
 use crate::error::ServiceError;
 use crate::logging::targets::ADMIN;
 use crate::policy_mgr::DEFAULT_POLICY_ID;
@@ -360,6 +360,11 @@ async fn install_policy(
         }
         Err(e) => {
             error!(target: ADMIN, "failed to update policy: {}", e);
+            // The policy write may have landed although it returned an error (a lost
+            // reply): the reconciler publishes it then, or drops the obligation of a
+            // write that never landed (zl-zipline#290). Kick it now rather than at
+            // the next sweeper tick.
+            rstate.asm.event_mgr.kick_reconcile();
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -1033,10 +1038,7 @@ async fn flush_service_cache(
     // The reloaded data can make live visas unacceptable: record the obligation
     // durably before the reload, and hold its guard across it (zl-zipline#289). A
     // failed record fails the request: nothing would re-check the visas.
-    let obligation = match revocations
-        .begin(ObligationKind::Attributes, Vec::new())
-        .await
-    {
+    let obligation = match revocations.begin(Obligation::attributes(Vec::new())).await {
         Ok(guard) => guard,
         Err(e) => {
             error!(target: ADMIN, "could not record the revocation obligation for flushing {}: {}", svc_id, e);
@@ -1168,10 +1170,7 @@ async fn service_changed(
     // The changed data can make live visas unacceptable: record the obligation
     // durably before marking anything stale, and hold its guard until the marks are
     // done (zl-zipline#289). A failed record fails the request.
-    let obligation = match revocations
-        .begin(ObligationKind::Attributes, Vec::new())
-        .await
-    {
+    let obligation = match revocations.begin(Obligation::attributes(Vec::new())).await {
         Ok(guard) => guard,
         Err(e) => {
             error!(target: ADMIN, "could not record the revocation obligation for the change to {}: {}", svc_id, e);
@@ -3092,7 +3091,7 @@ mod tests {
             1,
             "one obligation must be pending: {pending:?}"
         );
-        assert_eq!(pending[0].1.kind, ObligationKind::Attributes);
+        assert_eq!(pending[0].1.kind, crate::db::ObligationKind::Attributes);
         match event_rx.try_recv() {
             Ok(crate::event_mgr::VsEvent::Reconcile) => {}
             other => panic!("expected a Reconcile kick, got {other:?}"),
