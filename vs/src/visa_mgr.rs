@@ -998,6 +998,28 @@ impl VisaMgr {
         Ok(self.revoke_visa_ids(&ids).await)
     }
 
+    /// As [VisaMgr::remove_visas_for_actors], for actors that have vanished, but leaving
+    /// out bootstrap visas ([BOOTSTRAP_VISA_ZPL]). A joiner's bootstrap visas are minted
+    /// from the relay's peering before the joiner has an actor, so a departed node that
+    /// is rejoining has them while its old actor is gone: revoking them would cut it off
+    /// from the visa service it authenticates with. The sweep re-checks them against
+    /// the peering instead (zl-zipline#290).
+    ///
+    /// Returns the number of visas quarantined, as [VisaMgr::revoke_visa_ids] does.
+    pub async fn remove_visas_for_vanished_actors(
+        &self,
+        actor_addrs: &[IpAddr],
+    ) -> Result<u32, ServiceError> {
+        let mut ids = self.get_visa_ids_for_actors(actor_addrs).await?;
+        ids.retain(|id| {
+            !self
+                .repo
+                .get_visa_metadata_by_id(*id)
+                .is_ok_and(|md| md.zpl == BOOTSTRAP_VISA_ZPL)
+        });
+        Ok(self.revoke_visa_ids(&ids).await)
+    }
+
     /// Revoke each of `ids` everywhere: mark every node holding it `PendingRevoke`, so VSS
     /// housekeeping revokes it from those nodes and removes it on their acks. A visa with
     /// no node left to revoke from is removed at once instead of waiting for its TTL.

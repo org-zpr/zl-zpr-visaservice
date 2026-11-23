@@ -277,7 +277,11 @@ async fn revoke_visas_of_vanished_actors(
     // A visa whose revoke cannot be recorded is quarantined in memory for retry
     // ([crate::visa_mgr::VisaMgr::revoke_visa_ids]), which a restart loses, and the
     // sweep skips it (its actor is gone): keep the obligation until it is persisted.
-    match asm.visa_mgr.remove_visas_for_actors(&vanished).await {
+    match asm
+        .visa_mgr
+        .remove_visas_for_vanished_actors(&vanished)
+        .await
+    {
         Ok(0) => true,
         Ok(quarantined) => {
             warn!(target: EVENT, "reconcile: {quarantined} revoke(s) of vanished actors' visas not persisted; kept pending");
@@ -1294,6 +1298,46 @@ mod tests {
             "by then the actor record is gone"
         );
         disconnect.await.unwrap().unwrap();
+    }
+
+    /// zl-zipline#290 (local codex P1): a departed node can rejoin before the pass for
+    /// its disconnect has run. Its new bootstrap visas are minted from the relay's
+    /// peering before it has an actor, so the vanished-actor step leaves them alone
+    /// (the sweep re-checks them against the peering) while it revokes the departed
+    /// actor's own visas; revoking them would cut the joiner off from the visa
+    /// service it is authenticating with.
+    #[tokio::test]
+    async fn test_vanished_actor_step_spares_a_rejoining_nodes_bootstrap_visas() {
+        use libeval::eval_result::Direction;
+        let (asm, addr, id, _db) = zode_with_visa("zode-290d.zpr").await;
+        asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await.unwrap();
+
+        // The node rejoins through a relay: bootstrap visas, no actor yet.
+        let relay: IpAddr = "fd5a:5052::1".parse().unwrap();
+        let policy = asm.policy_mgr.get_current();
+        let bootstrap = asm
+            .visa_mgr
+            .mint_bootstrap_visa(&asm, &policy, &addr, &relay, Direction::Forward)
+            .await
+            .unwrap()
+            .issuer_id;
+
+        assert_eq!(
+            asm.visa_mgr
+                .remove_visas_for_vanished_actors(&[addr])
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            revoke_pending(&asm, &addr, id).await,
+            "the old visa is revoked"
+        );
+        assert!(
+            !revoke_pending(&asm, &relay, bootstrap).await
+                && !revoke_pending(&asm, &addr, bootstrap).await,
+            "the joiner's bootstrap visa must stay"
+        );
     }
 
     /// Test 4 (zl-zipline#290, gate q4): a disconnect whose obligation cannot be
