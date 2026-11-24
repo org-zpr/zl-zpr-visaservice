@@ -23,11 +23,10 @@ use zpr::write_to::WriteTo;
 use crate::assembly::Assembly;
 use crate::config;
 use crate::counters::CounterType;
-use crate::error::VssSyncError;
+use crate::error::{ServiceError, VssSyncError};
 use crate::logging::targets::VSS;
 use crate::net_mgr;
-use crate::policy_mgr::ResolvedPeer;
-use crate::visa_bootstrap;
+use crate::policy_mgr::{PolicySnapshot, ResolvedPeer};
 use crate::vss::VssCmd;
 
 /// Default timeout for a single Cap'n Proto RPC call.
@@ -119,7 +118,7 @@ pub async fn vss_worker_loop(
     // Open connect to VSS.
     info!(target: VSS, "connecting to VSS at {}", node_addr);
 
-    let vss_handle = match vss_connect(node_addr).await {
+    let vss_handle = match vss_connect(asm.config.get_vs_addr(), node_addr).await {
         Ok(h) => h,
         Err(e) => {
             error!(target: VSS, "failed to connect to VSS at {}: {}", node_addr, e);
@@ -130,7 +129,7 @@ pub async fn vss_worker_loop(
 
     info!(target: VSS, "now connected to VSS at {}", node_addr);
     let mut state = VssState::default();
-    do_housekeeping(&mut state, &asm, &node_addr.ip(), &vss_handle).await;
+    do_housekeeping(&mut state, &asm, &node_addr, &vss_handle).await;
 
     let ping_timeout = tokio::time::sleep(config::VSS_PING_INTERVAL);
     tokio::pin!(ping_timeout);
@@ -149,7 +148,7 @@ pub async fn vss_worker_loop(
                             break;
                         }
                         VssCmd::PushVisas(visas, resp_tx) => {
-                            if let Err(e) = resp_tx.send(vss_do_push_visas(&vss_handle, &visas).await) {
+                            if let Err(e) = resp_tx.send(push_queued_visas(&asm, &node_addr.ip(), &vss_handle, visas).await) {
                                 error!(target: VSS, "failed to send response for push-visas command: {:?}", e);
                                 asm.counters.incr(CounterType::VssErrors);
                             }
@@ -185,9 +184,9 @@ pub async fn vss_worker_loop(
                                 asm.counters.incr(CounterType::VssErrors);
                             }
                         }
-                        VssCmd::SetTopology(links, policy, resp_tx) => {
+                        VssCmd::SetTopology(psnap, resp_tx) => {
                             state.mark_topology_updated();
-                            if let Err(e) = resp_tx.send(vss_do_set_topology(&vss_handle, asm.clone(), &node_addr.ip(), policy, links).await) {
+                            if let Err(e) = resp_tx.send(vss_do_set_topology(&vss_handle, asm.clone(), &node_addr.ip(), psnap).await) {
                                 error!(target: VSS, "failed to send response for set-topology command: {:?}", e);
                                 asm.counters.incr(CounterType::VssErrors);
                             }
@@ -202,7 +201,7 @@ pub async fn vss_worker_loop(
             }
 
             _ = heartbeat.tick() => {
-                do_housekeeping(&mut state, &asm, &node_addr.ip(), &vss_handle).await;
+                do_housekeeping(&mut state, &asm, &node_addr, &vss_handle).await;
             }
 
             () = &mut ping_timeout => {
@@ -248,12 +247,35 @@ pub async fn vss_worker_loop(
     }
 }
 
-/// Perform TCP connect, TLS handshake, Cap'n Proto RPC bootstrap, and the initial
-/// connect RPC, returning a ready-to-use VSS handle client.
-async fn vss_connect(node_addr: SocketAddr) -> Result<v1::v_s_s_handle::Client, VssSyncError> {
-    let sock = tokio::net::TcpStream::connect(node_addr)
+/// Open a TCP connection to `remote` from the local address `local`.
+///
+/// The visa service must originate VSS traffic from its own ZPR address
+/// (`vs_addr`). On a relay Zode the TUN also carries the relay's own address,
+/// and the kernel's source-address choice could pick that one instead; the
+/// relay grants the visa service's visas only for `vs_addr`, so such a
+/// connection would be dropped. Binding first removes the choice. A `local`
+/// that is not a local address, or of a different family than `remote`, is
+/// an error — never a silent fallback to a kernel-chosen source.
+async fn connect_from(local: IpAddr, remote: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+    let sock = if local.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    sock.bind(SocketAddr::new(local, 0))?;
+    sock.connect(remote).await
+}
+
+/// Perform TCP connect (from `local`, see [connect_from]), TLS handshake,
+/// Cap'n Proto RPC bootstrap, and the initial connect RPC, returning a
+/// ready-to-use VSS handle client.
+async fn vss_connect(
+    local: IpAddr,
+    node_addr: SocketAddr,
+) -> Result<v1::v_s_s_handle::Client, VssSyncError> {
+    let sock = connect_from(local, node_addr)
         .await
-        .map_err(|e| VssSyncError::Internal(format!("TCP connect: {e}")))?;
+        .map_err(|e| VssSyncError::Internal(format!("TCP connect from {local}: {e}")))?;
 
     let tls = tls_connect()
         .connect(node_addr.ip().into(), sock)
@@ -290,12 +312,15 @@ async fn vss_connect(node_addr: SocketAddr) -> Result<v1::v_s_s_handle::Client, 
     }
 }
 
+/// One heartbeat of the worker for the node whose VSS listens on `vss_addr`: the initial
+/// configuration sends, J9 core-visa renewal, then the pending visa and revoke queues.
 async fn do_housekeeping(
     state: &mut VssState,
     asm: &Arc<Assembly>,
-    node_addr: &IpAddr,
+    vss_addr: &SocketAddr,
     vss_handle: &v1::v_s_s_handle::Client,
 ) {
+    let node_addr = &vss_addr.ip();
     // Currently these three items are all onoly part of intiial VSS connection.
     // Once they are sent, they are not sent again.
     if state.needs_configure() {
@@ -313,6 +338,19 @@ async fn do_housekeeping(
         warn!(target: VSS, "failed to purge expired visas: {e}");
     }
 
+    // J9: renew the node's core visas before they expire. Their copies are queued
+    // pending-install, so the push just below starts delivering them (ingress last).
+    if let Err(e) = crate::core_visas::renew_core_visas(
+        asm,
+        node_addr,
+        vss_addr.port(),
+        std::time::SystemTime::now(),
+    )
+    .await
+    {
+        warn!(target: VSS, "core visa renewal for node {node_addr} failed, retrying next heartbeat: {e}");
+    }
+
     send_pending_visas(asm, node_addr, vss_handle).await;
     send_pending_revokes(asm, node_addr, vss_handle).await;
 
@@ -326,7 +364,9 @@ async fn send_pending_visas(
     node_addr: &IpAddr,
     vss_handle: &v1::v_s_s_handle::Client,
 ) {
-    match asm.visa_mgr.get_pending_visas_for_node(node_addr).await {
+    // Ingress copies wait for the other hops' acks (gate g89 q4): see
+    // `VisaMgr::deliverable_visas_for_node`.
+    match asm.visa_mgr.deliverable_visas_for_node(node_addr).await {
         Ok(pending_visas) => {
             let mut actualized = Vec::new();
             for visa in pending_visas {
@@ -379,9 +419,8 @@ async fn send_pending_visas(
 /// If there are visas pending revocation for this node, send the revokes over
 /// VSS and tear down the acked ones. Mirrors `send_pending_visas`.
 ///
-/// No per-id staleness re-check is needed: allow verdicts cancel queued revokes
-/// under the same store lock that marks them, so a `PendingRevoke` with a newer
-/// allow cannot exist in memory.
+/// No per-id staleness re-check is needed: a `PendingRevoke` is final, nothing
+/// moves a node back out of it.
 async fn send_pending_revokes(
     asm: &Assembly,
     node_addr: &IpAddr,
@@ -402,11 +441,14 @@ async fn send_pending_revokes(
         return; // Nothing to revoke; skip the RPC.
     }
 
+    // When the revoke left: the grant horizon is judged by it, not by when the ack is
+    // processed (zl-zipline#248, `VisaMgr::revoke_acked`).
+    let sent_at = tokio::time::Instant::now();
     match vss_do_revoke_visas(vss_handle, &ids).await {
         Ok(processed) => {
             // Tear down state for the acked ids (same prefix convention as install).
             for &id in ids.iter().take(processed) {
-                asm.visa_mgr.revoke_acked(*node_addr, id).await;
+                asm.visa_mgr.revoke_acked(*node_addr, id, sent_at).await;
             }
             debug!(target: VSS, "revoked {} of {} pending visas on node {}", processed, ids.len(), node_addr);
         }
@@ -471,20 +513,9 @@ async fn send_topology(
     node_addr: &IpAddr,
     vss_handle: &v1::v_s_s_handle::Client,
 ) {
-    // One snapshot for both the resolved peers and the bootstrap-visa peer lookup inside.
     let psnap = asm.policy_mgr.get_current_snapshot();
-    let peers = psnap.resolved_peers_for_node(node_addr);
-
     debug!(target: VSS, "sending initial topology to VSS at {}", node_addr);
-    if let Err(e) = vss_do_set_topology(
-        vss_handle,
-        asm.clone(),
-        node_addr,
-        psnap.policy_arc(),
-        peers,
-    )
-    .await
-    {
+    if let Err(e) = vss_do_set_topology(vss_handle, asm.clone(), node_addr, psnap).await {
         error!(target: VSS, "failed to send initial topology to VSS at {}: {}", node_addr, e);
         asm.counters.incr(CounterType::VssErrors);
     } else {
@@ -552,7 +583,7 @@ impl ServerCertVerifier for NoVerification {
 
 // Create a dangerous connector - the verifier will always approve
 // TODO decide if we want to use an actual certificate
-fn tls_connect() -> TlsConnector {
+pub(crate) fn tls_connect() -> TlsConnector {
     let cfg = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerification))
@@ -627,6 +658,29 @@ async fn vss_do_visa_ops(
         let err_obj = ApiResponseError::try_from(err_rdr)?;
         return Err(err_obj.into());
     }
+}
+
+/// Push the visas of a [VssCmd::PushVisas] command, which may have waited in the
+/// worker's queue, to the node at `node`; returns the number positively ack'd.
+///
+/// A copy that is no longer grantable -- revoked, acknowledged gone or withheld while
+/// the command waited -- is dropped first (zl-zipline#248). This worker task also sends
+/// the node's revokes, so a revoke marked after this check goes out after the push and
+/// cannot overtake it, however long the command waited.
+async fn push_queued_visas(
+    asm: &Assembly,
+    node: &IpAddr,
+    vss_handle: &v1::v_s_s_handle::Client,
+    visas: Vec<Visa>,
+) -> Result<usize, VssSyncError> {
+    let grantable: Vec<Visa> = visas
+        .into_iter()
+        .filter(|v| asm.visa_mgr.still_grantable(v.issuer_id, node))
+        .collect();
+    if grantable.is_empty() {
+        return Ok(0);
+    }
+    vss_do_push_visas(vss_handle, &grantable).await
 }
 
 /// Push visa grants to the node, returning the number positively ack'd.
@@ -761,79 +815,27 @@ async fn vss_do_configure(
     check_ok_or_error(configure_response_ok_or_err.get_res().unwrap())
 }
 
-/// Send the node's links via the `setTopology` RPC. Pass an empty vec to indicate no peers.
+/// Send the node's links via the `setTopology` RPC, built from `psnap`
+/// ([proposed_links]). No links means no peers.
 ///
-/// This is the one place the wire-level vsapi `Link` structs are built: `peers` carries
-/// only what the policy manager computed (link id + resolved substrate address), and the
-/// full `Link` — role, peer address, bootstrap visas — is materialized here, just before
-/// it goes on the wire.
+/// This is the one place the wire-level vsapi `Link` structs are built and sent.
+/// `node_addr` is the ZPR address of the node on the other end of `vss_handle`; the
+/// links are that node's view of the topology.
 ///
-/// `node_addr` is the ZPR address of the node on the other end of `vss_handle`; the links are
-/// that node's view of the topology, so the peer lookup below must be keyed by it.
-///
-/// `policy` must be the snapshot `peers` was computed from. Reacquiring the current policy here
-/// would let a newly installed one pair its peers with the older snapshot's resolved peers.
+/// A failed address lookup fails the send, so the caller leaves the topology unsynced
+/// and the worker's heartbeat sends it again: no link goes out with a guessed address.
 async fn vss_do_set_topology(
     vss_handle: &v1::v_s_s_handle::Client,
     asm: Arc<Assembly>,
     node_addr: &IpAddr,
-    policy: Arc<Policy>,
-    peers: Vec<ResolvedPeer>,
+    psnap: PolicySnapshot,
 ) -> Result<(), VssSyncError> {
-    // HACK -> This hack here is to support our intial MULTINODE implementation.
-    // We create "bootstrap" visas for each peer in the topology message, every
-    // time we send it: one for the peer's own SYN to VSAPI, one for the visa
-    // service's reply to it.
-    //
-    // The visas belong to the peer, not to the node to whom we are sending the
-    // message: that node holds them and hands them off when the peer connects.
-    //
-    // Minting bypasses policy evaluation entirely -- see
-    // [crate::visa_bootstrap], which is where all of this lives and where it
-    // gets deleted from.
-    //
-    // TODO: Reevaluate this.
-
-    // Both ends of an edge share a link_id, and each end's `remote_zpr_addr` is only
-    // meaningful under its own node key -- so resolve the link within `node_addr`'s peers.
-    let node_peers = policy.get_peers_for_node(node_addr).unwrap_or_default();
-    let mut links: Vec<Link> = Vec::with_capacity(peers.len());
-    for (link_id, sock_addr) in peers {
-        // `zpr_addr` is required on the wire (the reader rejects a link without it), so a
-        // link with no peer entry cannot be sent at all anymore: skip it instead of the old
-        // "send without bootstrap visas" fallback.
-        let Some(peer) = node_peers.iter().find(|p| p.link_id == link_id) else {
-            warn!(target: VSS, "no peer entry for link {link_id} under node {node_addr}; skipping it (zprAddr unknown)");
-            continue;
-        };
-        let mut link = Link {
-            link_id,
-            role: LinkRole::Active, // only "active" support at the moment.
-            peer: SockAddr {
-                addr: sock_addr.ip(),
-                port: sock_addr.port(),
-            },
-            visas: Vec::new(),
-            zpr_addr: peer.remote_zpr_addr,
-        };
-        // The link is between `node_addr` and `peer.remote_zpr_addr`. Fail the whole call rather
-        // than sending the link bare: without the visas the peer cannot reach VSAPI, so the link
-        // is useless, and returning Ok would let `send_topology` mark topology synced and stop
-        // housekeeping from ever retrying. Minting is idempotent, so the retry is free.
-        //
-        // An already-connected peer is the exception and yields no visas -- it has a VSAPI
-        // session of its own and asks for what it needs.
-        let visas = visa_bootstrap::visas_for_link(&asm, &policy, &peer.remote_zpr_addr, node_addr)
-            .await
-            .map_err(|e| {
-                VssSyncError::Internal(format!(
-                    "failed to create bootstrap visas for future peer {}: {e}",
-                    peer.remote_zpr_addr
-                ))
-            })?;
-        link.visas.extend(visas);
-        links.push(link);
-    }
+    // Each link names its peer's ZPR address and CN. It carries no visas (J8): a relay asks
+    // for a joining peer's bootstrap visas when that peer's link comes up
+    // (`requestBootstrapVisas`, see [crate::visa_bootstrap]).
+    let links = proposed_links(&asm, &psnap, node_addr)
+        .await
+        .map_err(|e| VssSyncError::Internal(format!("building the topology: {e}")))?;
 
     let mut req = vss_handle.set_topology_request();
     let req_builder = req.get();
@@ -847,6 +849,150 @@ async fn vss_do_set_topology(
         rpc_with_timeout("set-topology", DEFAULT_RPC_TIMEOUT, req.send().promise).await?;
     let set_response_ok_or_err = set_response_rdr.get()?;
     check_ok_or_error(set_response_ok_or_err.get_res().unwrap())
+}
+
+/// The `Link`s the visa service proposes to `node_addr`, all read from `psnap`
+/// (ZODE_LINKS.md rule 13b, zl-zipline#255): it proposes a link only when it can work,
+/// and never asks a Zode to dial an address it does not know.
+///
+/// The candidates are [topology_links] (R13a and the CN rule apply there). Of those:
+/// - a **relay link** -- one end is the relay, the node the visa service docks on
+///   ([crate::visa_bootstrap::is_relay]; the v1 relay, zl-zpr-dev-context
+///   docs/SYSTEM_OVERVIEW.md, Design decisions, "The relay Zode hosts the visa service
+///   on one TUN") -- is always proposed: an endpoint dials its configured initial link,
+///   and the relay must know a joiner's CN before the joiner connects (J2). `peer` is
+///   the other end's known address, or unset if there is none (the relay never dials a
+///   joiner);
+/// - a **direct link** is proposed only when both ends have a known address, and its
+///   `peer` is the other end's. Which end dials is the Zodes' rule, not copied here.
+///
+/// A known address is [known_substrate_addr]. A lookup that fails is an error: the
+/// caller leaves the topology unsynced and it is sent again, never with a guess.
+pub(crate) async fn proposed_links(
+    asm: &Assembly,
+    psnap: &PolicySnapshot,
+    node_addr: &IpAddr,
+) -> Result<Vec<Link>, ServiceError> {
+    let candidates = topology_links(
+        asm,
+        psnap.policy(),
+        node_addr,
+        psnap.resolved_peers_for_node(node_addr),
+    );
+    let node_is_relay = crate::visa_bootstrap::is_relay(asm, node_addr);
+    let own_addr = known_substrate_addr(
+        asm,
+        crate::connection_control::substrate_addr_from_topology(psnap, node_addr),
+        node_addr,
+    )
+    .await?;
+    let mut links = Vec::with_capacity(candidates.len());
+    for mut link in candidates {
+        // `link.peer` holds the peer's policy address, if policy declares one.
+        let peer_addr =
+            known_substrate_addr(asm, link.peer.clone().map(SocketAddr::from), &link.zpr_addr)
+                .await?;
+        let is_relay_link = node_is_relay || crate::visa_bootstrap::is_relay(asm, &link.zpr_addr);
+        if !is_relay_link && (own_addr.is_none() || peer_addr.is_none()) {
+            let missing = if own_addr.is_none() {
+                node_addr
+            } else {
+                &link.zpr_addr
+            };
+            info!(target: VSS, "direct link {} between {node_addr} and {}: no known address for {missing}; left out of topology", link.link_id, link.zpr_addr);
+            continue;
+        }
+        link.peer = peer_addr.map(|addr| SockAddr {
+            addr: addr.ip(),
+            port: addr.port(),
+        });
+        links.push(link);
+    }
+    Ok(links)
+}
+
+/// The known substrate address of `node` (plan p37 rule 3): `policy_addr`, its
+/// DNS-resolved policy address, if policy declares one; else the `SUBSTRATE_ADDR` claim
+/// on its stored node actor ([crate::connection_control::substrate_claim]), but only
+/// while it has a live VS-API session, that is a live VSS worker. Nothing else: `None`
+/// means unknown.
+///
+/// The claim is policy's address or the relay's observation of the node's initial link,
+/// never the node's own word (`connection_control::substrate_addr_for`, zl-zipline#264).
+/// An observation goes stale once its node is gone: a Zode that vanished without
+/// rejoining may have lost that IP to someone else (DHCP or CGNAT reassignment), and
+/// peers must not be pointed at the new holder. A rejoin replaces the claim when the
+/// relay asks for the joiner's bootstrap visas, before its next session starts.
+async fn known_substrate_addr(
+    asm: &Assembly,
+    policy_addr: Option<SocketAddr>,
+    node: &IpAddr,
+) -> Result<Option<SocketAddr>, ServiceError> {
+    if policy_addr.is_some() {
+        return Ok(policy_addr);
+    }
+    if !asm.vss_mgr.has_live_worker(node) {
+        return Ok(None);
+    }
+    Ok(match asm.actor_mgr.get_actor_by_zpr_addr(node).await? {
+        Some(actor) if actor.is_node() => crate::connection_control::substrate_claim(&actor),
+        _ => None,
+    })
+}
+
+/// The candidate `Link`s of `node_addr`'s topology message: one per resolved peer, each
+/// naming the peer's ZPR address and CN, with `peer` = the peer's policy address if
+/// policy declares one. No link carries visas (J8). A link whose owner reported it
+/// `failed` is left out until the pair is cleared (R13a, `TopologyMgr::is_failed_pair`).
+/// [proposed_links] decides which candidates are sent, and with which `peer`.
+///
+/// `policy` must be the snapshot `peers` was computed from.
+pub(crate) fn topology_links(
+    asm: &Assembly,
+    policy: &Policy,
+    node_addr: &IpAddr,
+    peers: Vec<ResolvedPeer>,
+) -> Vec<Link> {
+    // Both ends of an edge share a link_id, and each end's `remote_zpr_addr` is only
+    // meaningful under its own node key -- so resolve the link within `node_addr`'s peers.
+    let node_peers = policy.get_peers_for_node(node_addr).unwrap_or_default();
+    let mut links: Vec<Link> = Vec::with_capacity(peers.len());
+    for (link_id, sock_addr) in peers {
+        // `zpr_addr` is required on the wire (the reader rejects a link without it), so a
+        // link with no peer entry cannot be sent at all: skip it.
+        let Some(peer) = node_peers.iter().find(|p| p.link_id == link_id) else {
+            warn!(target: VSS, "no peer entry for link {link_id} under node {node_addr}; skipping it (zprAddr unknown)");
+            continue;
+        };
+        // R13a (ZODE_LINKS.md): the visa service owns the retry policy. The owner reported
+        // this link failed, so neither end is told about it until something about the pair
+        // changes; dropping it from topology also closes it (R12).
+        if asm
+            .topo_mgr
+            .is_failed_pair(node_addr, &peer.remote_zpr_addr)
+        {
+            info!(target: VSS, "link {link_id} between {node_addr} and {} was reported failed; left out of topology", peer.remote_zpr_addr);
+            continue;
+        }
+        // The CN the peer's link certificate must carry (zl-zipline#221). A peer policy does
+        // not name is left out (operator, pd g44 q2): its node would refuse an unnamed peer
+        // (zl-zipline#220), and a relay could not ask for its bootstrap visas by CN (J2).
+        let Some(peer_cn) = policy.node_cn_for_addr(&peer.remote_zpr_addr) else {
+            warn!(target: VSS, "no CN in policy for peer {} of node {node_addr} (link {link_id}); skipping the link", peer.remote_zpr_addr);
+            continue;
+        };
+        links.push(Link {
+            link_id,
+            role: LinkRole::Active, // only "active" support at the moment.
+            peer: sock_addr.map(|sock_addr| SockAddr {
+                addr: sock_addr.ip(),
+                port: sock_addr.port(),
+            }),
+            zpr_addr: peer.remote_zpr_addr,
+            peer_cn: peer_cn.to_string(),
+        });
+    }
+    links
 }
 
 #[cfg(test)]
@@ -923,6 +1069,35 @@ mod tests {
         handle
     }
 
+    /// zl-zipline#248 (codex P1): a copy revoked while its push waited in the worker's
+    /// queue is not sent. The worker sends revokes from the same task, so a revoke marked
+    /// after this check goes out after the push and cannot overtake it. The stub VSS
+    /// implements no visa ops, so any push RPC would fail.
+    #[tokio::test]
+    async fn test_queued_push_of_a_revoked_copy_is_not_sent() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let cn = "zode-248-push.zpr";
+                let (asm, _cc, addr, _privkey) =
+                    crate::connection_control::tests::zode_fixture(cn).await;
+                let id = crate::connection_control::tests::create_zode_files_visa(&asm, addr).await;
+                let visa = asm.visa_mgr.get_visa_by_id(id).await.unwrap().unwrap();
+                assert!(asm.visa_mgr.mark_visa_revoked(id).await.unwrap());
+                let handle = start_stub(StubVss {
+                    seen: Rc::new(RefCell::new(Vec::new())),
+                    ack_ok: true,
+                    processed: 0,
+                    error_msg: None,
+                });
+
+                let pushed = push_queued_visas(&asm, &addr, &handle, vec![visa]).await;
+
+                assert_eq!(pushed.ok(), Some(0), "nothing is sent for a revoked copy");
+            })
+            .await;
+    }
+
     /// An ok ack with `processed = n` maps to `Ok(n)`, and the node saw exactly
     /// the addresses we sent, in order.
     #[tokio::test]
@@ -979,5 +1154,305 @@ mod tests {
                 }
             })
             .await;
+    }
+
+    /// The VSS connection must leave from the visa service's own address
+    /// (`vs_addr`), not whichever local address the kernel would pick. On
+    /// Linux the whole of 127/8 is local, so 127.0.0.2 is a second address on
+    /// the same interface — the relay Zode's two-addresses-on-one-TUN case.
+    /// The listener does not speak TLS, so the connect itself fails after
+    /// the TCP handshake; only the source address the listener saw matters.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn vss_connect_originates_from_vs_addr() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move {
+            let (_sock, peer) = listener.accept().await.unwrap();
+            peer.ip()
+        });
+
+        let vs_addr: IpAddr = "127.0.0.2".parse().unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(5), vss_connect(vs_addr, listen_addr))
+            .await
+            .expect("vss_connect hung");
+        assert!(
+            res.is_err(),
+            "the listener does not speak TLS, so connect must fail"
+        );
+
+        let peer_ip = accepted.await.unwrap();
+        assert_eq!(
+            peer_ip, vs_addr,
+            "VSS connection must originate from vs_addr"
+        );
+    }
+
+    /// A source address that is not local cannot be bound: the connect must
+    /// fail rather than silently fall back to a kernel-chosen source.
+    #[tokio::test]
+    async fn connect_from_reports_unbindable_source() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737): never assigned to a host.
+        let not_local: IpAddr = "192.0.2.1".parse().unwrap();
+        let res = connect_from(not_local, listen_addr).await;
+        assert!(
+            res.is_err(),
+            "binding a non-local source must fail, got {res:?}"
+        );
+    }
+
+    /// Tests for which links the visa service proposes and with which `peer`
+    /// (ZODE_LINKS.md rule 13b, zl-zipline#255).
+    mod proposed {
+        use super::*;
+        use crate::db::{FakeDb, FaultMode};
+        use crate::test_helpers::{make_node_actor_defexp, make_peering};
+        use std::collections::HashMap;
+        use zpr::policy_types::{NetAddr, Peering};
+
+        /// The relay: the visa service docks on it. Policy declares its address.
+        const R: &str = "fd5a:5052:3000::1";
+        /// Endpoints with no address in policy: the relay observes theirs when they join.
+        const A: &str = "fd5a:5052:3000::a";
+        const B: &str = "fd5a:5052:3000::b";
+        /// Nodes whose address policy declares.
+        const C: &str = "fd5a:5052:3000::c";
+        const D: &str = "fd5a:5052:3000::d";
+
+        fn ip(s: &str) -> IpAddr {
+            s.parse().unwrap()
+        }
+
+        fn sa(s: &str) -> SocketAddr {
+            s.parse().unwrap()
+        }
+
+        /// The policy address of `node` on its links, if policy declares one.
+        fn policy_port(node: &str) -> Option<u16> {
+            match node {
+                R => Some(7000),
+                C => Some(7003),
+                D => Some(7004),
+                _ => None,
+            }
+        }
+
+        /// A peering of `a` and `b`, each end at its own ZPR address with its
+        /// [policy_port], or with no address where policy declares none.
+        fn peering(a: &str, b: &str, link_id: &str) -> Peering {
+            let mut peering = make_peering(ip(a), ip(b), link_id, vec![]);
+            peering.substrate_a = policy_port(a).map(|port| NetAddr::new_for_ip_or_host(a, port));
+            peering.substrate_b = policy_port(b).map(|port| NetAddr::new_for_ip_or_host(b, port));
+            peering
+        }
+
+        /// An assembly whose policy links the relay R to A, B and C, and declares the
+        /// direct links A-B and C-D, with a CN for every node. The visa service docks
+        /// on R. No node has a VS-API session yet; see [connect].
+        async fn build() -> (Arc<Assembly>, Arc<FakeDb>) {
+            let (asm, event_rx, db) =
+                crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+            std::mem::forget(event_rx);
+            let peerings = [
+                peering(R, A, "link-ra"),
+                peering(R, B, "link-rb"),
+                peering(R, C, "link-rc"),
+                peering(A, B, "link-ab"),
+                peering(C, D, "link-cd"),
+            ];
+            let cns = [R, A, B, C, D].map(|n| (ip(n), n));
+            asm.policy_mgr
+                .update_policy_from_container_bytes(
+                    crate::test_helpers::policy_with_peerings_and_node_cns(&peerings, &cns),
+                )
+                .await
+                .unwrap();
+            asm.topo_mgr.add_node(ip(R)).unwrap();
+            asm.actor_mgr
+                .hack_set_vs_docking_node(&ip(R))
+                .await
+                .unwrap();
+            (Arc::new(asm), db)
+        }
+
+        /// `node` starts a VS-API session whose stored substrate address claim is
+        /// `substrate`, with a live VSS worker.
+        async fn connect(asm: &Assembly, node: &str, substrate: &str) {
+            asm.actor_mgr
+                .add_node(
+                    &make_node_actor_defexp(node, node, substrate),
+                    false,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            asm.vss_mgr.insert_test_handle(ip(node), tx);
+            std::mem::forget(rx);
+        }
+
+        /// `node`'s VS-API session ends without a rejoin: its VSS worker exits (its
+        /// command channel closes), and its node actor stays stored.
+        fn end_session(asm: &Assembly, node: &str) {
+            let (tx, _closed) = tokio::sync::mpsc::channel(1);
+            asm.vss_mgr.insert_test_handle(ip(node), tx);
+        }
+
+        /// `node`'s proposed links, by peer ZPR address: `peer -> Link.peer`.
+        async fn links_of(asm: &Assembly, node: &str) -> HashMap<IpAddr, Option<SocketAddr>> {
+            let psnap = asm.policy_mgr.get_current_snapshot();
+            proposed_links(asm, &psnap, &ip(node))
+                .await
+                .expect("no lookup fails")
+                .into_iter()
+                .map(|link| (link.zpr_addr, link.peer.map(SocketAddr::from)))
+                .collect()
+        }
+
+        /// The relay's topology names a joiner that policy gives no address and that
+        /// has not connected yet, with `peer` unset: the relay never dials it, and must
+        /// know the joiner's CN before the joiner connects (J2).
+        #[tokio::test]
+        async fn a_relay_link_to_an_unaddressed_unconnected_joiner_has_no_peer() {
+            let (asm, _db) = build().await;
+            let relay = links_of(&asm, R).await;
+            assert_eq!(relay.get(&ip(A)), Some(&None), "{relay:?}");
+            assert_eq!(relay.get(&ip(B)), Some(&None), "{relay:?}");
+        }
+
+        /// Once the joiner connects, the relay's link to it names its stored address,
+        /// and the joiner's link to the relay names the relay's policy address.
+        #[tokio::test]
+        async fn a_relay_link_names_the_joiners_stored_address_once_it_connects() {
+            let (asm, _db) = build().await;
+            connect(&asm, A, "192.0.2.10:7000").await;
+            assert_eq!(
+                links_of(&asm, R).await.get(&ip(A)),
+                Some(&Some(sa("192.0.2.10:7000")))
+            );
+            assert_eq!(
+                links_of(&asm, A).await.get(&ip(R)),
+                Some(&Some(sa("[fd5a:5052:3000::1]:7000")))
+            );
+        }
+
+        /// A direct link (neither end is the relay) with one end's address unknown is
+        /// proposed to neither end: no Zode is asked to dial a link it cannot make.
+        #[tokio::test]
+        async fn a_direct_link_with_one_end_unknown_is_left_out_at_both_ends() {
+            let (asm, _db) = build().await;
+            connect(&asm, A, "192.0.2.10:7000").await;
+            let a = links_of(&asm, A).await;
+            assert!(!a.contains_key(&ip(B)), "{a:?}");
+            let b = links_of(&asm, B).await;
+            assert!(!b.contains_key(&ip(A)), "{b:?}");
+            assert!(b.contains_key(&ip(R)), "B's relay link stays: {b:?}");
+        }
+
+        /// A direct link with both ends' stored addresses known is proposed to both
+        /// ends, each naming the other's address.
+        #[tokio::test]
+        async fn a_direct_link_with_both_ends_known_names_the_other_end() {
+            let (asm, _db) = build().await;
+            connect(&asm, A, "192.0.2.10:7000").await;
+            connect(&asm, B, "198.51.100.20:7001").await;
+            assert_eq!(
+                links_of(&asm, A).await.get(&ip(B)),
+                Some(&Some(sa("198.51.100.20:7001")))
+            );
+            assert_eq!(
+                links_of(&asm, B).await.get(&ip(A)),
+                Some(&Some(sa("192.0.2.10:7000")))
+            );
+        }
+
+        /// A policy address is a known address with or without a session, and wins over
+        /// a session's claim: links between policy-addressed nodes are unchanged.
+        #[tokio::test]
+        async fn a_policy_address_wins_and_needs_no_session() {
+            let (asm, _db) = build().await;
+            connect(&asm, C, "192.0.2.99:1").await;
+            assert_eq!(
+                links_of(&asm, R).await.get(&ip(C)),
+                Some(&Some(sa("[fd5a:5052:3000::c]:7003")))
+            );
+            assert_eq!(
+                links_of(&asm, C).await.get(&ip(D)),
+                Some(&Some(sa("[fd5a:5052:3000::d]:7004")))
+            );
+            assert_eq!(
+                links_of(&asm, D).await.get(&ip(C)),
+                Some(&Some(sa("[fd5a:5052:3000::c]:7003")))
+            );
+        }
+
+        /// A stored claim that names no dialable address (a bare IP from an adapter-path
+        /// connect, an unspecified IP, port 0) is not a known address, and it does not
+        /// fail the topology: the relay link is still proposed, with `peer` unset, and
+        /// the direct link left out (visaservice#68 review, Copilot).
+        #[tokio::test]
+        async fn a_claim_that_is_not_a_dialable_address_is_unknown() {
+            let (asm, _db) = build().await;
+            connect(&asm, B, "198.51.100.20:7001").await;
+            for claim in ["192.0.2.10", "0.0.0.0:7000", "192.0.2.10:0"] {
+                connect(&asm, A, "192.0.2.10:7000").await;
+                let mut actor = asm
+                    .actor_mgr
+                    .get_actor_by_zpr_addr(&ip(A))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                actor
+                    .add_attribute(
+                        libeval::attribute::Attribute::builder(
+                            libeval::attribute::key::SUBSTRATE_ADDR,
+                        )
+                        .value(claim),
+                    )
+                    .unwrap();
+                asm.actor_mgr
+                    .update_actor(&actor, &asm.policy_service_names())
+                    .await
+                    .unwrap();
+                assert_eq!(links_of(&asm, R).await.get(&ip(A)), Some(&None), "{claim}");
+                let b = links_of(&asm, B).await;
+                assert!(!b.contains_key(&ip(A)), "{claim}: {b:?}");
+            }
+        }
+
+        /// No stale observations (zl-zipline#264): once a node's session ends without a
+        /// rejoin, its stored address is no longer known. Its peer may hold that IP now
+        /// (DHCP, CGNAT), so the direct link is left out and the relay link has no `peer`.
+        /// A policy address is unaffected.
+        #[tokio::test]
+        async fn a_stored_address_is_unknown_once_the_session_ends() {
+            let (asm, _db) = build().await;
+            connect(&asm, A, "192.0.2.10:7000").await;
+            connect(&asm, B, "198.51.100.20:7001").await;
+            connect(&asm, C, "192.0.2.99:1").await;
+            end_session(&asm, A);
+            end_session(&asm, C);
+            let b = links_of(&asm, B).await;
+            assert!(!b.contains_key(&ip(A)), "{b:?}");
+            assert_eq!(links_of(&asm, R).await.get(&ip(A)), Some(&None));
+            assert_eq!(
+                links_of(&asm, R).await.get(&ip(C)),
+                Some(&Some(sa("[fd5a:5052:3000::c]:7003")))
+            );
+        }
+
+        /// A session lookup that fails is an error, never a guessed or missing address:
+        /// the send fails and the topology stays unsynced, so the worker retries it.
+        #[tokio::test]
+        async fn a_failed_lookup_fails_the_topology() {
+            let (asm, db) = build().await;
+            connect(&asm, A, "192.0.2.10:7000").await;
+            db.set_exists_fault(FaultMode::Reject);
+            let psnap = asm.policy_mgr.get_current_snapshot();
+            assert!(proposed_links(&asm, &psnap, &ip(R)).await.is_err());
+        }
     }
 }

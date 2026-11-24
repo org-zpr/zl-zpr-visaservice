@@ -16,6 +16,7 @@
 //! the address resolved at construction time.
 
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -79,6 +80,14 @@ pub struct KeySource {
     /// Yields the CONNECT proxy's current URL; called on every refresh so
     /// the fetch follows the providing actor when it moves.
     proxy: ProxyResolver,
+    /// Local address a *proxied* fetch binds to: the visa service's own ZPR
+    /// address (`vs_addr`). The CONNECT proxy is always an actor on the
+    /// ZPRnet (see `PolicyMgr`'s proxy resolver), and on a relay Zode the TUN
+    /// also carries the relay's address; without a bind the kernel may pick
+    /// that one and the relay drops the fetch (zl-zipline#240, the JWKS case
+    /// of #228). `None` (and every direct, unproxied fetch) leaves the
+    /// source to the kernel: direct egress goes to a substrate URL.
+    bind_addr: Option<IpAddr>,
     /// Serializes credential-triggered refreshes so concurrent requests
     /// coalesce onto one in-flight fetch ([`Self::refresh_coalesced`]).
     refresh_gate: tokio::sync::Mutex<()>,
@@ -136,11 +145,27 @@ impl KeySource {
             last_ok: Mutex::new(None),
             cfg: cfg.clone(),
             proxy,
+            bind_addr: None,
             refresh_gate: tokio::sync::Mutex::new(()),
             last_attempt: Mutex::new(None),
             #[cfg(test)]
             extra_roots: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Set the local address that proxied fetches bind to (see the
+    /// `bind_addr` field). Builder-style so construction sites that never
+    /// proxy (tests, direct egress) need not change.
+    pub fn with_bind_addr(mut self, bind_addr: Option<IpAddr>) -> Self {
+        self.bind_addr = bind_addr;
+        self
+    }
+
+    /// The local address proxied fetches bind to (test-only observability
+    /// for the factory wiring, zl-zipline#240).
+    #[cfg(test)]
+    pub(crate) fn bind_addr(&self) -> Option<IpAddr> {
+        self.bind_addr
     }
 
     /// The current key set. Lock-free; safe to call on the hot path.
@@ -197,7 +222,9 @@ impl KeySource {
             // sees only `CONNECT host:port`, never the request.
             let proxy = reqwest::Proxy::https(proxy_url.clone())
                 .map_err(|e| OidcError::Rejected(format!("bad proxy url: {e}")))?;
-            builder = builder.proxy(proxy);
+            // The proxy is an actor on the ZPRnet: leave from our own ZPR
+            // address, not whatever source the kernel picks (see `bind_addr`).
+            builder = builder.proxy(proxy).local_address(self.bind_addr);
         }
         #[cfg(test)]
         for cert in self
@@ -610,6 +637,46 @@ mod tests {
         assert!(
             !seen.iter().any(|l| l.starts_with("GET ")),
             "a plaintext GET through the proxy would expose the request: {seen:?}"
+        );
+    }
+
+    /// zl-zipline#240: a proxied fetch must leave from `bind_addr` (the visa
+    /// service's `vs_addr`), not a kernel-chosen source. 127.0.0.1 and
+    /// 127.0.0.2 are both local on one interface, which is the relay's
+    /// situation (same trick as #228's `vss_connect_originates_from_vs_addr`).
+    /// The fake proxy only records who connected; the fetch itself fails.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_proxied_refresh_originates_from_bind_addr() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move {
+            let (_sock, peer) = listener.accept().await.unwrap();
+            peer.ip()
+        });
+
+        let c = cfg(
+            seed_jwks_json(),
+            "https://idp.invalid/jwks",
+            Some("egress-proxy"),
+        );
+        let proxy_url = reqwest::Url::parse(&format!("http://{proxy_addr}")).unwrap();
+        let bind: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+        let ks = KeySource::from_policy(&c, static_proxy(Some(proxy_url)))
+            .await
+            .unwrap()
+            .with_bind_addr(Some(bind));
+        // The stub never answers the CONNECT, so the fetch fails or times out;
+        // only the source address of the TCP connection matters.
+        let _ = tokio::time::timeout(Duration::from_secs(5), ks.refresh()).await;
+
+        let peer_ip = tokio::time::timeout(Duration::from_secs(5), accepted)
+            .await
+            .expect("no connection reached the proxy")
+            .unwrap();
+        assert_eq!(
+            peer_ip, bind,
+            "a proxied JWKS fetch must originate from bind_addr"
         );
     }
 

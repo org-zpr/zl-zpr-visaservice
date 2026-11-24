@@ -8,24 +8,84 @@
 //!
 use std::collections::HashSet;
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use crate::actor_mgr::ActorMgr;
 use crate::db::LinkRepo;
 use crate::error::{ServiceError, TopologyError};
+use crate::link_state::LinkStateTable;
 use crate::logging::targets::TOPO;
 use crate::policy_mgr::PolicySnapshot;
 use crate::router::{LinkSpec, Router};
 
 use libeval::actor::Actor;
-use libeval::attribute::{AttrMatch, Attribute, attributes_equivalent};
+#[cfg(test)]
+use libeval::attribute::Attribute;
+use libeval::attribute::{AttrMatch, attributes_equivalent};
 use libeval::eval_route::{RouteHint, TopologyQueryApi};
 use libeval::policy::LinkDescription;
 use libeval::route::{LinkId, NodeId, Route};
+use zpr::vsapi_types::{LinkState, LinkStateReport};
+
+/// Proof that the caller holds the topology operation lock ([TopologyMgr::ops]).
+///
+/// THE INVARIANT (zl-zpr-visaservice#62, zl-zipline#224): every operation that reads
+/// policy, link, actor or session state to decide a topology, link-state or session
+/// write holds one `TopoOps` from its first read to its last write, including any visa
+/// revocation the write calls for. Every mutating `TopologyMgr` method takes `&TopoOps`,
+/// so an unlocked topology mutation does not compile. Operations therefore never
+/// interleave: none can act on state another is about to change, whatever it awaits in
+/// between (persistence, actor updates, revocations).
+///
+/// Policy installs commit under the same lock ([crate::policy_mgr::PolicyMgr::bind_topology_lock]), so
+/// the current policy cannot change while a guard is held: read it after taking the
+/// guard and it stays current until the guard is dropped. Work that must read policy
+/// before the guard because it waits on the network -- authenticating a node, which
+/// can query trusted services -- rechecks under the guard that the policy it used is
+/// still current (`approved_under_current_policy` in `vsapi_worker`) and refuses
+/// otherwise. Likewise a `VSHandle` call that writes on its node's behalf rechecks
+/// the handle's session (`node_is_live`) under the guard, right before the write, so
+/// a handle superseded by a reconnect while the call waited cannot act on the new
+/// session's state.
+///
+/// Rules: never take a second guard while holding one: the lock is not re-entrant
+/// (pass the guard down instead, as `disconnect_locked` and `AuthenticateUndo::undo`
+/// take it). Under the guard await only local work (state store writes, actor
+/// updates): never the visa request queue, a trusted service, an event-queue send or
+/// a node RPC. Those can be slow, and can wait on a task that wants the guard (a visa
+/// request refreshes actor attributes, whose commit takes it). So `authenticate` drops
+/// it before recording `ActorJoins`, `disconnect` before stopping the node's VSS
+/// worker, `register_vss` prepares its visas before taking it, and the policy pass
+/// drops it before sending `setTopology` (as does a re-proposal after a `down`
+/// report, `vsapi_worker::repropose_link_after_down`).
+///
+/// Actor attribute refreshes query trusted services outside the guard and commit
+/// under it, applying only the attributes they changed onto the actor as stored then
+/// (`commit_refresh` in `actor_attributes`), so they never roll back a session or
+/// claim written meanwhile.
+///
+/// The one path outside it is visa issuance, which is not a topology write: it reads
+/// routes lock-free and checks its route again once the visa is stored (see
+/// `VisaMgr::revoke_if_route_down`). A link going down sets its flag before its
+/// revocation pass lists visas, so a visa is either listed by the pass or sees the flag.
+///
+/// ponytail: one global lock. Topology operations are rare (node connects and
+/// disconnects, link-state reports, policy installs); make it per-node only if
+/// profiling shows contention.
+pub struct TopoOps<'a> {
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+}
 
 pub struct TopologyMgr {
     router: Router,
     link_repo: LinkRepo,
+    /// Latest link-state snapshot per reporting node (zl-zipline#224). Decides each
+    /// router link's up/down flag together with policy CNs; see [Self::refresh_link].
+    /// In memory only; a std mutex because no critical section awaits.
+    link_state: Mutex<LinkStateTable>,
+    /// The topology operation lock; see [TopoOps].
+    ops: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The fate of a persisted/live edge when validated against the current policy.
@@ -47,6 +107,24 @@ pub struct RevalidationReport {
     pub links_repaired: usize,
     /// Known nodes left with no remaining links. Detected and reported only.
     pub orphaned_nodes: Vec<IpAddr>,
+    /// Links this reconciliation took from up to down -- a rebuilt link whose
+    /// link-state reports no longer agree under the new policy -- or removed while
+    /// up. The caller revokes the visas that cross them (zl-zipline#224): a visa
+    /// committed under the new policy before this ran is not re-checked by the
+    /// policy sweep, whose generation gate considers it current.
+    pub links_down: Vec<(IpAddr, IpAddr)>,
+}
+
+/// What one link-state report changed ([TopologyMgr::record_link_states]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LinkStateChanges {
+    /// Links that went from up to down, as `(reporter, peer)`, so the caller can revoke
+    /// the visas that use them.
+    pub went_down: Vec<(IpAddr, IpAddr)>,
+    /// The reporter's declared peers whose link the report newly lists `down`
+    /// (`LinkStateTable::newly_down`), so the caller can propose the link again
+    /// (zl-zipline#268).
+    pub newly_down: Vec<IpAddr>,
 }
 
 /// Special error returned by [TopologyMgr::add_linked_node] that records
@@ -82,25 +160,454 @@ impl TopologyMgr {
         Self {
             router: Router::new(),
             link_repo,
+            link_state: Mutex::new(LinkStateTable::new()),
+            ops: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Take the topology operation lock. Hold the returned guard from the first read to
+    /// the last write of the operation, revocations included; see [TopoOps].
+    pub async fn ops(&self) -> TopoOps<'_> {
+        TopoOps {
+            _guard: self.ops.lock().await,
+        }
+    }
+
+    /// The topology operation lock itself, for [crate::policy_mgr::PolicyMgr::bind_topology_lock]: a
+    /// policy install commits under it, so the current policy cannot change while a
+    /// topology operation holds a [TopoOps].
+    pub fn ops_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.ops.clone()
+    }
+
+    /// Test helper: take the topology operation lock without awaiting, for single
+    /// operations in tests (sync or async). Panics if the lock is already held, which in
+    /// a test means the test itself is holding a guard it forgot about.
+    #[cfg(test)]
+    pub fn ops_now(&self) -> TopoOps<'_> {
+        TopoOps {
+            _guard: self
+                .ops
+                .try_lock()
+                .expect("topology operation lock already held"),
+        }
+    }
+
+    /// The node-address -> CN lookup that link-state evaluation uses, backed by policy
+    /// (`Policy::node_cn_for_addr`).
+    pub fn policy_cn_lookup(snapshot: &PolicySnapshot) -> impl Fn(&IpAddr) -> Option<String> + '_ {
+        move |addr: &IpAddr| snapshot.policy().node_cn_for_addr(addr).map(str::to_string)
+    }
+
+    /// Store `reporter`'s link-state snapshot (already validated, see
+    /// `link_state::validate_snapshot`) and re-evaluate every router link incident to it.
+    ///
+    /// `current_policy` returns the policy snapshot current at the time of the call. It
+    /// is called once, inside the link-state table lock, and every CN of the evaluation
+    /// comes from that one snapshot: CNs come from policy, and mixing two policies'
+    /// CNs in one edge could enable a link neither policy would. Revalidation holds the
+    /// same lock with the new policy, so whichever applies second sees it.
+    ///
+    /// Returns the links that went from up to down, as `(reporter, peer)`, so the caller
+    /// can revoke the visas that use them. A link coming up is not returned: it affects
+    /// new visas only (zl-zpr-dev-context docs/ROUTING.md, Design decisions, "Link down
+    /// revokes; link up does not"). Also returns the declared peers whose link the
+    /// report newly lists `down` (zl-zipline#268), resolved by CN like `failed` entries.
+    ///
+    /// `session` is the VS-API session the report came from. A report from an older
+    /// session generation than the node's latest is dropped
+    /// (`LinkStateTable::accept_session`): a soft reconnect keeps the router node, so a
+    /// late report from the replaced session must not overwrite the new one's.
+    ///
+    /// A `failed` entry also marks the pair {reporter, that peer} failed (R13a). The
+    /// peer is the policy-declared peer of `reporter` whose CN (from the same policy
+    /// snapshot) is the entry's `peerCn`. Recording a report never sends topology: the
+    /// caller decides what to send for [LinkStateChanges::newly_down].
+    pub fn record_link_states(
+        &self,
+        _ops: &TopoOps<'_>,
+        reporter: &IpAddr,
+        session: Option<&str>,
+        entries: Vec<LinkStateReport>,
+        current_policy: &dyn Fn() -> PolicySnapshot,
+    ) -> LinkStateChanges {
+        let mut table = self.link_state.lock().unwrap();
+        let snapshot = current_policy();
+        let declared_peers: Vec<IpAddr> = snapshot
+            .policy()
+            .get_peers_for_node(reporter)
+            .unwrap_or(&[])
+            .iter()
+            .map(|p| p.remote_zpr_addr)
+            .collect();
+        self.record_locked(
+            &mut table,
+            reporter,
+            session,
+            entries,
+            &Self::policy_cn_lookup(&snapshot),
+            &declared_peers,
+        )
+    }
+
+    /// As [Self::record_link_states], with a fixed node-address -> CN lookup instead of a
+    /// policy. For tests, which have no compiled policy naming CNs; the reporter's router
+    /// peers stand in for its policy-declared peers.
+    #[cfg(test)]
+    pub fn record_link_states_with_cns(
+        &self,
+        _ops: &TopoOps<'_>,
+        reporter: &IpAddr,
+        session: Option<&str>,
+        entries: Vec<LinkStateReport>,
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
+    ) -> LinkStateChanges {
+        let mut table = self.link_state.lock().unwrap();
+        let declared_peers = self.router.get_peers(reporter);
+        self.record_locked(
+            &mut table,
+            reporter,
+            session,
+            entries,
+            cn_of,
+            &declared_peers,
+        )
+    }
+
+    /// Body of [Self::record_link_states], with the table locked by the caller: one
+    /// critical section from storing the snapshot through the last router update, so
+    /// two overlapping reports cannot interleave and leave an older evaluation's flag
+    /// on the router (table, then router: the same order as installs).
+    ///
+    /// `declared_peers` are the reporter's peers; a `failed` entry marks the pair with
+    /// the one whose CN it names (R13a).
+    fn record_locked(
+        &self,
+        table: &mut LinkStateTable,
+        reporter: &IpAddr,
+        session: Option<&str>,
+        entries: Vec<LinkStateReport>,
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
+        declared_peers: &[IpAddr],
+    ) -> LinkStateChanges {
+        if !table.accept_session(*reporter, session) {
+            debug!(target: TOPO, "link-state report from {reporter}: from a superseded session; dropped");
+            return LinkStateChanges::default();
+        }
+        // A report from a node that is no longer in the router -- a stale handle whose
+        // node was disconnected meanwhile -- is dropped: storing it would let a
+        // pre-disconnect snapshot govern the link after the node reconnects.
+        // `remove_node` clears the snapshot and the router node under this same lock.
+        if !self.router.has_node(reporter) {
+            debug!(target: TOPO, "link-state report from {reporter}: node is no longer connected; dropped");
+            return LinkStateChanges::default();
+        }
+        // R13a: remember each pair whose link the owner newly reports `failed`
+        // (LinkStateTable::record_failures).
+        let failed_cns: Vec<String> = entries
+            .iter()
+            .filter(|e| e.state == LinkState::Failed)
+            .map(|e| e.peer_cn.clone())
+            .collect();
+        let failed_peers = Self::declared_peers_named(reporter, &failed_cns, declared_peers, cn_of);
+        for peer in table.record_failures(*reporter, &failed_peers) {
+            info!(target: TOPO, "link {reporter} <-> {peer} reported failed; left out of topology until either end reconnects");
+        }
+        // zl-zipline#268: the links this snapshot newly lists `down`, compared with the
+        // stored snapshot it is about to replace.
+        let newly_down = Self::declared_peers_named(
+            reporter,
+            &table.newly_down(reporter, &entries),
+            declared_peers,
+            cn_of,
+        );
+        table.set_snapshot(*reporter, entries);
+        LinkStateChanges {
+            went_down: self.refresh_links_locked(table, reporter, cn_of),
+            newly_down,
+        }
+    }
+
+    /// The peers among `declared_peers` whose CN (by `cn_of`) is one of `peer_cns`, the
+    /// CNs of some entries of a report from `reporter`. A CN that names none of the
+    /// reporter's peers resolves to nothing (it may race a policy change) and is logged.
+    fn declared_peers_named(
+        reporter: &IpAddr,
+        peer_cns: &[String],
+        declared_peers: &[IpAddr],
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
+    ) -> Vec<IpAddr> {
+        peer_cns
+            .iter()
+            .filter_map(|cn| {
+                let peer = declared_peers
+                    .iter()
+                    .find(|p| cn_of(p).as_deref() == Some(cn.as_str()))
+                    .copied();
+                if peer.is_none() {
+                    debug!(target: TOPO, "report from {reporter} for peerCn '{cn}': no such peer; ignored");
+                }
+                peer
+            })
+            .collect()
+    }
+
+    /// Forget `node`'s link-state reports and re-evaluate every router link incident to it,
+    /// so those links are down until it reports again (R14). For a node that lost all its
+    /// links (a rejoin, R9) but keeps its state in the visa service. Returns the links that
+    /// went from up to down, as `(node, peer)`, for the caller to revoke the visas crossing
+    /// them. CNs come from `current_policy`, called once under the table lock, as in
+    /// [Self::record_link_states].
+    pub fn forget_link_states(
+        &self,
+        _ops: &TopoOps<'_>,
+        node: &IpAddr,
+        current_policy: &dyn Fn() -> PolicySnapshot,
+    ) -> Vec<(IpAddr, IpAddr)> {
+        let mut table = self.link_state.lock().unwrap();
+        table.remove_node(node);
+        let snapshot = current_policy();
+        self.refresh_links_locked(&mut table, node, &Self::policy_cn_lookup(&snapshot))
+    }
+
+    /// Re-evaluate every router link incident to `node`. Returns the links that went from
+    /// up to down, as `(node, peer)`. Production code re-evaluates through
+    /// [Self::record_link_states] and the install paths; tests use this directly.
+    #[cfg(test)]
+    pub fn refresh_links_for_node(
+        &self,
+        _ops: &TopoOps<'_>,
+        node: &IpAddr,
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
+    ) -> Vec<(IpAddr, IpAddr)> {
+        let mut table = self.link_state.lock().unwrap();
+        self.refresh_links_locked(&mut table, node, cn_of)
+    }
+
+    /// As [Self::refresh_links_for_node], with the table already locked by the caller.
+    fn refresh_links_locked(
+        &self,
+        table: &mut LinkStateTable,
+        node: &IpAddr,
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
+    ) -> Vec<(IpAddr, IpAddr)> {
+        self.router
+            .get_peers(node)
+            .into_iter()
+            .filter(|peer| self.refresh_link(table, node, peer, cn_of))
+            .map(|peer| (*node, peer))
+            .collect()
+    }
+
+    /// Whether the link between `a` and `b` may carry routes according to the current
+    /// link-state reports (`LinkStateTable::edge_usable`).
+    fn usable_now(
+        &self,
+        a: &IpAddr,
+        b: &IpAddr,
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
+    ) -> bool {
+        Self::usable_in(&self.link_state.lock().unwrap(), a, b, cn_of)
+    }
+
+    /// As [Self::usable_now], against a table the caller already holds locked.
+    fn usable_in(
+        table: &LinkStateTable,
+        a: &IpAddr,
+        b: &IpAddr,
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
+    ) -> bool {
+        let (a_cn, b_cn) = (cn_of(a), cn_of(b));
+        table.edge_usable(a, a_cn.as_deref(), b, b_cn.as_deref())
+    }
+
+    /// True if the owner of the link between `a` and `b` reported it `failed` and the
+    /// pair has not been cleared since (R13a): the link is left out of both ends'
+    /// topology. A read, like visa issuance, so it takes no [TopoOps].
+    pub fn is_failed_pair(&self, a: &IpAddr, b: &IpAddr) -> bool {
+        self.link_state.lock().unwrap().is_failed(a, b)
+    }
+
+    /// Clear every failed pair `node` is part of (R13a): something about those pairs
+    /// changed, so the visa service proposes their links again. Returns the other end
+    /// of each cleared pair; the caller sends those nodes `setTopology` once it has
+    /// dropped the guard (see `vsapi_worker::repropose_links_to_peers`).
+    ///
+    /// This is the one entry point for "the pair changed". Today the only such event is a
+    /// (re)connect of the node's VS-API session; v2's ZBOLT/rendezvous step is meant to
+    /// call it too.
+    pub fn clear_failed_pairs_for(&self, _ops: &TopoOps<'_>, node: &IpAddr) -> Vec<IpAddr> {
+        self.link_state.lock().unwrap().clear_failed_for(node)
+    }
+
+    /// Mark the link between `a` and `b` as waiting to be proposed again after a `down`
+    /// report (zl-zipline#268). Returns false if a re-proposal is already pending, in
+    /// which case the caller schedules nothing: the pending one covers this report too.
+    pub fn mark_repropose(&self, _ops: &TopoOps<'_>, a: &IpAddr, b: &IpAddr) -> bool {
+        self.link_state.lock().unwrap().mark_repropose(*a, *b)
+    }
+
+    /// Take the pending re-proposal mark of the link between `a` and `b`
+    /// ([Self::mark_repropose]), so the next `down` schedules a new one. Returns false if
+    /// there was none.
+    pub fn take_repropose(&self, _ops: &TopoOps<'_>, a: &IpAddr, b: &IpAddr) -> bool {
+        self.link_state.lock().unwrap().take_repropose(*a, *b)
+    }
+
+    /// Record that `node`, in VS-API session `session`, has no up link left
+    /// (zl-zipline#284). Returns the token its departure check presents to
+    /// [Self::take_departure], or None if a check for that session is already pending
+    /// (`LinkStateTable::mark_departure`).
+    pub fn mark_departure(
+        &self,
+        _ops: &TopoOps<'_>,
+        node: &IpAddr,
+        session: Option<&str>,
+    ) -> Option<u64> {
+        self.link_state
+            .lock()
+            .unwrap()
+            .mark_departure(*node, session)
+    }
+
+    /// Take `node`'s pending departure check if `token` is still the pending one
+    /// ([Self::mark_departure]). Returns false if a link of the node came up meanwhile,
+    /// or a newer session's check replaced it.
+    pub fn take_departure(&self, _ops: &TopoOps<'_>, node: &IpAddr, token: u64) -> bool {
+        self.link_state.lock().unwrap().take_departure(*node, token)
+    }
+
+    /// Make the router's transit set the one `snapshot`'s policy declares
+    /// (`Policy.transitNodes`, zl-zipline#255): only those nodes may be an interior hop
+    /// of a route. Takes the caller's [TopoOps] because it is a topology write.
+    ///
+    /// Returns the nodes that lost transit, for the log and tests. The caller revokes
+    /// the visas through every non-transit node afterwards
+    /// (`visa_reconciler::revoke_visas_through_non_transit`). The flag is cleared before
+    /// that lists visas, so a visa committed concurrently is either listed by it or
+    /// fails the commit-time route check ([Self::route_still_valid]), as for a link
+    /// going down.
+    pub fn apply_transit_nodes(
+        &self,
+        _ops: &TopoOps<'_>,
+        snapshot: &PolicySnapshot,
+    ) -> Vec<IpAddr> {
+        let lost = self
+            .router
+            .set_transit_nodes(snapshot.policy().transit_nodes().clone());
+        if !lost.is_empty() {
+            info!(target: TOPO, "policy vinst {}: nodes no longer transit-capable: {:?}", snapshot.vinst(), lost);
+        }
+        lost
+    }
+
+    /// Take transit away from every node that `snapshot`'s policy does not list, and
+    /// grant none: the router's transit set becomes its current set intersected with
+    /// the policy's. A policy pass does this before its links are reconciled; it grants
+    /// with [Self::apply_transit_nodes] after. Returns the nodes that lost transit.
+    pub fn withdraw_transit_nodes(
+        &self,
+        _ops: &TopoOps<'_>,
+        snapshot: &PolicySnapshot,
+    ) -> Vec<IpAddr> {
+        let policy_transit = snapshot.policy().transit_nodes();
+        let kept = self
+            .router
+            .transit_nodes()
+            .into_iter()
+            .filter(|node| policy_transit.contains(node))
+            .collect();
+        let lost = self.router.set_transit_nodes(kept);
+        if !lost.is_empty() {
+            info!(target: TOPO, "policy vinst {}: nodes no longer transit-capable: {:?}", snapshot.vinst(), lost);
+        }
+        lost
+    }
+
+    /// True if every interior node of a visa's recorded node `path` is transit-capable
+    /// ([Router::interior_is_transit]).
+    pub fn interior_is_transit(&self, path: &[IpAddr]) -> bool {
+        self.router.interior_is_transit(path)
+    }
+
+    /// Is `addr` a node in the router?
+    pub fn has_node(&self, addr: &IpAddr) -> bool {
+        self.router.has_node(addr)
+    }
+
+    /// True if a link connects `a` and `b` and it is up.
+    pub fn link_up(&self, a: &IpAddr, b: &IpAddr) -> bool {
+        self.router.link_between(a, b).is_some_and(|l| l.up)
+    }
+
+    /// True if a stored visa's route is still valid: with its recorded node `path`,
+    /// every link exists, is up and joins the matching hop ([Router::route_matches]);
+    /// without one (a route that stays on one node, or no recorded path), every link
+    /// exists and is up ([Router::links_up]).
+    pub fn route_still_valid(&self, links: &[LinkId], path: Option<&[IpAddr]>) -> bool {
+        match path {
+            Some(p) => self.router.route_matches(links, p),
+            None => self.router.links_up(links),
+        }
+    }
+
+    /// The one place that decides a router link's up/down flag: usable only while both
+    /// ends agree it is up (`LinkStateTable::edge_usable`). The caller holds the table
+    /// locked through the router update, so the flag set is the one the latest
+    /// snapshots call for. Returns true if the link went from up to down. A missing
+    /// link is a no-op.
+    fn refresh_link(
+        &self,
+        table: &mut LinkStateTable,
+        a: &IpAddr,
+        b: &IpAddr,
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
+    ) -> bool {
+        let Some(link) = self.router.link_between(a, b) else {
+            return false;
+        };
+        let usable = Self::usable_in(table, a, b, cn_of);
+        let changed = self.router.set_link_up(&link.id, usable);
+        if changed {
+            info!(target: TOPO, "link {} between {} and {} is now {}", link.id.0, a, b, if usable { "up" } else { "down" });
+        }
+        if changed && usable {
+            table.link_is_up(a, b); // zl-zipline#284
+        }
+        changed && !usable
     }
 
     /// Install a link into the in-memory router from a [LinkDescription], without
     /// persisting it. Used by both `add_linked_node` (which persists separately) and
     /// `restore_from_state` (which must not re-persist). The router error is returned
     /// unchanged so callers can decide how to treat [TopologyError::LinkExists].
+    ///
+    /// The link is installed with the up/down flag its link-state reports call for,
+    /// atomically, so a link one end already vetoes is never usable in between.
     fn install_router_link(
         &self,
         a: &IpAddr,
         b: &IpAddr,
         link_desc: LinkDescription,
+        cn_of: &dyn Fn(&IpAddr) -> Option<String>,
     ) -> Result<(), TopologyError> {
-        self.router.add_link(
+        // Hold the link-state table from reading the flag until the link is in the
+        // router. A concurrent report stores its snapshot under this lock and then
+        // refreshes the links it can see: it either runs before (and this read sees
+        // its snapshot) or after (and its refresh sees this link). Lock order is
+        // table, then router; no path takes them the other way round.
+        let mut table = self.link_state.lock().unwrap();
+        let up = Self::usable_in(&table, a, b, cn_of);
+        if up {
+            table.link_is_up(a, b); // zl-zipline#284
+        }
+        self.router.add_link_with_state(
             a.clone(),
             b.clone(),
             link_desc.link_id.into(),
             link_desc.attrs,
             link_desc.cost,
+            up,
         )
     }
 
@@ -132,6 +639,7 @@ impl TopologyMgr {
     /// error, so we never report failure while leaving a router edge behind.
     pub async fn add_linked_node(
         &self,
+        _ops: &TopoOps<'_>,
         snapshot: &PolicySnapshot,
         actor_mgr: &ActorMgr,
         actor: &Actor,
@@ -189,7 +697,12 @@ impl TopologyMgr {
         // Add the link to the router. LinkExists is tolerated (repair / re-auth): in
         // that case we did NOT add a link, so the rollback below must not remove it.
         let mut added_new_link = false;
-        match self.install_router_link(connect_via, new_node_addr, link_desc) {
+        match self.install_router_link(
+            connect_via,
+            new_node_addr,
+            link_desc,
+            &Self::policy_cn_lookup(snapshot),
+        ) {
             Ok(()) => added_new_link = true,
             Err(TopologyError::LinkExists(_)) => {}
             Err(e) => {
@@ -231,17 +744,30 @@ impl TopologyMgr {
     /// "Load state completely or fail": any error other than the precise
     /// link-not-found-in-policy case is propagated, so a transient policy/DB problem at
     /// startup fails the service rather than silently deleting valid persisted edges.
+    ///
+    /// Returns the restored links that are down. At startup the link-state table is
+    /// empty, so under R14 that is every restored link until both its ends report it
+    /// up; the caller revokes the persisted visas that cross them (R15).
     pub async fn restore_from_state(
         &self,
+        _ops: &TopoOps<'_>,
         snapshot: &PolicySnapshot,
         node_addrs: &[IpAddr],
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Vec<(IpAddr, IpAddr)>, ServiceError> {
+        // Which nodes may pass traffic through comes from policy (zl-zipline#255). The
+        // router is empty here, so this reports no loss even when the policy took a
+        // node's flag away before a restart: the caller revokes the restored visas that
+        // pass through a node that is not transit-capable
+        // (`revoke_visas_through_non_transit`).
+        self.apply_transit_nodes(_ops, snapshot);
+
         // In this code path there should be no cases for errors from add_node.
         for addr in node_addrs {
             self.router.add_node(addr.clone())?;
         }
 
         let known: HashSet<IpAddr> = node_addrs.iter().copied().collect();
+        let mut down = Vec::new();
 
         for (a, b) in self.link_repo.list_edges().await? {
             // Decide the edge's fate against the current policy + known-node set. Any
@@ -249,8 +775,18 @@ impl TopologyMgr {
             // transient policy/DB problem fails startup rather than deleting valid edges.
             match Self::decide_edge(snapshot, &known, &a, &b)? {
                 EdgeDecision::Install(link_desc) => {
-                    match self.install_router_link(&a, &b, link_desc) {
-                        Ok(()) | Err(TopologyError::LinkExists(_)) => {}
+                    match self.install_router_link(
+                        &a,
+                        &b,
+                        link_desc,
+                        &Self::policy_cn_lookup(snapshot),
+                    ) {
+                        Ok(()) => {
+                            if !self.link_up(&a, &b) {
+                                down.push((a, b));
+                            }
+                        }
+                        Err(TopologyError::LinkExists(_)) => {}
                         Err(e) => return Err(e.into()),
                     }
                 }
@@ -263,7 +799,7 @@ impl TopologyMgr {
             }
         }
 
-        Ok(())
+        Ok(down)
     }
 
     /// Decide whether an edge should be installed (policy still describes it) or
@@ -302,21 +838,33 @@ impl TopologyMgr {
     /// membership is governed by the passed in `node_addrs` (the authoritative
     /// known-node set), not by edge count.
     ///
-    /// Validation always runs against the current policy. The pass is
-    /// idempotent, so a policy update racing mid-pass simply produces another
-    /// pass.
+    /// `snapshot` decides which links exist and their ids, attributes and cost; their
+    /// up/down flags are computed with `current_policy()` inside the link-state table
+    /// lock. The caller reads `snapshot` under its [TopoOps], and policy installs
+    /// commit under the same lock, so the two are the same policy for the whole pass.
+    /// A `snapshot` that is not current when the pass starts (a caller that read it
+    /// before taking the guard) applies nothing -- not even persistence repairs or
+    /// deletions -- and leaves the work to the pass for the current policy.
     pub async fn revalidate_against_policy(
         &self,
+        ops: &TopoOps<'_>,
         snapshot: &PolicySnapshot,
         node_addrs: &[IpAddr],
+        current_policy: &dyn Fn() -> PolicySnapshot,
     ) -> Result<RevalidationReport, ServiceError> {
         let mut report = RevalidationReport::default();
+        // Superseded before any write: nothing is decided on an old policy.
+        let current_vinst = current_policy().vinst();
+        if current_vinst != snapshot.vinst() {
+            info!(target: TOPO, "revalidate: policy vinst {} superseded by {}; topology left to the newer pass", snapshot.vinst(), current_vinst);
+            return Ok(report);
+        }
         let known: HashSet<IpAddr> = node_addrs.iter().copied().collect();
 
         // Actor/node state is the authoritative live-node set; make sure each such node
         // exists in the router before repairing its links.
         for addr in node_addrs {
-            self.add_node_if_not_exists(*addr);
+            self.add_node_if_not_exists(ops, *addr);
         }
 
         // Reconcile the union of persisted and live-router edges: either store may hold
@@ -363,6 +911,7 @@ impl TopologyMgr {
             old_id: Option<LinkId>,
         }
 
+        let cn_of = Self::policy_cn_lookup(snapshot);
         let mut surviving: Vec<Surviving> = Vec::new();
         let mut removals: Vec<Removal> = Vec::new();
         for (a, b) in work_edges {
@@ -379,9 +928,14 @@ impl TopologyMgr {
                     let action = match &router_link {
                         None => Action::Fresh,
                         Some(rl) => {
+                            // The up/down flag is part of the comparison: the
+                            // node-to-CN index comes from policy, so a new policy can
+                            // change which link-state reports match a link whose id,
+                            // cost and attributes did not change.
                             let changed = rl.id.0 != desc.link_id
                                 || rl.cost != desc.cost
-                                || !attributes_equivalent(&rl.attributes, &desc.attrs);
+                                || !attributes_equivalent(&rl.attributes, &desc.attrs)
+                                || rl.up != self.usable_now(&a, &b, &cn_of);
                             if changed {
                                 Action::Replace(rl.id.clone())
                             } else {
@@ -439,6 +993,20 @@ impl TopologyMgr {
         let mut removal_ids: Vec<LinkId> =
             removals.iter().filter_map(|r| r.old_id.clone()).collect();
         let mut additions: Vec<LinkSpec> = Vec::new();
+        // Link state comes from link-state reports, not policy: every installed or
+        // rebuilt link gets the flag its reports call for, inside the atomic batch.
+        // The table stays locked until the batch is applied, for the same reason as
+        // in install_router_link: a concurrent report cannot slip in between.
+        let mut table = self.link_state.lock().unwrap();
+        let current = current_policy();
+        let flag_cn_of = Self::policy_cn_lookup(&current);
+        // A removed link that is up now (read under the lock: a report may have brought
+        // it up since the decision) carries visas that must be revoked.
+        report.links_down = removals
+            .iter()
+            .filter(|r| self.router.link_between(&r.a, &r.b).is_some_and(|l| l.up))
+            .map(|r| (r.a, r.b))
+            .collect();
         for e in surviving {
             let spec = LinkSpec {
                 a: e.a,
@@ -446,8 +1014,22 @@ impl TopologyMgr {
                 id: e.desc.link_id.into(),
                 attributes: e.desc.attrs,
                 cost: e.desc.cost,
+                up: Self::usable_in(&table, &e.a, &e.b, &flag_cn_of),
             };
+            // The router flag as it is now. Flags only change under the table lock,
+            // which is held, so this cannot move before the batch is applied.
+            let up_now = self.router.link_between(&e.a, &e.b).is_some_and(|l| l.up);
+            if up_now && !spec.up {
+                report.links_down.push((e.a, e.b));
+            }
             match e.action {
+                // Keep was decided with the pass snapshot; under the current policy the
+                // flag may still differ. Rebuild such a link with the right flag.
+                Action::Keep if up_now != spec.up => {
+                    removal_ids.push(spec.id.clone());
+                    additions.push(spec);
+                    report.links_updated += 1;
+                }
                 Action::Keep => {}
                 Action::Fresh => {
                     additions.push(spec);
@@ -460,7 +1042,16 @@ impl TopologyMgr {
                 }
             }
         }
+        let up_links: Vec<(IpAddr, IpAddr)> = additions
+            .iter()
+            .filter(|l| l.up)
+            .map(|l| (l.a, l.b))
+            .collect();
         self.router.apply_link_batch(&removal_ids, additions)?;
+        for (a, b) in &up_links {
+            table.link_is_up(a, b); // zl-zipline#284
+        }
+        drop(table);
 
         // Detect + report orphans. An orphan node is a legitimate state and stays in the
         // topology so long as it remains a known node; removing it belongs to the
@@ -502,6 +1093,8 @@ impl TopologyMgr {
     ///
     /// Retruns an error if the node already exists.
     #[allow(dead_code)]
+    /// Test helper: add a bare node, outside any operation.
+    #[cfg(test)]
     pub fn add_node(&self, addr: IpAddr) -> Result<(), TopologyError> {
         self.router.add_node(addr)
     }
@@ -510,7 +1103,7 @@ impl TopologyMgr {
     /// This calls [Router::add_node].
     ///
     /// Returns true if node was added. If node already exists, you get `false` back instead.
-    pub fn add_node_if_not_exists(&self, addr: IpAddr) -> bool {
+    pub fn add_node_if_not_exists(&self, _ops: &TopoOps<'_>, addr: IpAddr) -> bool {
         match self.router.add_node(addr) {
             Ok(()) => true,
             Err(TopologyError::NodeExists(_)) => false,
@@ -519,6 +1112,8 @@ impl TopologyMgr {
     }
 
     #[allow(dead_code)]
+    /// Test helper: add a link, outside any operation.
+    #[cfg(test)]
     pub fn add_link(
         &self,
         zpr_addr_a: IpAddr,
@@ -531,6 +1126,14 @@ impl TopologyMgr {
             .add_link(zpr_addr_a, zpr_addr_b, id, attributes, cost)
     }
 
+    /// Test helper: replace the router's transit set ([Router::set_transit_nodes]),
+    /// outside any operation. Production code sets it from policy.
+    #[cfg(test)]
+    pub fn set_transit_nodes(&self, transit: &[IpAddr]) -> Vec<IpAddr> {
+        self.router
+            .set_transit_nodes(transit.iter().copied().collect())
+    }
+
     /// Remove a node and all its incident links from the router, and best-effort
     /// delete the corresponding persisted edges.
     ///
@@ -540,13 +1143,17 @@ impl TopologyMgr {
     /// persisted edge may survive a DB failure, but `restore_from_state` validates
     /// every persisted edge against the surviving node set and current policy before
     /// recreating anything, so stale edges never resurrect a real link.
-    pub async fn remove_node(&self, addr: &IpAddr) {
+    pub async fn remove_node(&self, _ops: &TopoOps<'_>, addr: &IpAddr) {
         let peers = self.router.get_peers(addr);
         for peer in &peers {
             if let Err(e) = self.link_repo.remove_edge(addr, peer).await {
                 warn!(target: TOPO, "failed to remove persisted edge {} <-> {} on node removal: {}", addr, peer, e);
             }
         }
+        // Under the table lock, so a concurrent report either lands before (and is
+        // cleared here) or after (and finds the node gone; see record_link_states).
+        let mut table = self.link_state.lock().unwrap();
+        table.remove_node(addr);
         self.router.remove_node(addr)
     }
 
@@ -612,9 +1219,9 @@ mod tests {
         Peering {
             link_id: link_id.to_string(),
             node_a,
-            substrate_a: NetAddr::new_for_ip_or_host(&node_a.to_string(), 0),
+            substrate_a: Some(NetAddr::new_for_ip_or_host(&node_a.to_string(), 0)),
             node_b,
-            substrate_b: NetAddr::new_for_ip_or_host(&node_b.to_string(), 0),
+            substrate_b: Some(NetAddr::new_for_ip_or_host(&node_b.to_string(), 0)),
             attributes,
         }
     }
@@ -630,6 +1237,12 @@ mod tests {
 
     /// Serialize a policy whose topology is exactly the given peerings.
     fn policy_bytes_from_peerings(peerings: &[Peering]) -> Vec<u8> {
+        policy_bytes_from_peerings_and_transit(peerings, &[])
+    }
+
+    /// As [policy_bytes_from_peerings], with `Policy.transitNodes` = `transit` (left
+    /// unset when empty).
+    fn policy_bytes_from_peerings_and_transit(peerings: &[Peering], transit: &[IpAddr]) -> Vec<u8> {
         let mut msg = capnp::message::Builder::new_default();
         {
             let mut policy = msg.init_root::<policy_capnp::policy::Builder>();
@@ -637,6 +1250,12 @@ mod tests {
             let mut topo = policy.reborrow().init_topology(peerings.len() as u32);
             for (i, p) in peerings.iter().enumerate() {
                 p.write_to(&mut topo.reborrow().get(i as u32));
+            }
+            if !transit.is_empty() {
+                let mut list = policy.reborrow().init_transit_nodes(transit.len() as u32);
+                for (i, addr) in transit.iter().enumerate() {
+                    list.set(i as u32, addr.to_string());
+                }
             }
         }
         let mut bytes = Vec::new();
@@ -651,14 +1270,23 @@ mod tests {
 
     /// Create a PolicyMgr over the given db preloaded with the given policy bytes.
     async fn make_policy_mgr_from_bytes(db: Arc<FakeDb>, pol_bytes: Vec<u8>) -> PolicyMgr {
-        let repo = PolicyRepo::new(db.clone());
-        PolicyMgr::new_with_initial_policy(
+        make_policy_mgr_from_container(
+            db,
             make_container_bytes(
                 config::POLICY_MIN_COMPILER_MAJOR,
                 config::POLICY_MIN_COMPILER_MINOR,
                 config::POLICY_MIN_COMPILER_PATCH,
                 &pol_bytes,
             ),
+        )
+        .await
+    }
+
+    /// Create a PolicyMgr over the given db from already-wrapped container bytes.
+    async fn make_policy_mgr_from_container(db: Arc<FakeDb>, container: Vec<u8>) -> PolicyMgr {
+        let repo = PolicyRepo::new(db.clone());
+        PolicyMgr::new_with_initial_policy(
+            container,
             repo,
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
@@ -666,6 +1294,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(crate::db::ActorRepo::new(db)),
             None,
+            crate::config::VSConfig::default().get_vs_addr(),
         )
         .await
         .unwrap()
@@ -700,6 +1329,7 @@ mod tests {
         let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
 
         topo.add_linked_node(
+            &topo.ops_now(),
             &policy_mgr.get_current_snapshot(),
             &actor_mgr,
             &actor_b,
@@ -741,6 +1371,7 @@ mod tests {
         // Re-adding the same link hits the already-connected path and repairs Redis.
         let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
         topo.add_linked_node(
+            &topo.ops_now(),
             &policy_mgr.get_current_snapshot(),
             &actor_mgr,
             &actor_b,
@@ -772,6 +1403,7 @@ mod tests {
 
         let result = topo
             .add_linked_node(
+                &topo.ops_now(),
                 &policy_mgr.get_current_snapshot(),
                 &actor_mgr,
                 &actor_b,
@@ -823,6 +1455,7 @@ mod tests {
         let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
         let result = topo
             .add_linked_node(
+                &topo.ops_now(),
                 &policy_mgr.get_current_snapshot(),
                 &actor_mgr,
                 &actor_b,
@@ -856,6 +1489,7 @@ mod tests {
         topo.add_node(a).unwrap();
         let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
         topo.add_linked_node(
+            &topo.ops_now(),
             &policy_mgr.get_current_snapshot(),
             &actor_mgr,
             &actor_b,
@@ -869,7 +1503,7 @@ mod tests {
             1
         );
 
-        topo.remove_node(&b).await;
+        topo.remove_node(&topo.ops_now(), &b).await;
 
         assert!(
             LinkRepo::new(db).list_edges().await.unwrap().is_empty(),
@@ -889,13 +1523,39 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
 
-        topo.restore_from_state(&policy_mgr.get_current_snapshot(), &[a, b])
+        topo.restore_from_state(&topo.ops_now(), &policy_mgr.get_current_snapshot(), &[a, b])
             .await
             .unwrap();
 
-        // The link is back: a and b are peers and a route exists.
+        // The link is back: a and b are peers. No route yet: neither end has reported
+        // since the restart, so under R14 the link is down (see
+        // test_restore_installs_link_down_until_both_ends_report).
         assert_eq!(topo.get_peers(&a), vec![b]);
-        assert!(topo.get_best_route(&a, &b).is_some());
+        assert!(topo.router.link_between(&a, &b).is_some());
+    }
+
+    /// zl-zipline#255: restore applies the policy's transit set, so C may again be an
+    /// interior hop after a restart. (The restored links themselves stay down under R14
+    /// until both ends report, so this checks the transit set, not a route.)
+    #[tokio::test]
+    async fn test_restore_applies_the_policy_transit_set() {
+        let db = Arc::new(FakeDb::new());
+        let (a, b, c) = (ip("fd5a:5052::1"), ip("fd5a:5052::2"), ip("fd5a:5052::3"));
+        let peerings = [peering(a, c, "ac", vec![]), peering(c, b, "cb", vec![])];
+        let policy = policy_bytes_from_peerings_and_transit(&peerings, &[c]);
+        let policy_mgr = make_policy_mgr_from_bytes(db.clone(), policy).await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.link_repo.add_edge(&a, &c).await.unwrap();
+        topo.link_repo.add_edge(&c, &b).await.unwrap();
+        topo.restore_from_state(
+            &topo.ops_now(),
+            &policy_mgr.get_current_snapshot(),
+            &[a, b, c],
+        )
+        .await
+        .unwrap();
+        assert!(topo.interior_is_transit(&[a, c, b]));
+        assert!(!topo.interior_is_transit(&[c, a, b]));
     }
 
     /// add_node_if_not_exists preserves restored in-memory links and persisted edges on reconnect.
@@ -909,12 +1569,12 @@ mod tests {
         // Persist an edge directly, then restore into a fresh topology to simulate restart.
         LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
-        topo.restore_from_state(&policy_mgr.get_current_snapshot(), &[a, b])
+        topo.restore_from_state(&topo.ops_now(), &policy_mgr.get_current_snapshot(), &[a, b])
             .await
             .unwrap();
         assert_eq!(topo.get_peers(&a), vec![b], "precondition: link restored");
 
-        let added = topo.add_node_if_not_exists(b);
+        let added = topo.add_node_if_not_exists(&topo.ops_now(), b);
 
         assert!(!added, "node was already present from restore");
         assert_eq!(
@@ -941,7 +1601,7 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&a, &c).await.unwrap();
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
 
-        topo.restore_from_state(&policy_mgr.get_current_snapshot(), &[a, c])
+        topo.restore_from_state(&topo.ops_now(), &policy_mgr.get_current_snapshot(), &[a, c])
             .await
             .unwrap();
 
@@ -966,7 +1626,7 @@ mod tests {
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
 
         // Only `a` survived node-state refresh; `b` is gone.
-        topo.restore_from_state(&policy_mgr.get_current_snapshot(), &[a])
+        topo.restore_from_state(&topo.ops_now(), &policy_mgr.get_current_snapshot(), &[a])
             .await
             .unwrap();
 
@@ -988,7 +1648,7 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
 
-        topo.restore_from_state(&policy_mgr.get_current_snapshot(), &[])
+        topo.restore_from_state(&topo.ops_now(), &policy_mgr.get_current_snapshot(), &[])
             .await
             .unwrap();
 
@@ -1018,7 +1678,12 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&a, &c).await.unwrap();
 
         let report = topo
-            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, c])
+            .revalidate_against_policy(
+                &topo.ops_now(),
+                &policy_mgr.get_current_snapshot(),
+                &[a, c],
+                &|| policy_mgr.get_current_snapshot(),
+            )
             .await
             .unwrap();
 
@@ -1051,14 +1716,21 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
 
         let report = topo
-            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
+            .revalidate_against_policy(
+                &topo.ops_now(),
+                &policy_mgr.get_current_snapshot(),
+                &[a, b],
+                &|| policy_mgr.get_current_snapshot(),
+            )
             .await
             .unwrap();
 
         assert_eq!(report.links_updated, 1);
         assert_eq!(report.links_removed, 0);
+        // Read the cost off the router link, not a route: no end has reported, so the
+        // rebuilt link is down (R14) and carries no route.
         assert_eq!(
-            topo.get_best_route(&a, &b).unwrap().cost,
+            topo.router.link_between(&a, &b).unwrap().cost,
             9,
             "router link cost refreshed from policy"
         );
@@ -1076,7 +1748,12 @@ mod tests {
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
 
         let report = topo
-            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
+            .revalidate_against_policy(
+                &topo.ops_now(),
+                &policy_mgr.get_current_snapshot(),
+                &[a, b],
+                &|| policy_mgr.get_current_snapshot(),
+            )
             .await
             .unwrap();
 
@@ -1091,13 +1768,16 @@ mod tests {
         let db = Arc::new(FakeDb::new());
         let a = ip("fd5a:5052::1");
         let b = ip("fd5a:5052::2");
-        let policy_mgr = make_policy_mgr(db.clone(), a, b, "link-ab").await;
+        let policy_mgr = make_policy_mgr_with_cns(db.clone(), a, b).await;
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
         // Router link present at the policy's default cost; nothing persisted.
         topo.add_node(a).unwrap();
         topo.add_node(b).unwrap();
         topo.add_link(a, b, LinkId("link-ab".into()), vec![], 1)
             .unwrap();
+        // Both ends report the link up, so its up flag already matches what policy
+        // and reports call for (R14): only the persisted edge is missing.
+        report_both_up(&topo, a, b);
         assert!(
             LinkRepo::new(db.clone())
                 .list_edges()
@@ -1107,7 +1787,12 @@ mod tests {
         );
 
         let report = topo
-            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
+            .revalidate_against_policy(
+                &topo.ops_now(),
+                &policy_mgr.get_current_snapshot(),
+                &[a, b],
+                &|| policy_mgr.get_current_snapshot(),
+            )
             .await
             .unwrap();
 
@@ -1137,7 +1822,12 @@ mod tests {
             .unwrap();
 
         let report = topo
-            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, c])
+            .revalidate_against_policy(
+                &topo.ops_now(),
+                &policy_mgr.get_current_snapshot(),
+                &[a, c],
+                &|| policy_mgr.get_current_snapshot(),
+            )
             .await
             .unwrap();
 
@@ -1155,13 +1845,23 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
         // First pass installs the link from policy.
-        topo.revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
-            .await
-            .unwrap();
+        topo.revalidate_against_policy(
+            &topo.ops_now(),
+            &policy_mgr.get_current_snapshot(),
+            &[a, b],
+            &|| policy_mgr.get_current_snapshot(),
+        )
+        .await
+        .unwrap();
 
         // Second pass must be a no-op.
         let report = topo
-            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
+            .revalidate_against_policy(
+                &topo.ops_now(),
+                &policy_mgr.get_current_snapshot(),
+                &[a, b],
+                &|| policy_mgr.get_current_snapshot(),
+            )
             .await
             .unwrap();
 
@@ -1188,19 +1888,31 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
         // First pass installs the attribute-bearing link.
-        topo.revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
-            .await
-            .unwrap();
+        topo.revalidate_against_policy(
+            &topo.ops_now(),
+            &policy_mgr.get_current_snapshot(),
+            &[a, b],
+            &|| policy_mgr.get_current_snapshot(),
+        )
+        .await
+        .unwrap();
 
         // Second pass must not report a spurious update from rebuilt attrs.
         let report = topo
-            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
+            .revalidate_against_policy(
+                &topo.ops_now(),
+                &policy_mgr.get_current_snapshot(),
+                &[a, b],
+                &|| policy_mgr.get_current_snapshot(),
+            )
             .await
             .unwrap();
 
         assert_eq!(report.links_updated, 0, "rebuilt attrs must compare equal");
         assert_eq!(report.links_repaired, 0);
-        assert_eq!(topo.get_best_route(&a, &b).unwrap().cost, 5);
+        // Read the cost off the router link: no end has reported, so the link is down
+        // (R14) and carries no route.
+        assert_eq!(topo.router.link_between(&a, &b).unwrap().cost, 5);
     }
 
     /// A policy whose link id collides with another live router link's id makes the
@@ -1233,7 +1945,12 @@ mod tests {
             .unwrap();
 
         let result = topo
-            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b, c, d])
+            .revalidate_against_policy(
+                &topo.ops_now(),
+                &policy_mgr.get_current_snapshot(),
+                &[a, b, c, d],
+                &|| policy_mgr.get_current_snapshot(),
+            )
             .await;
 
         assert!(result.is_err(), "id collision must surface as an error");
@@ -1282,7 +1999,12 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&c, &d).await.unwrap();
 
         let report = topo
-            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b, c, d])
+            .revalidate_against_policy(
+                &topo.ops_now(),
+                &policy_mgr.get_current_snapshot(),
+                &[a, b, c, d],
+                &|| policy_mgr.get_current_snapshot(),
+            )
             .await
             .expect("id reassignment between valid edges must reconcile, not abort");
 
@@ -1313,7 +2035,12 @@ mod tests {
 
         // `c` is a known node with no links.
         let report = topo
-            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b, c])
+            .revalidate_against_policy(
+                &topo.ops_now(),
+                &policy_mgr.get_current_snapshot(),
+                &[a, b, c],
+                &|| policy_mgr.get_current_snapshot(),
+            )
             .await
             .unwrap();
 
@@ -1326,5 +2053,921 @@ mod tests {
             topo.add_node(c).is_err(),
             "orphaned node must remain in the topology"
         );
+    }
+
+    // --- Link-state reports (zl-zipline#224) ---
+
+    use std::collections::HashMap;
+    use zpr::vsapi_types::{LinkState, LinkStateReport};
+
+    fn report(cn: &str, state: LinkState) -> LinkStateReport {
+        LinkStateReport {
+            peer_cn: cn.to_string(),
+            state,
+        }
+    }
+
+    /// A CN lookup over a fixed address -> CN table, standing in for policy.
+    fn cn_table(pairs: &[(IpAddr, &str)]) -> impl Fn(&IpAddr) -> Option<String> + use<> {
+        let map: HashMap<IpAddr, String> = pairs.iter().map(|(a, c)| (*a, c.to_string())).collect();
+        move |addr: &IpAddr| map.get(addr).cloned()
+    }
+
+    /// Policy declaring one link a-b and the nodes' CNs "a.zpr" and "b.zpr".
+    async fn make_policy_mgr_with_cns(db: Arc<FakeDb>, a: IpAddr, b: IpAddr) -> PolicyMgr {
+        make_policy_mgr_from_container(
+            db,
+            crate::test_helpers::policy_with_peerings_and_node_cns(
+                &[peering(a, b, "link-ab", vec![])],
+                &[(a, "a.zpr"), (b, "b.zpr")],
+            ),
+        )
+        .await
+    }
+
+    /// Both ends report the a-b link up, with A's CN "a.zpr" and B's "b.zpr".
+    fn report_both_up(topo: &TopologyMgr, a: IpAddr, b: IpAddr) {
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        for (reporter, peer_cn) in [(a, "b.zpr"), (b, "a.zpr")] {
+            topo.record_link_states_with_cns(
+                &topo.ops_now(),
+                &reporter,
+                None,
+                vec![report(peer_cn, LinkState::Up)],
+                &cn_of,
+            );
+        }
+    }
+
+    /// Report A's and then B's view of the link as up, checking after A's report that
+    /// one end alone does not bring the link up (R14).
+    fn report_both_up_and_check(topo: &TopologyMgr, a: IpAddr, b: IpAddr) {
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("b.zpr", LinkState::Up)],
+            &cn_of,
+        );
+        assert!(
+            !topo.router.link_between(&a, &b).unwrap().up,
+            "one end's report is not enough"
+        );
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &b,
+            None,
+            vec![report("a.zpr", LinkState::Up)],
+            &cn_of,
+        );
+        assert!(
+            topo.router.link_between(&a, &b).unwrap().up,
+            "both ends report up: the link is usable"
+        );
+        assert!(topo.get_best_route(&a, &b).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_add_linked_node_installs_link_down_until_both_ends_report() {
+        // R14 (ZODE_LINKS.md): a link with no report counts as down. A link installed
+        // when a node joins starts down, and comes up only once both ends report it up.
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr = make_policy_mgr_with_cns(db.clone(), a, b).await;
+        let actor_mgr = make_actor_mgr(db.clone());
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
+        topo.add_linked_node(
+            &topo.ops_now(),
+            &policy_mgr.get_current_snapshot(),
+            &actor_mgr,
+            &actor_b,
+            &a,
+            &b,
+        )
+        .await
+        .unwrap();
+
+        let link = topo.router.link_between(&a, &b).expect("link installed");
+        assert!(!link.up, "neither end has reported: the link is down");
+        assert!(topo.get_best_route(&a, &b).is_none());
+        report_both_up_and_check(&topo, a, b);
+    }
+
+    #[tokio::test]
+    async fn test_revalidate_installs_link_down_until_both_ends_report() {
+        // R14: a link the policy pass installs (here a repair of router drift) starts
+        // down, and comes up only once both ends report it up.
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr = make_policy_mgr_with_cns(db.clone(), a, b).await;
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+
+        let report = topo
+            .revalidate_against_policy(
+                &topo.ops_now(),
+                &policy_mgr.get_current_snapshot(),
+                &[a, b],
+                &|| policy_mgr.get_current_snapshot(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.links_repaired, 1);
+        assert!(
+            !topo.router.link_between(&a, &b).unwrap().up,
+            "neither end has reported: the link is down"
+        );
+        assert!(report.links_down.is_empty(), "it was never up");
+        report_both_up_and_check(&topo, a, b);
+    }
+
+    #[tokio::test]
+    async fn test_revalidate_installing_an_up_link_drops_pending_departure_checks() {
+        // zl-zipline#284 (PR #72 review): a link the policy pass installs up is a
+        // recovery like a report's, so both ends' pending departure checks are dropped.
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr = make_policy_mgr_with_cns(db.clone(), a, b).await;
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        report_both_up(&topo, a, b); // no router link yet: only the table learns it
+        let ops = topo.ops_now();
+        let check_a = topo.mark_departure(&ops, &a, Some("s")).unwrap();
+        let check_b = topo.mark_departure(&ops, &b, Some("s")).unwrap();
+
+        let report = topo
+            .revalidate_against_policy(&ops, &policy_mgr.get_current_snapshot(), &[a, b], &|| {
+                policy_mgr.get_current_snapshot()
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.links_repaired, 1);
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+        assert!(!topo.take_departure(&ops, &a, check_a), "A's check dropped");
+        assert!(!topo.take_departure(&ops, &b, check_b), "B's check dropped");
+    }
+
+    #[tokio::test]
+    async fn test_restore_installs_link_down_until_both_ends_report() {
+        // R14: the link-state table is in memory only, so after a visa-service restart
+        // every restored link is down until both ends report again.
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr = make_policy_mgr_with_cns(db.clone(), a, b).await;
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+
+        let down = topo
+            .restore_from_state(&topo.ops_now(), &policy_mgr.get_current_snapshot(), &[a, b])
+            .await
+            .unwrap();
+        assert!(
+            !topo.router.link_between(&a, &b).unwrap().up,
+            "no reports after a restart: the link is down"
+        );
+        // Review (Codex P1, #66): the restored-down link is returned, so startup can
+        // revoke the persisted visas that cross it (R15).
+        assert_eq!(down.len(), 1);
+        let (x, y) = down[0];
+        assert!((x, y) == (a, b) || (x, y) == (b, a));
+        report_both_up_and_check(&topo, a, b);
+    }
+
+    // --- R13a: failed pairs (ZODE_LINKS.md) ---
+
+    /// Two router nodes a, b with a link, and their CN table.
+    fn two_linked_nodes() -> (TopologyMgr, IpAddr, IpAddr) {
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let topo = TopologyMgr::new(LinkRepo::new(Arc::new(FakeDb::new())));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        (topo, a, b)
+    }
+
+    #[test]
+    fn test_failed_report_marks_the_pair() {
+        let (topo, a, b) = two_linked_nodes();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("b.zpr", LinkState::Failed)],
+            &cn_of,
+        );
+        assert!(topo.is_failed_pair(&a, &b));
+        assert!(topo.is_failed_pair(&b, &a), "the pair is unordered");
+    }
+
+    #[test]
+    fn test_up_and_down_reports_neither_set_nor_clear_the_mark() {
+        let (topo, a, b) = two_linked_nodes();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        for state in [LinkState::Down, LinkState::Up] {
+            topo.record_link_states_with_cns(
+                &topo.ops_now(),
+                &a,
+                None,
+                vec![report("b.zpr", state)],
+                &cn_of,
+            );
+            assert!(!topo.is_failed_pair(&a, &b), "{state:?} sets no mark");
+        }
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("b.zpr", LinkState::Failed)],
+            &cn_of,
+        );
+        for state in [LinkState::Down, LinkState::Up] {
+            topo.record_link_states_with_cns(
+                &topo.ops_now(),
+                &b,
+                None,
+                vec![report("a.zpr", state)],
+                &cn_of,
+            );
+            topo.record_link_states_with_cns(
+                &topo.ops_now(),
+                &a,
+                None,
+                vec![report("b.zpr", state)],
+                &cn_of,
+            );
+            assert!(topo.is_failed_pair(&a, &b), "{state:?} clears no mark");
+        }
+    }
+
+    #[test]
+    fn test_failed_report_from_a_superseded_session_marks_nothing() {
+        let (topo, a, b) = two_linked_nodes();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        topo.record_link_states_with_cns(&topo.ops_now(), &a, Some("7-new"), vec![], &cn_of);
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            Some("6-old"),
+            vec![report("b.zpr", LinkState::Failed)],
+            &cn_of,
+        );
+        assert!(!topo.is_failed_pair(&a, &b));
+    }
+
+    #[test]
+    fn test_failed_report_for_an_unknown_cn_marks_nothing() {
+        let (topo, a, b) = two_linked_nodes();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("stranger.zpr", LinkState::Failed)],
+            &cn_of,
+        );
+        assert!(!topo.is_failed_pair(&a, &b));
+    }
+
+    #[test]
+    fn test_clear_failed_pairs_for_returns_the_other_ends() {
+        let (topo, a, b) = two_linked_nodes();
+        let c = ip("fd5a:5052::3");
+        topo.add_node(c).unwrap();
+        topo.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr"), (c, "c.zpr")]);
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![
+                report("b.zpr", LinkState::Failed),
+                report("c.zpr", LinkState::Failed),
+            ],
+            &cn_of,
+        );
+        // C reconnects: only the A-C pair is cleared, and A is the end to tell.
+        assert_eq!(topo.clear_failed_pairs_for(&topo.ops_now(), &c), vec![a]);
+        assert!(!topo.is_failed_pair(&a, &c));
+        assert!(topo.is_failed_pair(&a, &b));
+    }
+
+    #[test]
+    fn test_stale_failed_snapshot_does_not_re_mark_a_cleared_pair() {
+        // Review (Copilot, #66): B reconnects and the A-B pair is cleared. Before A
+        // receives the re-proposed topology it sends a snapshot for an unrelated A-C
+        // change that still lists B as failed; that must not re-mark A-B, or the
+        // re-proposed topology would leave the link out again.
+        let (topo, a, b) = two_linked_nodes();
+        let c = ip("fd5a:5052::3");
+        topo.add_node(c).unwrap();
+        topo.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr"), (c, "c.zpr")]);
+        let a_reports = |entries: Vec<LinkStateReport>| {
+            topo.record_link_states_with_cns(&topo.ops_now(), &a, None, entries, &cn_of);
+        };
+        a_reports(vec![report("b.zpr", LinkState::Failed)]);
+        assert!(topo.is_failed_pair(&a, &b));
+        assert_eq!(topo.clear_failed_pairs_for(&topo.ops_now(), &b), vec![a]);
+
+        a_reports(vec![
+            report("b.zpr", LinkState::Failed),
+            report("c.zpr", LinkState::Up),
+        ]);
+        assert!(
+            !topo.is_failed_pair(&a, &b),
+            "a stale failure re-marks nothing"
+        );
+
+        // A retries (its entry for B leaves `failed`), and the retry fails: marked.
+        a_reports(vec![report("c.zpr", LinkState::Up)]);
+        assert!(!topo.is_failed_pair(&a, &b));
+        a_reports(vec![
+            report("b.zpr", LinkState::Failed),
+            report("c.zpr", LinkState::Up),
+        ]);
+        assert!(topo.is_failed_pair(&a, &b), "a new failure is marked");
+    }
+
+    #[tokio::test]
+    async fn test_policy_pass_keeps_failed_marks() {
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr = make_policy_mgr_with_cns(db.clone(), a, b).await;
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.restore_from_state(&topo.ops_now(), &policy_mgr.get_current_snapshot(), &[a, b])
+            .await
+            .unwrap();
+        topo.record_link_states(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("b.zpr", LinkState::Failed)],
+            &|| policy_mgr.get_current_snapshot(),
+        );
+        assert!(
+            topo.is_failed_pair(&a, &b),
+            "marked from the policy's peers"
+        );
+        topo.revalidate_against_policy(
+            &topo.ops_now(),
+            &policy_mgr.get_current_snapshot(),
+            &[a, b],
+            &|| policy_mgr.get_current_snapshot(),
+        )
+        .await
+        .unwrap();
+        assert!(topo.is_failed_pair(&a, &b), "a policy pass clears no mark");
+    }
+
+    #[test]
+    fn test_link_state_reports_drive_the_router_flag() {
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let topo = TopologyMgr::new(LinkRepo::new(Arc::new(FakeDb::new())));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+
+        // A says up, B has not reported: a link with no report is down (R14). The
+        // test helper installed the link up, so this is its up -> down transition.
+        let down = topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("b.zpr", LinkState::Up)],
+            &cn_of,
+        );
+        assert_eq!(down.went_down, vec![(a, b)]);
+        assert!(!topo.router.link_between(&a, &b).unwrap().up);
+
+        // B says up too: the edge comes up; coming up is not a "went down".
+        let down = topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &b,
+            None,
+            vec![report("a.zpr", LinkState::Up)],
+            &cn_of,
+        );
+        assert!(down.went_down.is_empty());
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+
+        // B says down: the edge goes down and is reported as such, once.
+        let down = topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &b,
+            None,
+            vec![report("a.zpr", LinkState::Down)],
+            &cn_of,
+        );
+        assert_eq!(down.went_down, vec![(b, a)]);
+        assert!(!topo.router.link_between(&a, &b).unwrap().up);
+        assert!(topo.get_best_route(&a, &b).is_none());
+        let again = topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &b,
+            None,
+            vec![report("a.zpr", LinkState::Down)],
+            &cn_of,
+        );
+        assert!(
+            again.went_down.is_empty(),
+            "an edge already down is not reported again"
+        );
+
+        // B says up again: the edge comes back; coming up is not a "went down".
+        let down = topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &b,
+            None,
+            vec![report("a.zpr", LinkState::Up)],
+            &cn_of,
+        );
+        assert!(down.went_down.is_empty());
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+        assert!(topo.get_best_route(&a, &b).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_report_before_link_exists_applies_when_link_is_installed() {
+        // Both ends report the link up before it is installed (a Zode reports its
+        // link to the relay before the endpoint has authenticated). When B joins and
+        // the link is installed, it must start up: the reports apply at install.
+        // (Under R14 a link with no report starts down anyway, so this checks the
+        // positive direction: stored reports are read at install.)
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr = make_policy_mgr_with_cns(db.clone(), a, b).await;
+        let actor_mgr = make_actor_mgr(db.clone());
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        // B is a router node already (it reported), but has no link yet.
+        topo.add_node(b).unwrap();
+
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        for (reporter, peer_cn) in [(a, "b.zpr"), (b, "a.zpr")] {
+            let down = topo.record_link_states_with_cns(
+                &topo.ops_now(),
+                &reporter,
+                None,
+                vec![report(peer_cn, LinkState::Up)],
+                &cn_of,
+            );
+            assert!(
+                down.went_down.is_empty(),
+                "no edge yet, so nothing went down"
+            );
+        }
+
+        let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
+        topo.add_linked_node(
+            &topo.ops_now(),
+            &policy_mgr.get_current_snapshot(),
+            &actor_mgr,
+            &actor_b,
+            &a,
+            &b,
+        )
+        .await
+        .unwrap();
+
+        let link = topo.router.link_between(&a, &b).expect("link installed");
+        assert!(link.up, "both ends' earlier reports say the link is up");
+    }
+
+    #[tokio::test]
+    async fn test_removing_a_node_forgets_its_reports() {
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let topo = TopologyMgr::new(LinkRepo::new(Arc::new(FakeDb::new())));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+        report_both_up(&topo, a, b);
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+
+        topo.remove_node(&topo.ops_now(), &a).await;
+        topo.add_node(a).unwrap();
+        topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        topo.refresh_links_for_node(&topo.ops_now(), &a, &cn_of);
+        assert!(
+            !topo.router.link_between(&a, &b).unwrap().up,
+            "a re-joined node's earlier up report is forgotten: its links are down (R14)"
+        );
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("b.zpr", LinkState::Up)],
+            &cn_of,
+        );
+        assert!(
+            topo.router.link_between(&a, &b).unwrap().up,
+            "up again once it reports again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revalidate_reapplies_link_state_to_kept_links() {
+        // A link that is unchanged in policy (same id, cost, attributes) must still get
+        // its up/down flag re-evaluated: the node-to-CN index comes from policy, so a
+        // new policy can change which reports match the link.
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        // This policy declares the link but names no CNs.
+        let policy_mgr = make_policy_mgr(db.clone(), a, b, "link-ab").await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("link-ab".into()), vec![], 1)
+            .unwrap();
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+
+        // Under an earlier CN mapping, both ends' reports match and the link is up
+        // (R14 needs both).
+        report_both_up(&topo, a, b);
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+
+        // The current policy no longer knows B's CN, so A's entry cannot match it.
+        let report = topo
+            .revalidate_against_policy(
+                &topo.ops_now(),
+                &policy_mgr.get_current_snapshot(),
+                &[a, b],
+                &|| policy_mgr.get_current_snapshot(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.links_removed, 0);
+        assert!(
+            !topo.router.link_between(&a, &b).unwrap().up,
+            "the kept link must follow the new CN mapping"
+        );
+        assert_eq!(
+            report.links_down.len(),
+            1,
+            "the up->down transition is reported so its visas get revoked"
+        );
+        let (x, y) = report.links_down[0];
+        assert!((x, y) == (a, b) || (x, y) == (b, a));
+    }
+
+    #[test]
+    fn test_report_from_a_node_no_longer_in_the_router_is_not_stored() {
+        // A stale handle whose node was disconnected (removed from the router) must
+        // not leave a snapshot behind that would govern the link after a reconnect.
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let topo = TopologyMgr::new(LinkRepo::new(Arc::new(FakeDb::new())));
+        topo.add_node(b).unwrap();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+
+        // B, a router node, reports its end up.
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &b,
+            None,
+            vec![report("a.zpr", LinkState::Up)],
+            &cn_of,
+        );
+        // A is not a router node: its (up) report is dropped.
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("b.zpr", LinkState::Up)],
+            &cn_of,
+        );
+
+        // A reconnects and its link is installed. Had A's stale report been stored,
+        // both ends would agree and the link would be up; it was not, so A is a
+        // non-reporter and the link is down (R14).
+        topo.add_node(a).unwrap();
+        topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        topo.refresh_links_for_node(&topo.ops_now(), &a, &cn_of);
+        assert!(!topo.router.link_between(&a, &b).unwrap().up);
+    }
+
+    #[tokio::test]
+    async fn test_stale_revalidation_does_not_override_current_policy_flags() {
+        // A report evaluated against the current policy takes the link down; a
+        // revalidation pass still holding an older policy must not bring it back up.
+        use crate::test_helpers::policy_with_peerings_and_node_cns;
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        // Old policy: B is "b.zpr". New policy: B is "b2.zpr". Same link in both.
+        let old = make_policy_mgr_from_container(
+            db.clone(),
+            policy_with_peerings_and_node_cns(
+                &[peering(a, b, "link-ab", vec![])],
+                &[(a, "a.zpr"), (b, "b.zpr")],
+            ),
+        )
+        .await;
+        let new = make_policy_mgr_from_container(
+            db.clone(),
+            policy_with_peerings_and_node_cns(
+                &[peering(a, b, "link-ab", vec![])],
+                &[(a, "a.zpr"), (b, "b2.zpr")],
+            ),
+        )
+        .await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("link-ab".into()), vec![], 1)
+            .unwrap();
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+
+        // B reports A up ("a.zpr" in both policies), so A's report alone decides the
+        // link (R14 needs both ends).
+        topo.record_link_states(
+            &topo.ops_now(),
+            &b,
+            None,
+            vec![report("a.zpr", LinkState::Up)],
+            &|| new.get_current_snapshot(),
+        );
+        // A reports B up under the name "b.zpr": no longer B's CN under the new policy,
+        // though under the old one both ends would agree.
+        topo.record_link_states(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("b.zpr", LinkState::Up)],
+            &|| new.get_current_snapshot(),
+        );
+        assert!(!topo.router.link_between(&a, &b).unwrap().up);
+
+        // A stale pass with the old policy runs while the new one is current.
+        topo.revalidate_against_policy(
+            &topo.ops_now(),
+            &old.get_current_snapshot(),
+            &[a, b],
+            &|| new.get_current_snapshot(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !topo.router.link_between(&a, &b).unwrap().up,
+            "flags come from the current policy, not the stale pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revalidation_rechecks_kept_links_against_the_current_policy() {
+        // A's report was applied under the old policy (B was "b.zpr"); the new policy
+        // renamed B. The pass for the new policy must take the unchanged link down and
+        // report it for revocation.
+        use crate::test_helpers::policy_with_peerings_and_node_cns;
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let old = make_policy_mgr_from_container(
+            db.clone(),
+            policy_with_peerings_and_node_cns(
+                &[peering(a, b, "link-ab", vec![])],
+                &[(a, "a.zpr"), (b, "b.zpr")],
+            ),
+        )
+        .await;
+        let new = make_policy_mgr_from_container(
+            db.clone(),
+            policy_with_peerings_and_node_cns(
+                &[peering(a, b, "link-ab", vec![])],
+                &[(a, "a.zpr"), (b, "b2.zpr")],
+            ),
+        )
+        .await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("link-ab".into()), vec![], 1)
+            .unwrap();
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+
+        // Under the old policy both ends' reports match: the link is up (R14 needs
+        // both). B's report names A, whose CN the new policy keeps.
+        topo.record_link_states(
+            &topo.ops_now(),
+            &b,
+            None,
+            vec![report("a.zpr", LinkState::Up)],
+            &|| old.get_current_snapshot(),
+        );
+        topo.record_link_states(
+            &topo.ops_now(),
+            &a,
+            None,
+            vec![report("b.zpr", LinkState::Up)],
+            &|| old.get_current_snapshot(),
+        );
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+
+        // The flag was set under the old policy; a pass for the new (current) policy
+        // must re-check it even though the link itself is unchanged.
+        let report = topo
+            .revalidate_against_policy(
+                &topo.ops_now(),
+                &new.get_current_snapshot(),
+                &[a, b],
+                &|| new.get_current_snapshot(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !topo.router.link_between(&a, &b).unwrap().up,
+            "the kept link follows the current policy"
+        );
+        assert_eq!(
+            report.links_down.len(),
+            1,
+            "and its down transition is reported"
+        );
+    }
+
+    #[test]
+    fn test_reports_are_ordered_by_session_generation() {
+        // A soft reconnect keeps the router node; a late report from an older session
+        // must not overwrite a newer session's state. Sessions are ordered by their
+        // generation prefix, not by which handle was minted last.
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let topo = TopologyMgr::new(LinkRepo::new(Arc::new(FakeDb::new())));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        let cn_of = cn_table(&[(a, "a.zpr"), (b, "b.zpr")]);
+
+        // B reports A up. A has not reported, so the link is down (R14); from here on
+        // A's reports alone decide it.
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &b,
+            Some("1-b"),
+            vec![report("a.zpr", LinkState::Up)],
+            &cn_of,
+        );
+        assert!(!topo.router.link_between(&a, &b).unwrap().up);
+
+        // A's newer session (generation 7) reports the link down.
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            Some("7-new"),
+            vec![report("b.zpr", LinkState::Down)],
+            &cn_of,
+        );
+        assert!(!topo.router.link_between(&a, &b).unwrap().up);
+
+        // A late report from A's older session (generation 6) is dropped.
+        let down = topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            Some("6-old"),
+            vec![report("b.zpr", LinkState::Up)],
+            &cn_of,
+        );
+        assert!(down.went_down.is_empty());
+        assert!(
+            !topo.router.link_between(&a, &b).unwrap().up,
+            "the older session's report does not overwrite the newer one"
+        );
+
+        // The newer session can still update its state.
+        topo.record_link_states_with_cns(
+            &topo.ops_now(),
+            &a,
+            Some("7-new"),
+            vec![report("b.zpr", LinkState::Up)],
+            &cn_of,
+        );
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+    }
+
+    #[tokio::test]
+    async fn test_superseded_policy_pass_applies_nothing() {
+        // A pass whose policy is no longer current must not mutate the topology: the
+        // queued pass for the current policy does that.
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        // The pass's (old) policy declares no links, so it would GC a-b.
+        let policy_mgr =
+            make_policy_mgr_from_bytes(db.clone(), policy_bytes_from_peerings(&[])).await;
+        let old = policy_mgr.get_current_snapshot();
+        policy_mgr
+            .update_policy_from_container_bytes(make_container_bytes(
+                config::POLICY_MIN_COMPILER_MAJOR,
+                config::POLICY_MIN_COMPILER_MINOR,
+                config::POLICY_MIN_COMPILER_PATCH,
+                &policy_with_link(a, b, "link-ab"),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(old.vinst(), policy_mgr.get_current_snapshot().vinst());
+
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("link-ab".into()), vec![], 1)
+            .unwrap();
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+
+        let report = topo
+            .revalidate_against_policy(&topo.ops_now(), &old, &[a, b], &|| {
+                policy_mgr.get_current_snapshot()
+            })
+            .await
+            .unwrap();
+        assert!(
+            topo.router.link_between(&a, &b).is_some(),
+            "the stale pass removed nothing"
+        );
+        assert!(report.links_down.is_empty(), "and asks for no revocation");
+    }
+
+    #[tokio::test]
+    async fn test_superseded_policy_pass_keeps_persisted_edges() {
+        // Round 13 (Copilot): the stale-pass check runs before any write. An edge that
+        // exists only in persistence, which the old policy would GC but the current
+        // policy declares, must survive: the next pass can only find it there.
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr =
+            make_policy_mgr_from_bytes(db.clone(), policy_bytes_from_peerings(&[])).await;
+        let old = policy_mgr.get_current_snapshot();
+        policy_mgr
+            .update_policy_from_container_bytes(make_container_bytes(
+                config::POLICY_MIN_COMPILER_MAJOR,
+                config::POLICY_MIN_COMPILER_MINOR,
+                config::POLICY_MIN_COMPILER_PATCH,
+                &policy_with_link(a, b, "link-ab"),
+            ))
+            .await
+            .unwrap();
+
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+
+        topo.revalidate_against_policy(&topo.ops_now(), &old, &[a, b], &|| {
+            policy_mgr.get_current_snapshot()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            LinkRepo::new(db.clone()).list_edges().await.unwrap().len(),
+            1,
+            "the stale pass deleted no persisted edge"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_topology_operations_are_serialized() {
+        // The invariant: every topology/link-state operation holds the TopoOps guard
+        // from first read to last write. A report arriving during an in-flight
+        // operation (here: a guard held by the test) waits for it, so it can never act
+        // on state that operation is about to change.
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let topo = Arc::new(TopologyMgr::new(LinkRepo::new(Arc::new(FakeDb::new()))));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+
+        let in_flight = topo.ops().await;
+        let t2 = topo.clone();
+        let report = tokio::spawn(async move {
+            let ops = t2.ops().await;
+            t2.record_link_states_with_cns(&ops, &a, None, vec![], &|_: &IpAddr| None)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !report.is_finished(),
+            "the report waits for the in-flight operation"
+        );
+        assert!(topo.router.link_between(&a, &b).unwrap().up);
+
+        drop(in_flight);
+        let down = report.await.unwrap();
+        assert_eq!(down.went_down, vec![(a, b)], "and runs once it is released");
     }
 }

@@ -287,10 +287,12 @@ DELETE /admin/services/{id}/cache
     202: accepted (reload succeeded, reconciliation queued)
     403: permission denied (read-only key)
     404: no such trusted service
-    500: reload failed (e.g. the attribute file is missing or unparseable)
+    500: reload failed (e.g. the attribute file is missing or unparseable), or
+         the revocation obligation could not be recorded
   Notes
-    The reload is synchronous, so a 202 means the new data is live. The
-    reconciliation that follows is asynchronous: the actors behind live visas are
+    The reload is synchronous, so a 202 means the new data is live. A durable
+    revocation obligation is recorded before the reload; the reconciliation that
+    satisfies it is asynchronous and retried until it completes: the actors behind live visas are
     refreshed from the service and their visas re-checked against current policy,
     with visas no longer allowed queued for revocation. Its outcome is logged, not
     returned.
@@ -316,7 +318,8 @@ POST /admin/services/{id}/changed
     403: permission denied (key without notify rights, or a notify key bound
          to a different service id)
     404: no such trusted service
-    500: reload failed, or actor listing failed
+    500: reload failed, actor listing failed, or the revocation obligation
+         could not be recorded
   Notes
     Requires a notify or readwrite key. A notify key is bound to exactly one
     service id at mint time and gets 403 for any other id — checked BEFORE
@@ -502,8 +505,11 @@ GET /admin/policies/curr
 POST /admin/policies
 --------------------
   Summary
-    Installs a policy bundle and makes it the current policy. Fires a
-    PolicyUpdated event on success.
+    Installs a policy bundle and makes it the current policy. Records a durable
+    revocation obligation before the policy is committed and starts the
+    reconciler, which applies the policy to nodes and links and re-checks every
+    live visa (asynchronously; retried until it completes). A failure to record
+    the obligation fails the install (500).
   Request
     Body: PolicyBundle (config_id is ignored; the new policy is always id 0)
   Response

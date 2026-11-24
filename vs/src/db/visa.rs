@@ -9,8 +9,8 @@
 //!
 //! Redis schema (one key per visa):
 //! - `visa:next_visa_id` a counter for the next visa ID (INCR).
-//! - `visa:<ID>` a JSON `VisaRecord` (visa blob + metadata + per-node states),
-//!   with TTL = visa expiry.
+//! - `visa:<ID>` a JSON `VisaRecord` (visa blob + metadata + per-node states +
+//!   commit state), with TTL = visa expiry.
 //!
 //! TODO: At some point more of the redis stored state will be moved to write-through
 //! schemes like this, which may involve some refactoring.
@@ -44,7 +44,7 @@ const KEY_NEXT_VISA_ID: &str = "visa:next_visa_id";
 /// `purge_expired` once per node per heartbeat, so with N nodes it fires N× per
 /// interval; this collapses those to one real scan and spares readers the extra
 /// store-write-lock acquisitions.
-const PURGE_MIN_INTERVAL: Duration = Duration::from_millis(800);
+pub(crate) const PURGE_MIN_INTERVAL: Duration = Duration::from_millis(800);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeVisaState {
@@ -52,6 +52,19 @@ pub enum NodeVisaState {
     Installed,
     PendingRevoke,
     Revoked,
+}
+
+/// Whether a stored visa has passed its request's commit check (zl-zipline#248).
+///
+/// A visa a request commit-checks is stored `Pending` and stays so until the check
+/// passes; a visa nothing checks (a bootstrap visa) is stored `Committed`. A `Pending`
+/// visa is never delivered, and the mark is persisted, so a visa whose check never
+/// finished -- the visa service crashed in between -- is still known after a restart,
+/// which revokes it before it serves (see `VisaMgr::revoke_uncommitted_visas`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommitState {
+    Pending,
+    Committed,
 }
 
 /// Metadata around an issued visa.
@@ -66,7 +79,6 @@ pub struct VisaMetadata {
     pub ctime: SystemTime,
     pub policy_version: u64, // from policy.get_version
     pub created_vinst: u64,  // service vinst active when the visa was issued
-    pub checked_vinst: u64,  // latest vinst this visa has been evaluated against
     pub zpl: String,
     pub signal_msgs: Vec<String>, // note we do not keep the signal destination
     pub direction: Direction,
@@ -83,7 +95,6 @@ pub struct VisaMetadata {
 struct StoredNodeState {
     state: NodeVisaState,
     utime: String,
-    revoke_vinst: Option<u64>,
 }
 
 /// The single JSON value persisted at `visa:<id>`. Redis's only jobs are
@@ -96,13 +107,13 @@ struct VisaRecord {
     blob: String, // base64 capnp visa bytes (Visa is not serde)
     metadata: VisaMetadata,
     node_states: HashMap<String, StoredNodeState>, // keyed by ZAddr string
+    commit: CommitState,
 }
 
 /// In-memory, authoritative per-node state for a visa.
 #[derive(Debug, Clone)]
 struct NodeState {
     state: NodeVisaState,
-    revoke_vinst: Option<u64>, // policy `vinst` stamped when the node was marked PendingRevoke
 }
 
 /// In-memory, authoritative copy of one visa.
@@ -121,6 +132,7 @@ struct VisaEntry {
     // concern, AND-guard liveness with `seconds_until(visa.expires) > 0`.
     deadline: Instant,
     node_states: HashMap<IpAddr, NodeState>,
+    commit: CommitState,
 }
 
 /// The in-memory store guarded by a single `RwLock`.
@@ -171,7 +183,7 @@ impl VisaMetadata {
     /// `requesting_node` is the node that requested the visa.
     /// `pver` is the policy version that was in effect at the time of the visa request.
     /// `vinst` is the service policy-install generation active at issuance; it
-    /// seeds both `created_vinst` and `checked_vinst`.
+    /// seeds `created_vinst`.
     /// `zpl` is the ZPL is a copy of the ZPL line that matched in policy.
     /// `direction` is the direction of the match as reported by the hit.
     pub fn new(
@@ -188,7 +200,6 @@ impl VisaMetadata {
             ctime: SystemTime::now(),
             policy_version: pver,
             created_vinst: vinst,
-            checked_vinst: vinst,
             zpl,
             signal_msgs: Vec::new(),
             direction,
@@ -276,7 +287,8 @@ impl VisaRepo {
                 let json = if ttl > 0 {
                     let mut new_states = entry.node_states.clone();
                     new_states.remove(node_addr);
-                    let record = build_record(&entry.visa, &entry.metadata, &new_states)?;
+                    let record =
+                        build_record(&entry.visa, &entry.metadata, &new_states, entry.commit)?;
                     Some((serde_json::to_string(&record)?, ttl))
                 } else {
                     None
@@ -319,8 +331,8 @@ impl VisaRepo {
         Ok(())
     }
 
-    /// Store a new visa, setting its state w.r.t. the requesting node to `nstate`
-    /// and any other path nodes to `PendingInstall`.
+    /// Store a new visa, setting its state w.r.t. the requesting node to `nstate`,
+    /// any other path nodes to `PendingInstall`, and its commit state to `commit`.
     ///
     /// If the visa is already expired, this is a NOP and returns `Ok`.
     ///
@@ -331,6 +343,7 @@ impl VisaRepo {
         visa: &Visa,
         metadata: VisaMetadata,
         nstate: NodeVisaState,
+        commit: CommitState,
     ) -> Result<(), StoreError> {
         let visa_id = visa.issuer_id;
         let ttl = seconds_until(visa.expires);
@@ -342,13 +355,7 @@ impl VisaRepo {
         // Build the per-node state map: requesting node gets `nstate`, other path
         // nodes get PendingInstall.
         let mut node_states = HashMap::new();
-        node_states.insert(
-            metadata.requesting_node,
-            NodeState {
-                state: nstate,
-                revoke_vinst: None,
-            },
-        );
+        node_states.insert(metadata.requesting_node, NodeState { state: nstate });
         if let Some(path) = &metadata.path {
             for node in path {
                 if node == &metadata.requesting_node {
@@ -358,13 +365,12 @@ impl VisaRepo {
                     *node,
                     NodeState {
                         state: NodeVisaState::PendingInstall,
-                        revoke_vinst: None,
                     },
                 );
             }
         }
 
-        let record = build_record(visa, &metadata, &node_states)?;
+        let record = build_record(visa, &metadata, &node_states, commit)?;
         let json = serde_json::to_string(&record)?;
         let key = visa_key_for_visa(visa_id);
 
@@ -386,6 +392,7 @@ impl VisaRepo {
             metadata,
             deadline: Instant::now() + Duration::from_secs(ttl),
             node_states,
+            commit,
         };
         let mut store = self.inner.store.write().unwrap();
         insert_entry(&mut store, visa_id, entry);
@@ -406,116 +413,9 @@ impl VisaRepo {
             .collect()
     }
 
-    /// Apply an allow verdict at policy generation `vinst`. This happens after a policy
-    /// update and we are checking all existing visas.
-    ///
-    /// No-ops (`Ok(false)`) when the visa is absent/expired or `vinst` is not
-    /// newer than `checked_vinst` (never lowered). Otherwise bumps
-    /// `checked_vinst` and cancels any queued revoke whose stamp predates
-    /// `vinst` (`PendingRevoke -> PendingInstall`, stamp cleared) in one rewrite.
-    pub async fn record_allow_verdict(&self, visa_id: u64, vinst: u64) -> Result<bool, StoreError> {
-        // INVARIANT A: backing held for the whole write.
-        let _backing = self.inner.backing.lock().await;
-
-        // Snapshot + decide under a short read guard, then drop it for the Redis
-        // I/O. INVARIANT B: backing blocks other writers, so the entry can't
-        // change between this check and the apply below.
-        let (json, ttl, new_metadata, new_states) = {
-            let store = self.inner.store.read().unwrap();
-            let Some(entry) = live_entry(&store, visa_id) else {
-                return Ok(false);
-            };
-            if vinst <= entry.metadata.checked_vinst {
-                return Ok(false);
-            }
-            let ttl = remaining_secs(entry.deadline);
-            let mut new_metadata = entry.metadata.clone();
-            new_metadata.checked_vinst = vinst;
-            let mut new_states = entry.node_states.clone();
-            for ns in new_states.values_mut() {
-                if ns.state == NodeVisaState::PendingRevoke
-                    && ns.revoke_vinst.is_some_and(|rv| rv < vinst)
-                {
-                    // Was marked for revocation but now is allowed, flip it.
-                    ns.state = NodeVisaState::PendingInstall;
-                    ns.revoke_vinst = None;
-                }
-            }
-            let record = build_record(&entry.visa, &new_metadata, &new_states)?;
-            (
-                serde_json::to_string(&record)?,
-                ttl,
-                new_metadata,
-                new_states,
-            )
-        };
-        // Redis first.
-        self.inner
-            .db
-            .set_ex(&visa_key_for_visa(visa_id), &json, ttl)
-            .await?;
-        // Memory second. If purge_expired dropped the entry during the set_ex
-        // gap the visa expired mid-update; skipping the apply is correct.
-        if let Some(entry) = self.inner.store.write().unwrap().visas.get_mut(&visa_id) {
-            entry.metadata = new_metadata;
-            entry.node_states = new_states;
-        }
-        debug!(target: DB, "recorded allow verdict visa={visa_id} vinst={vinst}");
-        Ok(true)
-    }
-
-    /// Apply a deny verdict at policy generation `vinst`. This happens after a
-    /// policy update and we are checking all existing visas.
-    ///
-    /// No-ops (`Ok(false)`) when the visa is absent/expired or `vinst` is not
-    /// newer than `checked_vinst`. Otherwise marks every node `PendingRevoke`,
-    /// stamping `revoke_vinst = vinst` only where it exceeds the existing stamp
-    /// (a revoke decision overwrites `PendingInstall`/`Installed` freely). One
-    /// rewrite. `checked_vinst` is not bumped (only allow bumps it).
-    pub async fn record_deny_verdict(&self, visa_id: u64, vinst: u64) -> Result<bool, StoreError> {
-        // INVARIANT A: backing held for the whole write.
-        let _backing = self.inner.backing.lock().await;
-
-        // Snapshot + decide under a short read guard, then drop it for the Redis
-        // I/O. INVARIANT B: backing blocks other writers, so the entry can't
-        // change between this check and the apply below.
-        let (json, ttl, new_states) = {
-            let store = self.inner.store.read().unwrap();
-            let Some(entry) = live_entry(&store, visa_id) else {
-                return Ok(false);
-            };
-            if vinst <= entry.metadata.checked_vinst {
-                return Ok(false);
-            }
-            let ttl = remaining_secs(entry.deadline);
-            let mut new_states = entry.node_states.clone();
-            for ns in new_states.values_mut() {
-                ns.state = NodeVisaState::PendingRevoke;
-                if ns.revoke_vinst.is_none_or(|rv| vinst > rv) {
-                    ns.revoke_vinst = Some(vinst); // still revoked!
-                }
-            }
-            let record = build_record(&entry.visa, &entry.metadata, &new_states)?;
-            (serde_json::to_string(&record)?, ttl, new_states)
-        };
-        // Redis first.
-        self.inner
-            .db
-            .set_ex(&visa_key_for_visa(visa_id), &json, ttl)
-            .await?;
-        // Memory second. If purge_expired dropped the entry during the set_ex
-        // gap the visa expired mid-update; skipping the apply is correct.
-        if let Some(entry) = self.inner.store.write().unwrap().visas.get_mut(&visa_id) {
-            entry.node_states = new_states;
-        }
-        Ok(true)
-    }
-
-    /// Mark every node of a live visa `PendingRevoke`, unconditionally (no vinst
-    /// gate, no `checked_vinst` bump). For actor/node departure: the visa is
-    /// invalid regardless of policy, so leave each node's `revoke_vinst`
-    /// untouched -- a fresh revoke keeps `None`, which `record_allow_verdict`'s
-    /// `rv < vinst` test can never cancel, so a later allow cannot resurrect it.
+    /// Mark every node of a live visa `PendingRevoke`. Final: nothing moves a
+    /// node back out of `PendingRevoke` (the node re-requests to get a new visa).
+    /// Used by the visa sweep, actor/node departure and a link going down.
     /// No-ops (`Ok(false)`) when the visa is absent/expired.
     pub async fn mark_visa_revoked(&self, visa_id: u64) -> Result<bool, StoreError> {
         // INVARIANT A: backing held for the whole write.
@@ -529,9 +429,9 @@ impl VisaRepo {
             let ttl = remaining_secs(entry.deadline);
             let mut new_states = entry.node_states.clone();
             for ns in new_states.values_mut() {
-                ns.state = NodeVisaState::PendingRevoke; // revoke_vinst left as-is
+                ns.state = NodeVisaState::PendingRevoke;
             }
-            let record = build_record(&entry.visa, &entry.metadata, &new_states)?;
+            let record = build_record(&entry.visa, &entry.metadata, &new_states, entry.commit)?;
             (serde_json::to_string(&record)?, ttl, new_states)
         };
         // Redis first.
@@ -545,6 +445,58 @@ impl VisaRepo {
             entry.node_states = new_states;
         }
         Ok(true)
+    }
+
+    /// Mark a live visa `Committed`: its request's commit check passed. No-ops
+    /// (`Ok(false)`) when the visa is absent/expired.
+    pub async fn mark_visa_committed(&self, visa_id: u64) -> Result<bool, StoreError> {
+        // INVARIANT A: backing held for the whole write.
+        let _backing = self.inner.backing.lock().await;
+
+        let (json, ttl) = {
+            let store = self.inner.store.read().unwrap();
+            let Some(entry) = live_entry(&store, visa_id) else {
+                return Ok(false);
+            };
+            let record = build_record(
+                &entry.visa,
+                &entry.metadata,
+                &entry.node_states,
+                CommitState::Committed,
+            )?;
+            (
+                serde_json::to_string(&record)?,
+                remaining_secs(entry.deadline),
+            )
+        };
+        // Redis first.
+        self.inner
+            .db
+            .set_ex(&visa_key_for_visa(visa_id), &json, ttl)
+            .await?;
+        // Memory second. A purge during the I/O gap means the visa expired;
+        // skipping the apply is correct.
+        if let Some(entry) = self.inner.store.write().unwrap().visas.get_mut(&visa_id) {
+            entry.commit = CommitState::Committed;
+        }
+        Ok(true)
+    }
+
+    /// Whether a live visa is still `Pending` its commit check ([CommitState]).
+    pub fn is_uncommitted(&self, visa_id: u64) -> bool {
+        let store = self.inner.store.read().unwrap();
+        live_entry(&store, visa_id).is_some_and(|e| e.commit == CommitState::Pending)
+    }
+
+    /// The IDs of every live visa still `Pending` its commit check ([CommitState]).
+    pub fn list_uncommitted_visa_ids(&self) -> Vec<u64> {
+        let store = self.inner.store.read().unwrap();
+        store
+            .visas
+            .iter()
+            .filter(|(_, e)| e.is_live() && e.commit == CommitState::Pending)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Compare-and-swap one node's state: apply `new` only if the node is
@@ -577,7 +529,7 @@ impl VisaRepo {
             let ttl = remaining_secs(entry.deadline);
             let mut new_states = entry.node_states.clone();
             new_states.get_mut(&node_addr).unwrap().state = new;
-            let record = build_record(&entry.visa, &entry.metadata, &new_states)?;
+            let record = build_record(&entry.visa, &entry.metadata, &new_states, entry.commit)?;
             (serde_json::to_string(&record)?, ttl, new_states)
         };
         // Redis first.
@@ -623,7 +575,7 @@ impl VisaRepo {
             let ttl = remaining_secs(entry.deadline);
             let mut new_states = entry.node_states.clone();
             new_states.remove(&node_addr);
-            let record = build_record(&entry.visa, &entry.metadata, &new_states)?;
+            let record = build_record(&entry.visa, &entry.metadata, &new_states, entry.commit)?;
             (serde_json::to_string(&record)?, ttl, new_states)
         };
         // Redis first.
@@ -640,6 +592,20 @@ impl VisaRepo {
         unindex_node(&mut store, &node_addr, visa_id);
         debug!(target: DB, "removed pending-revoke node={node_addr} from visa={visa_id}");
         Ok(true)
+    }
+
+    /// Whether a visa can still be handed out: it is live and no node holds it as
+    /// `PendingRevoke`. A revocation (by policy, departure or a link going down) marks
+    /// its nodes `PendingRevoke`, and an acknowledged one removes them, so a revoked
+    /// visa never reads as issuable again.
+    pub fn is_issuable(&self, visa_id: u64) -> bool {
+        let store = self.inner.store.read().unwrap();
+        live_entry(&store, visa_id).is_some_and(|e| {
+            !e.node_states.is_empty()
+                && e.node_states
+                    .values()
+                    .all(|ns| ns.state != NodeVisaState::PendingRevoke)
+        })
     }
 
     /// Whether a given live visa still references any node.
@@ -865,19 +831,14 @@ fn decode_record(raw: &str) -> Result<VisaEntry, StoreError> {
     for (zaddr_str, sns) in record.node_states {
         let addr = IpAddr::try_from(ZAddr::new_from_encoded(&zaddr_str))
             .map_err(|e| StoreError::InvalidData(format!("bad zaddr {zaddr_str}: {e}")))?;
-        node_states.insert(
-            addr,
-            NodeState {
-                state: sns.state,
-                revoke_vinst: sns.revoke_vinst,
-            },
-        );
+        node_states.insert(addr, NodeState { state: sns.state });
     }
     Ok(VisaEntry {
         visa,
         metadata: record.metadata,
         deadline,
         node_states,
+        commit: record.commit,
     })
 }
 
@@ -886,6 +847,7 @@ fn build_record(
     visa: &Visa,
     metadata: &VisaMetadata,
     node_states: &HashMap<IpAddr, NodeState>,
+    commit: CommitState,
 ) -> Result<VisaRecord, StoreError> {
     let blob = BASE64.encode(visa_to_capnp_bytes(visa)?);
     let stored: HashMap<String, StoredNodeState> = node_states
@@ -896,7 +858,6 @@ fn build_record(
                 StoredNodeState {
                     state: ns.state,
                     utime: gen_timestamp(),
-                    revoke_vinst: ns.revoke_vinst,
                 },
             )
         })
@@ -905,6 +866,7 @@ fn build_record(
         blob,
         metadata: metadata.clone(),
         node_states: stored,
+        commit,
     })
 }
 
@@ -1056,7 +1018,6 @@ mod test {
                 .get(&ZAddr::from(addr).to_string())
                 .expect("node missing from persisted record");
             assert_eq!(sns.state, ns.state);
-            assert_eq!(sns.revoke_vinst, ns.revoke_vinst);
         }
         assert_eq!(
             record.metadata.requesting_node,
@@ -1073,9 +1034,14 @@ mod test {
         let node_addr: IpAddr = "fd5a:5052::1".parse().unwrap();
         let visa = make_visa(42, Duration::from_secs(60));
 
-        repo.store_visa(&visa, md(node_addr), NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            md(node_addr),
+            NodeVisaState::PendingInstall,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         // The single record persists the requesting node's state.
         let record = read_record(&db, 42).await;
@@ -1122,9 +1088,14 @@ mod test {
         let node_addr: IpAddr = "fd5a:5052::3".parse().unwrap();
         let visa = make_visa(7, Duration::from_secs(60));
 
-        repo.store_visa(&visa, md(node_addr), NodeVisaState::Installed)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            md(node_addr),
+            NodeVisaState::Installed,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         repo.clear_node_state(&node_addr).await.unwrap();
 
@@ -1154,9 +1125,14 @@ mod test {
         // One node referenced by two visas.
         for id in [70u64, 71] {
             let visa = make_visa(id, Duration::from_secs(60));
-            repo.store_visa(&visa, md(node_addr), NodeVisaState::Installed)
-                .await
-                .unwrap();
+            repo.store_visa(
+                &visa,
+                md(node_addr),
+                NodeVisaState::Installed,
+                CommitState::Committed,
+            )
+            .await
+            .unwrap();
         }
 
         // The clear's pipeline fails atomically.
@@ -1194,7 +1170,12 @@ mod test {
         visa.expires = SystemTime::now() - Duration::from_secs(1);
 
         let _res = repo
-            .store_visa(&visa, md(node_addr), NodeVisaState::PendingInstall)
+            .store_visa(
+                &visa,
+                md(node_addr),
+                NodeVisaState::PendingInstall,
+                CommitState::Committed,
+            )
             .await
             .unwrap();
 
@@ -1211,9 +1192,14 @@ mod test {
 
         for id in [1u64, 5, 42] {
             let visa = make_visa(id, Duration::from_secs(60));
-            repo.store_visa(&visa, md(node_addr), NodeVisaState::PendingInstall)
-                .await
-                .unwrap();
+            repo.store_visa(
+                &visa,
+                md(node_addr),
+                NodeVisaState::PendingInstall,
+                CommitState::Committed,
+            )
+            .await
+            .unwrap();
         }
 
         let mut ids = repo.list_visa_ids().unwrap();
@@ -1228,9 +1214,14 @@ mod test {
         let node_addr: IpAddr = "fd5a:5052::8".parse().unwrap();
         let visa = make_visa(77, Duration::from_secs(60));
 
-        repo.store_visa(&visa, md(node_addr), NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            md(node_addr),
+            NodeVisaState::PendingInstall,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         let loaded = repo.get_visa_by_id(77).unwrap();
         assert_eq!(loaded.issuer_id, 77);
@@ -1259,9 +1250,14 @@ mod test {
         let node_addr: IpAddr = "fd5a:5052::9".parse().unwrap();
         let visa = make_visa(88, Duration::from_secs(60));
 
-        repo.store_visa(&visa, md(node_addr), NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            md(node_addr),
+            NodeVisaState::PendingInstall,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         let metadata = repo.get_visa_metadata_by_id(88).unwrap();
         assert_eq!(metadata.requesting_node, node_addr);
@@ -1285,7 +1281,6 @@ mod test {
             ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             policy_version: 42,
             created_vinst: 7,
-            checked_vinst: 9,
             zpl: "permit src any dst any".to_string(),
             signal_msgs: vec!["sig-a".to_string(), "sig-b".to_string()],
             direction: Direction::Reverse,
@@ -1303,7 +1298,6 @@ mod test {
         assert_eq!(decoded.signal_msgs, original.signal_msgs);
         assert_eq!(decoded.direction, original.direction);
         assert_eq!(decoded.created_vinst, original.created_vinst);
-        assert_eq!(decoded.checked_vinst, original.checked_vinst);
     }
 
     /// signal_msgs is preserved when non-empty across a serialize round-trip.
@@ -1316,7 +1310,6 @@ mod test {
             ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_001),
             policy_version: 1,
             created_vinst: 0,
-            checked_vinst: 0,
             zpl: String::new(),
             signal_msgs: signals.clone(),
             direction: Direction::Forward,
@@ -1338,7 +1331,6 @@ mod test {
                 ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_002),
                 policy_version: 0,
                 created_vinst: 0,
-                checked_vinst: 0,
                 zpl: String::new(),
                 signal_msgs: Vec::new(),
                 direction,
@@ -1371,9 +1363,14 @@ mod test {
             Some(vec![requesting, node_b, node_c]),
             &make_pdesc(),
         );
-        repo.store_visa(&visa, metadata, NodeVisaState::Installed)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            metadata,
+            NodeVisaState::Installed,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         let record = read_record(&db, 100).await;
         assert_eq!(
@@ -1415,9 +1412,14 @@ mod test {
             Some(vec![requesting, other]),
             &make_pdesc(),
         );
-        repo.store_visa(&visa, metadata, NodeVisaState::Installed)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            metadata,
+            NodeVisaState::Installed,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         let record = read_record(&db, 101).await;
         assert_eq!(
@@ -1456,9 +1458,14 @@ mod test {
             Some(vec![requesting, path_node]),
             &make_pdesc(),
         );
-        repo.store_visa(&visa, metadata, NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            metadata,
+            NodeVisaState::PendingInstall,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         let ids = repo
             .get_visa_ids_for_node_by_state(&path_node, NodeVisaState::PendingInstall)
@@ -1481,9 +1488,14 @@ mod test {
         let unrelated: IpAddr = "fd5a:5052::61".parse().unwrap();
         let visa = make_visa(103, Duration::from_secs(60));
 
-        repo.store_visa(&visa, md(requesting), NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            md(requesting),
+            NodeVisaState::PendingInstall,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         let record = read_record(&db, 103).await;
         assert!(
@@ -1505,13 +1517,23 @@ mod test {
         let node_addr: IpAddr = "fd5a:5052::20".parse().unwrap();
 
         let visa_a = make_visa(10, Duration::from_secs(60));
-        repo.store_visa(&visa_a, md(node_addr), NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa_a,
+            md(node_addr),
+            NodeVisaState::PendingInstall,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
         let visa_b = make_visa(11, Duration::from_secs(60));
-        repo.store_visa(&visa_b, md(node_addr), NodeVisaState::Installed)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa_b,
+            md(node_addr),
+            NodeVisaState::Installed,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         let pending_ids = repo
             .get_visa_ids_for_node_by_state(&node_addr, NodeVisaState::PendingInstall)
@@ -1551,7 +1573,12 @@ mod test {
             &make_pdesc(),
         );
         repo1
-            .store_visa(&visa, metadata, NodeVisaState::Installed)
+            .store_visa(
+                &visa,
+                metadata,
+                NodeVisaState::Installed,
+                CommitState::Committed,
+            )
             .await
             .unwrap();
 
@@ -1596,10 +1623,9 @@ mod test {
             node,
             NodeState {
                 state: NodeVisaState::Installed,
-                revoke_vinst: None,
             },
         )]);
-        let record = build_record(&visa, &md(node), &node_states).unwrap();
+        let record = build_record(&visa, &md(node), &node_states, CommitState::Committed).unwrap();
         db.set_ex("visa:901", &serde_json::to_string(&record).unwrap(), 100)
             .await
             .unwrap();
@@ -1622,9 +1648,14 @@ mod test {
         let node: IpAddr = "fd5a:5052::90".parse().unwrap();
         let visa = make_visa(300, Duration::from_secs(60));
 
-        repo.store_visa(&visa, md(node), NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            md(node),
+            NodeVisaState::PendingInstall,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
         assert_memory_matches_redis(&repo, &db, 300).await;
 
         assert!(
@@ -1650,7 +1681,12 @@ mod test {
 
         db.set_set_ex_fault(FaultMode::Reject);
         let err = repo
-            .store_visa(&visa, md(node), NodeVisaState::PendingInstall)
+            .store_visa(
+                &visa,
+                md(node),
+                NodeVisaState::PendingInstall,
+                CommitState::Committed,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Redis(_)));
@@ -1670,7 +1706,12 @@ mod test {
 
         db.set_set_ex_fault(FaultMode::ApplyThenError);
         let err = repo
-            .store_visa(&visa, md(node), NodeVisaState::PendingInstall)
+            .store_visa(
+                &visa,
+                md(node),
+                NodeVisaState::PendingInstall,
+                CommitState::Committed,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Redis(_)));
@@ -1690,9 +1731,14 @@ mod test {
 
         db.set_set_ex_fault(FaultMode::ApplyThenError);
         db.set_del_fault(FaultMode::Reject);
-        repo.store_visa(&visa, md(node), NodeVisaState::PendingInstall)
-            .await
-            .unwrap_err();
+        repo.store_visa(
+            &visa,
+            md(node),
+            NodeVisaState::PendingInstall,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap_err();
 
         assert!(db.exists("visa:402").await.unwrap());
         assert!(repo.inner.store.read().unwrap().visas.is_empty());
@@ -1712,9 +1758,14 @@ mod test {
         let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
         let node: IpAddr = "fd5a:5052::94".parse().unwrap();
         let visa = make_visa(403, Duration::from_secs(60));
-        repo.store_visa(&visa, md(node), NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            md(node),
+            NodeVisaState::PendingInstall,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         db.set_set_ex_fault(FaultMode::ApplyThenError);
         repo.transition_node_visa_state(
@@ -1774,9 +1825,14 @@ mod test {
         let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
         let node: IpAddr = "fd5a:5052::95".parse().unwrap();
         let visa = make_visa(404, Duration::from_secs(60));
-        repo.store_visa(&visa, md(node), NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            md(node),
+            NodeVisaState::PendingInstall,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         db.set_del_fault(FaultMode::ApplyThenError);
         repo.remove_visa(404).await.unwrap_err();
@@ -1821,9 +1877,14 @@ mod test {
             Some(vec![req, node_b, node_c]),
             &make_pdesc(),
         );
-        repo.store_visa(&visa, metadata, NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            metadata,
+            NodeVisaState::PendingInstall,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         {
             let store = repo.inner.store.read().unwrap();
@@ -1856,9 +1917,14 @@ mod test {
         let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
         let node: IpAddr = "fd5a:5052::b0".parse().unwrap();
         let visa = make_visa(600, Duration::from_secs(5));
-        repo.store_visa(&visa, md(node), NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            md(node),
+            NodeVisaState::PendingInstall,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         tokio::time::advance(Duration::from_secs(6)).await;
 
@@ -1898,86 +1964,14 @@ mod test {
             &make_pdesc(),
         );
         let visa = make_visa(id, Duration::from_secs(60));
-        repo.store_visa(&visa, metadata, NodeVisaState::Installed)
-            .await
-            .unwrap();
-    }
-
-    /// An allow verdict cancels a queued revoke on every holder node
-    /// (`PendingRevoke -> PendingInstall`, stamp cleared) and bumps checked_vinst.
-    #[tokio::test]
-    async fn test_record_allow_cancels_queued_revokes() {
-        let db = Arc::new(FakeDb::new());
-        let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
-        let req: IpAddr = "fd5a:5052::c0".parse().unwrap();
-        let b: IpAddr = "fd5a:5052::c1".parse().unwrap();
-        let c: IpAddr = "fd5a:5052::c2".parse().unwrap();
-        store_three_node(&repo, 700, req, b, c, 5).await;
-
-        // Deny at 6 marks all nodes PendingRevoke (stamp 6).
-        assert!(repo.record_deny_verdict(700, 6).await.unwrap());
-        // Allow at 7 cancels them (6 < 7) and bumps checked_vinst.
-        assert!(repo.record_allow_verdict(700, 7).await.unwrap());
-
-        let store = repo.inner.store.read().unwrap();
-        let e = store.visas.get(&700).unwrap();
-        for n in [req, b, c] {
-            let ns = e.node_states.get(&n).unwrap();
-            assert_eq!(ns.state, NodeVisaState::PendingInstall);
-            assert_eq!(ns.revoke_vinst, None);
-        }
-        assert_eq!(e.metadata.checked_vinst, 7);
-    }
-
-    /// Stale verdicts no-op at the store boundary: checked_vinst is never lowered,
-    /// a stale revoke is not stamped, and a stale allow cannot cancel a newer revoke.
-    #[tokio::test]
-    async fn test_verdict_stale_guards() {
-        let db = Arc::new(FakeDb::new());
-        let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
-        let node: IpAddr = "fd5a:5052::d0".parse().unwrap();
-        let metadata = VisaMetadata::new(
-            node,
-            0,
-            5,
-            String::new(),
-            Direction::Forward,
-            None,
-            &make_pdesc(),
-        );
-        let visa = make_visa(710, Duration::from_secs(60));
-        repo.store_visa(&visa, metadata, NodeVisaState::Installed)
-            .await
-            .unwrap();
-
-        // Allow at 6 bumps checked to 6.
-        assert!(repo.record_allow_verdict(710, 6).await.unwrap());
-        // Not-newer allow (6) and stale deny (5) both no-op.
-        assert!(!repo.record_allow_verdict(710, 6).await.unwrap());
-        assert!(!repo.record_deny_verdict(710, 5).await.unwrap());
-        {
-            let store = repo.inner.store.read().unwrap();
-            let e = store.visas.get(&710).unwrap();
-            assert_eq!(e.metadata.checked_vinst, 6);
-            assert_eq!(
-                e.node_states.get(&node).unwrap().state,
-                NodeVisaState::Installed
-            );
-        }
-
-        // Deny at 7 stamps PendingRevoke; a stale allow (6) does not cancel it.
-        assert!(repo.record_deny_verdict(710, 7).await.unwrap());
-        assert!(!repo.record_allow_verdict(710, 6).await.unwrap());
-        let store = repo.inner.store.read().unwrap();
-        let ns = store
-            .visas
-            .get(&710)
-            .unwrap()
-            .node_states
-            .get(&node)
-            .unwrap();
-        assert_eq!(ns.state, NodeVisaState::PendingRevoke);
-        assert_eq!(ns.revoke_vinst, Some(7));
+        repo.store_visa(
+            &visa,
+            metadata,
+            NodeVisaState::Installed,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
     }
 
     /// CAS transition applies only when the current state matches `expected`;
@@ -1988,9 +1982,14 @@ mod test {
         let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
         let node: IpAddr = "fd5a:5052::e0".parse().unwrap();
         let visa = make_visa(720, Duration::from_secs(60));
-        repo.store_visa(&visa, md(node), NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            md(node),
+            NodeVisaState::PendingInstall,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         // CAS PendingInstall -> Installed succeeds, then a repeat misses.
         assert!(
@@ -2019,7 +2018,7 @@ mod test {
         assert!(!repo.remove_node_if_pending_revoke(node, 720).await.unwrap());
 
         // Deny → PendingRevoke, then teardown fires and clears the ref + index.
-        assert!(repo.record_deny_verdict(720, 1).await.unwrap());
+        assert!(repo.mark_visa_revoked(720).await.unwrap());
         assert!(repo.remove_node_if_pending_revoke(node, 720).await.unwrap());
         assert!(!repo.visa_has_node_refs(720).await);
         let store = repo.inner.store.read().unwrap();
@@ -2034,9 +2033,14 @@ mod test {
         let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
         let node: IpAddr = "fd5a:5052::f0".parse().unwrap();
         let visa = make_visa(730, Duration::from_secs(5));
-        repo.store_visa(&visa, md(node), NodeVisaState::Installed)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            md(node),
+            NodeVisaState::Installed,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         tokio::time::advance(Duration::from_secs(6)).await;
 
@@ -2052,17 +2056,16 @@ mod test {
                 .await
                 .unwrap()
         );
-        assert!(!repo.record_allow_verdict(730, 99).await.unwrap());
-        assert!(!repo.record_deny_verdict(730, 99).await.unwrap());
+        assert!(!repo.mark_visa_revoked(730).await.unwrap());
         assert!(repo.list_visa_metadata().await.is_empty());
         // Still resident until purge.
         assert!(repo.inner.store.read().unwrap().visas.contains_key(&730));
     }
 
-    /// Verdict mutators write through (record matches memory) and a second repo
-    /// hydrated from the same DB reproduces states and revoke_vinst stamps.
+    /// A revoke writes through (record matches memory) and a second repo
+    /// hydrated from the same DB reproduces the states.
     #[tokio::test]
-    async fn test_verdict_write_through_and_hydration() {
+    async fn test_revoke_write_through_and_hydration() {
         let db = Arc::new(FakeDb::new());
         let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
         let req: IpAddr = "fd5a:5052::1a0".parse().unwrap();
@@ -2070,7 +2073,7 @@ mod test {
         let c: IpAddr = "fd5a:5052::1a2".parse().unwrap();
         store_three_node(&repo, 740, req, b, c, 0).await;
 
-        assert!(repo.record_deny_verdict(740, 3).await.unwrap());
+        assert!(repo.mark_visa_revoked(740).await.unwrap());
         assert_memory_matches_redis(&repo, &db, 740).await;
         assert!(repo.remove_node_if_pending_revoke(b, 740).await.unwrap());
         assert_memory_matches_redis(&repo, &db, 740).await;
@@ -2082,26 +2085,30 @@ mod test {
         for n in [req, c] {
             let ns = e.node_states.get(&n).unwrap();
             assert_eq!(ns.state, NodeVisaState::PendingRevoke);
-            assert_eq!(ns.revoke_vinst, Some(3));
         }
     }
 
-    /// Reject-mode fault on a verdict rewrite → error returned, memory unchanged.
+    /// Reject-mode fault on a revoke rewrite → error returned, memory unchanged.
     #[tokio::test]
-    async fn test_verdict_reject_fault_leaves_memory() {
+    async fn test_revoke_reject_fault_leaves_memory() {
         let db = Arc::new(FakeDb::new());
         let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
         let node: IpAddr = "fd5a:5052::1b0".parse().unwrap();
         let visa = make_visa(750, Duration::from_secs(60));
-        repo.store_visa(&visa, md(node), NodeVisaState::Installed)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            md(node),
+            NodeVisaState::Installed,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         db.set_set_ex_fault(FaultMode::Reject);
-        let err = repo.record_deny_verdict(750, 5).await.unwrap_err();
+        let err = repo.mark_visa_revoked(750).await.unwrap_err();
         assert!(matches!(err, StoreError::Redis(_)));
 
-        // Memory untouched: still Installed, checked_vinst still 0.
+        // Memory untouched: still Installed.
         db.set_set_ex_fault(FaultMode::None);
         let store = repo.inner.store.read().unwrap();
         let e = store.visas.get(&750).unwrap();
@@ -2109,7 +2116,6 @@ mod test {
             e.node_states.get(&node).unwrap().state,
             NodeVisaState::Installed
         );
-        assert_eq!(e.metadata.checked_vinst, 0);
     }
 
     /// Build metadata whose five-tuple uses the given src/dst endpoint strings.
@@ -2131,9 +2137,14 @@ mod test {
 
         for id in [200u64, 201] {
             let visa = make_visa(id, Duration::from_secs(60));
-            repo.store_visa(&visa, md(node), NodeVisaState::Installed)
-                .await
-                .unwrap();
+            repo.store_visa(
+                &visa,
+                md(node),
+                NodeVisaState::Installed,
+                CommitState::Committed,
+            )
+            .await
+            .unwrap();
         }
 
         for actor in [src, dst] {
@@ -2155,9 +2166,14 @@ mod test {
         let node: IpAddr = "fd5a:5052::101".parse().unwrap();
         let src: IpAddr = "fd5a:5052::10".parse().unwrap();
         let visa = make_visa(210, Duration::from_secs(60));
-        repo.store_visa(&visa, md(node), NodeVisaState::Installed)
-            .await
-            .unwrap();
+        repo.store_visa(
+            &visa,
+            md(node),
+            NodeVisaState::Installed,
+            CommitState::Committed,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(repo.get_visa_ids_for_actors(&[src]).unwrap(), vec![210]);
 
@@ -2179,6 +2195,7 @@ mod test {
             &visa,
             md_ft(node, "fd5a:5052::10", "fd5a:5052::10"),
             NodeVisaState::Installed,
+            CommitState::Committed,
         )
         .await
         .unwrap();
@@ -2190,8 +2207,7 @@ mod test {
         );
     }
 
-    /// `mark_visa_revoked` flips every node PendingRevoke (leaving revoke_vinst
-    /// untouched), keeps Redis and memory in agreement, and no-ops on a missing
+    /// `mark_visa_revoked` flips every node PendingRevoke, keeps Redis and memory in agreement, and no-ops on a missing
     /// id.
     #[tokio::test]
     async fn test_mark_visa_revoked_write_through() {
@@ -2209,10 +2225,7 @@ mod test {
             for n in [req, b, c] {
                 let ns = e.node_states.get(&n).unwrap();
                 assert_eq!(ns.state, NodeVisaState::PendingRevoke);
-                assert_eq!(ns.revoke_vinst, None); // no vinst stamp
             }
-            // checked_vinst untouched (not a policy event).
-            assert_eq!(e.metadata.checked_vinst, 5);
         }
         assert_memory_matches_redis(&repo, &db, 800).await;
 

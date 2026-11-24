@@ -1,5 +1,6 @@
 //! Construction of trusted-service implementations from policy declarations.
 
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -181,7 +182,9 @@ pub fn trusted_service_definitions(
 /// `Policy::lookup_identity_keys`); OIDC stores build their JWKS key source
 /// from the policy config, with `proxy_for(service_id)` supplying the
 /// CONNECT-proxy resolver each refresh consults (see
-/// `crate::oidc::ProxyResolver`).
+/// `crate::oidc::ProxyResolver`). `jwks_bind_addr` is the local address a
+/// proxied JWKS fetch binds to (`vs_addr` in production; see
+/// `KeySource::with_bind_addr`, zl-zipline#240).
 ///
 /// Returns the full `dyn` store list plus its typed OIDC subset (each OIDC
 /// store appears in both), so `TrustedServicesMgr` can serve
@@ -192,6 +195,7 @@ pub async fn build_services(
     ts_secrets_dir: &Path,
     lookup_identity_keys: &[&str],
     proxy_for: &(dyn Fn(&str) -> ProxyResolver + Sync),
+    jwks_bind_addr: Option<IpAddr>,
 ) -> Result<
     (
         Vec<Arc<dyn TrustedServiceInterface>>,
@@ -220,6 +224,8 @@ pub async fn build_services(
                             definition.id
                         ))
                     })?;
+                // Proxied fetches leave from the visa service's own address.
+                let keys = keys.with_bind_addr(jwks_bind_addr);
                 let store = Arc::new(OidcTrustedService::new(&definition.record, Arc::new(keys))?);
                 oidc_services.push(store.clone());
                 services.push(store);
@@ -283,6 +289,7 @@ mod tests {
             dir,
             &policy.lookup_identity_keys(),
             &|_id| static_proxy(None),
+            None,
         )
         .await
         .map(|(services, _oidc)| services)
@@ -342,6 +349,33 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// zl-zipline#240: the bind address handed to `build_services` reaches the
+    /// OIDC store's key source, so proxied JWKS fetches leave from `vs_addr`.
+    #[tokio::test]
+    async fn test_oidc_key_source_gets_jwks_bind_addr() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = policy_from_container(make_oidc_policy(
+            "google",
+            300,
+            &["sub -> user.oidc-subject"],
+            &["sub"],
+            make_test_oidc_config(),
+        ));
+        let vs_addr: IpAddr = "fd5a:5052::1".parse().unwrap();
+        let (_stores, oidc) = build_services(
+            &trusted_service_definitions(&policy).unwrap(),
+            dir.path(),
+            dir.path(),
+            &policy.lookup_identity_keys(),
+            &|_id| static_proxy(None),
+            Some(vs_addr),
+        )
+        .await
+        .unwrap();
+        assert_eq!(oidc.len(), 1);
+        assert_eq!(oidc[0].keys_arc().bind_addr(), Some(vs_addr));
     }
 
     /// An `api = "oidc"` declaration builds an OIDC trusted-service store (today the
@@ -525,6 +559,7 @@ mod attr_query_tests {
             dir.path(),
             &policy.lookup_identity_keys(),
             &|_id| static_proxy(None),
+            None,
         )
         .await
         .unwrap();
@@ -597,6 +632,7 @@ mod attr_query_tests {
             dir.path(),
             &policy.lookup_identity_keys(),
             &|_id| static_proxy(None),
+            None,
         )
         .await
         .unwrap();
@@ -625,6 +661,7 @@ mod attr_query_tests {
             dir.path(),
             &policy.lookup_identity_keys(),
             &|_id| static_proxy(None),
+            None,
         )
         .await;
         let err = match result {
@@ -668,6 +705,7 @@ mod attr_query_tests {
             dir.path(),
             &policy.lookup_identity_keys(),
             &|_id| static_proxy(None),
+            None,
         )
         .await
         .unwrap();

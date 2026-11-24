@@ -384,8 +384,9 @@ impl EvalContext {
         // true for `is_node()`. If there is no node flag then `is_node()` must return false.
         //
         // Any services offered by the actor must be allowed by policy.
-        // The policy may have more services for the actor, but that must be picked up
-        // by doing a re-auth. Identity keys are in the same bucket: a policy update does
+        // The policy may have more services for the actor. For a node the visa
+        // service's policy pass recalculates its services before calling this
+        // (zl-zipline#273); otherwise they are picked up on re-auth. Identity keys are in the same bucket: a policy update does
         // not retroactively re-key a connected actor; new identity attributes are picked
         // up on re-auth via approve_connection.
 
@@ -415,8 +416,8 @@ impl EvalContext {
         }
 
         // Every service offered by the actor must be allowed by policy. Policy
-        // may allow more services than the actor offers; those are picked up on
-        // re-auth, not here.
+        // may allow more services than the actor offers; those are picked up by
+        // the visa service's policy pass (for a node) or on re-auth, not here.
         if !connected_actor
             .services_iter()
             .all(|s| services.contains(s))

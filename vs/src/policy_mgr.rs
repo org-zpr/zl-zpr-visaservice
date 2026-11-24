@@ -49,10 +49,11 @@ pub trait DnsResolver: Send + Sync {
 pub const DEFAULT_POLICY_ID: u64 = 0;
 
 /// A peer link resolved from policy topology: the link id paired with the peer's
-/// DNS-resolved substrate address. This is all the policy manager computes; the
-/// wire-level vsapi `Link` struct is built from it only when a topology message
-/// is actually sent (see `vss_worker::vss_do_set_topology`).
-pub type ResolvedPeer = (String, SocketAddr);
+/// DNS-resolved substrate address, or `None` when policy declares no address for the
+/// peer (it reports its own when it connects, zl-zipline#225). This is all the policy
+/// manager computes; the wire-level vsapi `Link` struct is built from it only when a
+/// topology message is actually sent (see `vss_worker::proposed_links`).
+pub type ResolvedPeer = (String, Option<SocketAddr>);
 
 /// Combined policy, source container, and resolved topology — swapped atomically
 /// as a unit so the three can never drift apart.
@@ -159,6 +160,37 @@ pub struct PolicyMgr {
     repo: db::PolicyRepo,
     /// Serializes concurrent policy updates; reads remain lock-free via ArcSwap.
     update_lock: tokio::sync::Mutex<()>,
+    /// The node commit lock (zl-zipline#232, #63 review): every writer of a
+    /// node's own actor -- `reauthorize` of its own actor, the node
+    /// `authenticate` persist, `open`, the login-nonce mint, a node's
+    /// attribute-refresh write and a disconnect's actor removal -- holds it
+    /// from the read its write is based on through the write, and calls
+    /// `connection_control::recheck_before_commit` just before committing.
+    /// Policy publication takes it too, so an install is serialized with that
+    /// recheck and write: it lands either before the recheck (which then sees
+    /// the new generation) or after the write (which the install's own
+    /// reconciliation then sees). The cost is that an install waits behind an
+    /// in-flight login or logout, including its attribute fetch
+    /// (org-zpr/zl-zipline#247).
+    ///
+    /// **Lock order (with #224's topology operation lock, [crate::topology_mgr::TopoOps]):**
+    /// `update_lock` -> topology lock -> `node_commit_lock`. A path that holds
+    /// the topology guard may take this lock (policy publication, the node
+    /// `authenticate` persist, `open`, a disconnect's actor removal, a node's
+    /// refresh commit); a path that holds this lock must never wait for the
+    /// topology guard -- so `reauthorize`, which holds it across its attribute
+    /// fetch, releases it before any disconnect -- otherwise each could wait for
+    /// the other forever.
+    /// ponytail: one global lock; per-address locks if node commits become
+    /// frequent (today: Zode logins/logouts, node authentications, refreshes).
+    pub(crate) node_commit_lock: tokio::sync::Mutex<()>,
+    /// The topology operation lock ([crate::topology_mgr::TopoOps]), bound once the
+    /// Assembly exists. An install commits under it, so the current policy cannot
+    /// change while a topology operation that read it is still running.
+    topology_lock: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>>,
+    /// The revocation ledger ([crate::revocation]), bound once the Assembly exists. An
+    /// install records a policy obligation before it commits (zl-zipline#289).
+    revocations: std::sync::OnceLock<Arc<crate::revocation::RevocationLedger>>,
     resolver: PolicyResolver,
     ts_mgr: Arc<TrustedServicesMgr>,
     /// Directory holding the `<service-id>.json` files for `api=file` trusted services.
@@ -170,6 +202,10 @@ pub struct PolicyMgr {
     /// refresh re-resolves the actor currently providing the policy-named
     /// `jwks_proxy_service` (zipline#19).
     actor_repo: Arc<db::ActorRepo>,
+    /// The visa service's own ZPR address (`vs_addr`). Proxied JWKS fetches
+    /// bind to it, because the CONNECT proxy is an actor on the ZPRnet and a
+    /// relay Zode's TUN also carries the relay's address (zl-zipline#240).
+    vs_addr: IpAddr,
     /// Period between JWKS refreshes for OIDC stores; `None` disables the
     /// periodic refresher (config `oidc_refresh_seconds` of 0 or unset).
     oidc_refresh: Option<Duration>,
@@ -241,10 +277,18 @@ impl PolicySnapshot {
     /// names a file or attribute-service store, which no OIDC declaration matches, so no user
     /// blob is demanded — or accepted — for it.
     pub fn declares_oidc_service(&self, id: &str) -> bool {
+        self.oidc_service_by_id(id).is_some()
+    }
+
+    /// The OIDC trusted service with id `id` in this snapshot, if its policy
+    /// declares one. A node's logout (zl-zipline#232) uses it to forget the
+    /// session anchors the dropped `user.zpr.authority` named.
+    pub fn oidc_service_by_id(&self, id: &str) -> Option<Arc<OidcTrustedService>> {
         self.0
             .oidc_services
             .iter()
-            .any(|service| service.id() == id)
+            .find(|service| service.id() == id)
+            .cloned()
     }
 
     /// Build a snapshot directly from a policy and its stores, for unit tests
@@ -329,6 +373,7 @@ impl PolicyMgr {
         ts_secrets_dir: PathBuf,
         actor_repo: Arc<db::ActorRepo>,
         oidc_refresh: Option<Duration>,
+        vs_addr: IpAddr,
     ) -> Result<Self, ServiceError> {
         debug!(target: MAIN, "initializing policy manager");
 
@@ -364,6 +409,7 @@ impl PolicyMgr {
             &file_ts_dir,
             &ts_secrets_dir,
             &actor_repo,
+            vs_addr,
             None,
         )
         .await?;
@@ -380,6 +426,7 @@ impl PolicyMgr {
             ts_secrets_dir,
             actor_repo,
             oidc_refresh,
+            vs_addr,
         ))
     }
 
@@ -399,6 +446,7 @@ impl PolicyMgr {
         ts_secrets_dir: PathBuf,
         actor_repo: Arc<db::ActorRepo>,
         oidc_refresh: Option<Duration>,
+        vs_addr: IpAddr,
     ) -> Result<Self, ServiceError> {
         debug!(target: MAIN, "initializing policy manager from state");
         let mut loaded = repo
@@ -421,6 +469,7 @@ impl PolicyMgr {
             &file_ts_dir,
             &ts_secrets_dir,
             &actor_repo,
+            vs_addr,
             None,
         )
         .await?;
@@ -436,6 +485,7 @@ impl PolicyMgr {
             ts_secrets_dir,
             actor_repo,
             oidc_refresh,
+            vs_addr,
         ))
     }
 
@@ -473,6 +523,7 @@ impl PolicyMgr {
         file_ts_dir: &Path,
         ts_secrets_dir: &Path,
         actor_repo: &Arc<db::ActorRepo>,
+        vs_addr: IpAddr,
         previous: Option<&PolicyState>,
     ) -> Result<CandidateState, ServiceError> {
         let policy = loaded.policy();
@@ -548,6 +599,7 @@ impl PolicyMgr {
                                 definition.jwks_proxy_port(),
                             )
                         },
+                        Some(vs_addr),
                     )
                     .await?;
                     // Refresher spawning is deferred to commit: a definition
@@ -588,6 +640,7 @@ impl PolicyMgr {
         ts_secrets_dir: PathBuf,
         actor_repo: Arc<db::ActorRepo>,
         oidc_refresh: Option<Duration>,
+        vs_addr: IpAddr,
     ) -> Self {
         ts_mgr
             .update_services_with_oidc(state.trusted_services.clone(), state.oidc_services.clone());
@@ -595,11 +648,15 @@ impl PolicyMgr {
             state: ArcSwap::from_pointee(state),
             repo,
             update_lock: tokio::sync::Mutex::new(()),
+            node_commit_lock: tokio::sync::Mutex::new(()),
+            topology_lock: std::sync::OnceLock::new(),
+            revocations: std::sync::OnceLock::new(),
             resolver,
             ts_mgr,
             file_ts_dir,
             ts_secrets_dir,
             actor_repo,
+            vs_addr,
             oidc_refresh,
         }
     }
@@ -633,7 +690,53 @@ impl PolicyMgr {
         // Assign the new vinst while the policy Arc is still uniquely held.
         let vinst = self.state.load().policy.vinst() + 1;
         loaded.set_vinst(vinst);
+        self.commit_policy(&loaded, true).await?;
+        Ok(vinst)
+    }
 
+    /// Bring the published policy up to the stored one, for the reconciler's policy
+    /// step (zl-zipline#290). A policy install's write can land in the store and
+    /// still fail to return (a lost reply, a cancelled admin request), so the
+    /// install never publishes it; its obligation, recorded before the write, names
+    /// its vinst. While the published vinst is below `target`, the highest vinst a
+    /// pending policy obligation names, this re-reads the store under `update_lock`:
+    /// - a stored vinst above the published one is a write that landed unpublished:
+    ///   it is published here, exactly as the install would have;
+    /// - otherwise the writes never landed, and nothing is done: the caller drops
+    ///   the obligations whose vinst is still above the published one.
+    ///
+    /// An error (the store cannot be read, the stored policy cannot be built) leaves
+    /// the published policy as it was; the caller keeps the obligations pending.
+    pub async fn catch_up_with_store(&self, target: u64) -> Result<(), ServiceError> {
+        let _guard = self.update_lock.lock().await;
+        let published = self.state.load().policy.vinst();
+        if published >= target {
+            return Ok(());
+        }
+        let stored = self.repo.get_current_identifier().await?;
+        let Some(stored) = stored.filter(|s| s.vinst > published) else {
+            info!(target: MAIN, "policy vinst={target} was never stored; published vinst={published} stays");
+            return Ok(());
+        };
+        warn!(target: MAIN, "policy vinst={} was stored but not published (published vinst={published}); publishing it", stored.vinst);
+        let mut loaded = self
+            .repo
+            .get_current_loaded_policy(&config::POLICY_MIN_VERSION)
+            .await?;
+        loaded.set_vinst(stored.vinst);
+        self.commit_policy(&loaded, false).await
+    }
+
+    /// Build `loaded`'s state and publish it: the tail an install and a catch-up
+    /// ([Self::catch_up_with_store]) share. The caller holds `update_lock` and has
+    /// set `loaded`'s vinst. An install (`install`) also records the policy
+    /// obligation and writes the policy to the store before it publishes; a
+    /// catch-up publishes what the store already holds.
+    async fn commit_policy(
+        &self,
+        loaded: &LoadedPolicy,
+        install: bool,
+    ) -> Result<(), ServiceError> {
         // Resolve topology before swapping in the new state so a failed update leaves
         // the current policy, container, and topology untouched. The new policy,
         // container, and links swap in together as one PolicyState. The live state is
@@ -646,17 +749,54 @@ impl PolicyMgr {
         let previous = self.state.load_full();
         let candidate = Self::build_state(
             &self.resolver,
-            &loaded,
+            loaded,
             &self.file_ts_dir,
             &self.ts_secrets_dir,
             &self.actor_repo,
+            self.vs_addr,
             Some(&previous),
         )
         .await?;
-        self.repo.set_current_policy(&loaded, false).await?;
 
+        // Commit under the topology operation lock (taken after the network-bound
+        // build above, and only around local writes): a topology operation reads the
+        // policy under that lock and relies on it staying current until it is done.
+        // Lock order: update_lock, then the topology lock; topology operations never
+        // take update_lock.
+        let _topology = match self.topology_lock.get() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        // Commit under the node commit lock too: an install never lands between a
+        // node commit's recheck and its write (#63 review, zl-zipline#247). Lock
+        // order: update_lock -> topology lock -> node_commit_lock (see the
+        // `node_commit_lock` field) -> the revocation guard.
+        let _commit = self.node_commit_lock.lock().await;
+
+        // The new policy can make live visas unacceptable: an install records the
+        // policy obligation, naming its vinst, durably before anything is written,
+        // and holds its guard until the policy is published, so the reconciler's
+        // pass for it reads the new policy (zl-zipline#289). A failed record fails
+        // the install (fail closed). The write can land and still return an error;
+        // the reconciler then publishes the stored policy before its policy step
+        // ([Self::catch_up_with_store], zl-zipline#290). The caller kicks the
+        // reconciler once this returns, whatever the outcome.
+        let _obligation = if install {
+            let guard = match self.revocations.get() {
+                Some(ledger) => Some(
+                    ledger
+                        .begin(crate::db::Obligation::policy(loaded.policy().vinst()))
+                        .await?,
+                ),
+                None => None,
+            };
+            self.repo.set_current_policy(loaded, false).await?;
+            guard
+        } else {
+            None
+        };
         self.publish(candidate.commit(Some(&previous), self.oidc_refresh));
-        Ok(vinst)
+        Ok(())
     }
 
     /// A consistent snapshot of policy, container, and resolved links taken in
@@ -670,6 +810,47 @@ impl PolicyMgr {
     /// hold across awaits.
     pub fn get_current_snapshot(&self) -> PolicySnapshot {
         PolicySnapshot(self.state.load_full())
+    }
+
+    /// A copy of the current snapshot with one more trusted service appended,
+    /// installed as current -- same policy, generation and OIDC stores.
+    /// Test-only: lets a test hook into enrichment on a live path.
+    #[cfg(test)]
+    pub(crate) fn add_trusted_service_for_tests(&self, svc: Arc<dyn TrustedServiceInterface>) {
+        let cur = self.state.load_full();
+        let mut trusted_services = cur.trusted_services.clone();
+        trusted_services.push(svc);
+        self.state.store(Arc::new(PolicyState {
+            policy: cur.policy.clone(),
+            container: cur.container.clone(),
+            resolved_peers_by_node: cur.resolved_peers_by_node.clone(),
+            trusted_services,
+            oidc_services: cur.oidc_services.clone(),
+            ts_definitions: cur.ts_definitions.clone(),
+            oidc_refreshers: std::sync::Mutex::new(HashMap::new()),
+        }));
+    }
+
+    /// Make `snapshot` the current one, bypassing a policy install. Test-only:
+    /// lets a test run a live path against a snapshot with chosen trusted
+    /// services (e.g. one that fails).
+    #[cfg(test)]
+    pub(crate) fn set_current_snapshot_for_tests(&self, snapshot: &PolicySnapshot) {
+        self.state.store(snapshot.0.clone());
+    }
+
+    /// Bind the topology operation lock ([crate::topology_mgr::TopologyMgr::ops_lock]);
+    /// from then on every install commits under it. Called once, when the Assembly is
+    /// built; a second call is ignored.
+    pub fn bind_topology_lock(&self, lock: Arc<tokio::sync::Mutex<()>>) {
+        let _ = self.topology_lock.set(lock);
+    }
+
+    /// Bind the revocation ledger ([crate::revocation::RevocationLedger]); from then on
+    /// every install records a policy obligation before it commits. Called once, when
+    /// the Assembly is built; a second call is ignored.
+    pub fn bind_revocations(&self, ledger: Arc<crate::revocation::RevocationLedger>) {
+        let _ = self.revocations.set(ledger);
     }
 
     /// Callers should drop the policy as quickly as possible to avoid missing a policy update.
@@ -728,20 +909,21 @@ impl PolicyResolver {
     /// DNS lookup, pairing each peer's link id with its concrete socket address.
     /// Returns an error if any peer's address fails to resolve. Building the wire-level
     /// vsapi `Link` struct is deliberately deferred to the topology-message send path.
+    ///
+    /// A peer whose remote substrate address is not in policy (the node reports its own,
+    /// zl-zipline#225) is kept with `None`: whether a link to it is proposed, and with
+    /// which address, is decided when the topology is sent (`vss_worker::proposed_links`).
     async fn resolve_peers(&self, peers: &[Peer]) -> Result<Vec<ResolvedPeer>, ResolverError> {
         // Parallelize the DNS lookups then check for the first error.
         let futs = peers.iter().map(|peer| async move {
-            (
-                peer,
-                resolve_netaddr(&peer.remote_substrate, self.resolver.as_ref()).await,
-            )
+            let sock_addr = match &peer.remote_substrate {
+                Some(naddr) => Some(resolve_netaddr(naddr, self.resolver.as_ref()).await?),
+                None => None,
+            };
+            Ok((peer.link_id.clone(), sock_addr))
         });
 
-        futures::future::join_all(futs)
-            .await
-            .into_iter()
-            .map(|(peer, result)| result.map(|sock_addr| (peer.link_id.clone(), sock_addr)))
-            .collect()
+        futures::future::join_all(futs).await.into_iter().collect()
     }
 }
 
@@ -839,6 +1021,11 @@ mod tests {
     use crate::db::{DbConnection, FakeDb, PolicyRepo};
     use crate::test_helpers::FakeResolver;
 
+    /// `vs_addr` for managers built in these tests. It must be a local
+    /// address: proxied JWKS refreshes bind to it (zl-zipline#240) and the
+    /// test CONNECT stubs listen on 127.0.0.1.
+    const TEST_VS_ADDR: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
@@ -861,6 +1048,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap()
@@ -883,6 +1071,7 @@ mod tests {
             dir.to_path_buf(),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap()
@@ -1054,6 +1243,7 @@ mod tests {
             PathBuf::from("."),
             actor_repo.clone(),
             oidc_refresh,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1573,9 +1763,9 @@ mod tests {
         Peering {
             link_id: link_id.to_string(),
             node_a,
-            substrate_a: NetAddr::new_for_ip_or_host(&node_a.to_string(), 0),
+            substrate_a: Some(NetAddr::new_for_ip_or_host(&node_a.to_string(), 0)),
             node_b,
-            substrate_b: NetAddr::new_for_ip_or_host("unresolvable.invalid", 5000),
+            substrate_b: Some(NetAddr::new_for_ip_or_host("unresolvable.invalid", 5000)),
             attributes: vec![],
         }
     }
@@ -1595,6 +1785,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await;
 
@@ -1758,8 +1949,8 @@ mod tests {
             link_id: link_id.to_string(),
             remote_zpr_addr: "fd5a:5052::1".parse().unwrap(),
             // local end is irrelevant to resolve_peers, so reuse the remote one.
-            local_substrate: substrate.clone(),
-            remote_substrate: substrate,
+            local_substrate: Some(substrate.clone()),
+            remote_substrate: Some(substrate),
         }
     }
 
@@ -1782,7 +1973,7 @@ mod tests {
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].0, "link-a");
-        assert_eq!(resolved[0].1, SocketAddr::new(ip, 4000));
+        assert_eq!(resolved[0].1, Some(SocketAddr::new(ip, 4000)));
     }
 
     /// Multiple IP peers produce one resolved pair each, in the same order.
@@ -1797,9 +1988,31 @@ mod tests {
 
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].0, "link-a");
-        assert_eq!(resolved[0].1.ip(), ip_a);
+        assert_eq!(resolved[0].1.unwrap().ip(), ip_a);
         assert_eq!(resolved[1].0, "link-b");
-        assert_eq!(resolved[1].1.ip(), ip_b);
+        assert_eq!(resolved[1].1.unwrap().ip(), ip_b);
+    }
+
+    /// A peer whose remote substrate address is not in policy (the node reports its own,
+    /// zl-zipline#225) is kept with no address, not dropped and not an error
+    /// (zl-zipline#255): the topology send decides what to do with it.
+    #[tokio::test]
+    async fn test_resolve_peers_keeps_unset_substrate() {
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let good = ip_peer("link-good", ip, 4000);
+        let mut reported = ip_peer("link-reported", ip, 4001);
+        reported.remote_substrate = None;
+        let presolver = PolicyResolver::new(Arc::new(FakeResolver::ip_only()));
+
+        let resolved = presolver.resolve_peers(&[good, reported]).await.unwrap();
+
+        assert_eq!(
+            resolved,
+            vec![
+                ("link-good".to_string(), Some(SocketAddr::new(ip, 4000))),
+                ("link-reported".to_string(), None),
+            ]
+        );
     }
 
     /// A peer with an unresolvable hostname causes resolve_peers to return an error.
@@ -1811,14 +2024,14 @@ mod tests {
         let bad = Peer {
             link_id: "link-bad".to_string(),
             remote_zpr_addr: "fd5a:5052::2".parse().unwrap(),
-            remote_substrate: NetAddr {
+            remote_substrate: Some(NetAddr {
                 host: NetworkHost::Hostname("some.unresolvable.host".to_string()),
                 port: 4000,
-            },
-            local_substrate: NetAddr {
+            }),
+            local_substrate: Some(NetAddr {
                 host: NetworkHost::Ip(ip),
                 port: 4000,
-            },
+            }),
         };
         let presolver = PolicyResolver::new(Arc::new(FakeResolver::ip_only()));
 
@@ -1841,6 +2054,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1858,6 +2072,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1880,6 +2095,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1895,6 +2111,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1911,6 +2128,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1933,6 +2151,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
+            TEST_VS_ADDR,
         )
         .await
         .unwrap();
@@ -1948,6 +2167,7 @@ mod tests {
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
+            TEST_VS_ADDR,
         )
         .await;
         assert!(res.is_err());
@@ -1960,14 +2180,14 @@ mod tests {
         let peer = Peer {
             link_id: "link-h".to_string(),
             remote_zpr_addr: "fd5a:5052::10".parse().unwrap(),
-            remote_substrate: NetAddr {
+            remote_substrate: Some(NetAddr {
                 host: NetworkHost::Hostname("peer.example.com".to_string()),
                 port: 5000,
-            },
-            local_substrate: NetAddr {
+            }),
+            local_substrate: Some(NetAddr {
                 host: NetworkHost::Ip("192.0.2.1".parse().unwrap()),
                 port: 5000,
-            },
+            }),
         };
         let mut entries = HashMap::new();
         entries.insert(
@@ -1980,6 +2200,6 @@ mod tests {
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].0, "link-h");
-        assert_eq!(resolved[0].1, SocketAddr::new(resolved_ip, 5000));
+        assert_eq!(resolved[0].1, Some(SocketAddr::new(resolved_ip, 5000)));
     }
 }

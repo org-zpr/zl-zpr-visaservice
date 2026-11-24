@@ -1,8 +1,10 @@
 //! Manage the creating, storage and retrieval of visas for the visa service.
 
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
 use crate::assembly::Assembly;
@@ -13,15 +15,14 @@ use crate::error::{ServiceError, StoreError};
 use crate::logging::targets::VISA;
 use crate::packet::make_fivetuple_tcp;
 use crate::policy_mgr::PolicySnapshot;
-use crate::visa_bootstrap::{BOOTSTRAP_VISA_ZPL, path_for_future_peer};
+use crate::visa_bootstrap::{BOOTSTRAP_VISA_LIFETIME, BOOTSTRAP_VISA_ZPL};
 use crate::visa_policy::{
     PolicyOutcome, docking_node_for_addr, evaluate_against_policy, route_for_allow,
 };
-use crate::visareq_worker::{VisaDecision, request_visa_wait_response};
 
 use libeval::eval_result::{Direction, Hit};
 use libeval::policy::Policy;
-use libeval::route::{NodeId, Route};
+use libeval::route::{LinkId, NodeId, Route};
 use zpr::vsapi_types::vsapi_ip_number as ip_proto;
 use zpr::vsapi_types::{
     CommFlag, DockPep, DockPepType, EndpointT, FwdPep, FwdPepStyle, IcmpPep, KeySet, PacketDesc,
@@ -33,9 +34,84 @@ use tracing::info;
 #[derive(Clone)]
 pub struct VisaMgr {
     repo: db::VisaRepo,
-    /// Serializes the check-then-create in [VisaMgr::vsapi_bootstrap_visa_for_future_peer].
-    /// Behind an `Arc` so every clone of the manager shares the one lock.
-    bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Visas whose revocation write failed, at commit ([VisaMgr::revoke_if_route_down])
+    /// or when a link went down (`revoke_visas_over_link`). They are never handed out,
+    /// and their revocation is retried on every [VisaMgr::get_pending_visas_for_node].
+    quarantine: Arc<Mutex<HashSet<u64>>>,
+    /// When each node's copy of a visa may still land (zl-zipline#248), see
+    /// [GrantHorizons].
+    horizons: Arc<Mutex<GrantHorizons>>,
+}
+
+/// The visa service's in-memory record of grants that may still be in flight to a node
+/// (zl-zipline#248; the contract is at [config::GRANT_HORIZON]).
+///
+/// A node treats a revoke of a visa it does not hold as done, so a revoke that overtakes
+/// its grant is acked and the late grant then installs. The visa service keeps the
+/// revoke record instead: an ack that arrives while the copy may still land is held
+/// back, and the revoke is sent once more after the horizon, when the grant can no
+/// longer arrive. Not persisted: for [config::GRANT_HORIZON] after start, every copy
+/// counts as inside its horizon (the startup floor).
+struct GrantHorizons {
+    /// The end of the startup floor.
+    floor: Instant,
+    /// `(visa_id, node)` -> until when the copy last built for `node` may still land.
+    /// Kept for one more [config::GRANT_HORIZON] after that ([GrantHorizons::prune]).
+    handed_out: HashMap<(u64, IpAddr), Instant>,
+    /// `(visa_id, node)` -> a revoke `node` acked inside the horizon: kept
+    /// `PendingRevoke`, held back from the node's revokes until this time, then sent once
+    /// more.
+    held: HashMap<(u64, IpAddr), Instant>,
+    /// When [GrantHorizons::prune] last scanned; `None` until it first does.
+    last_prune: Option<Instant>,
+}
+
+impl GrantHorizons {
+    fn new() -> Self {
+        GrantHorizons {
+            floor: Instant::now() + config::GRANT_HORIZON,
+            handed_out: HashMap::new(),
+            held: HashMap::new(),
+            last_prune: None,
+        }
+    }
+
+    /// Until when a copy of `visa_id` handed out to `node` may still land there: its
+    /// recorded horizon, and never before the end of the startup floor.
+    fn may_land_until(&self, visa_id: u64, node: &IpAddr) -> Instant {
+        match self.handed_out.get(&(visa_id, *node)) {
+            Some(horizon) => (*horizon).max(self.floor),
+            None => self.floor,
+        }
+    }
+
+    /// Whether a revoke of `visa_id` for `node` is held back now.
+    fn is_held(&self, visa_id: u64, node: &IpAddr, now: Instant) -> bool {
+        self.held
+            .get(&(visa_id, *node))
+            .is_some_and(|until| now < *until)
+    }
+
+    /// Drop every entry that no longer changes any decision. A held revoke goes once its
+    /// time has passed. A copy's horizon is kept for one more [config::GRANT_HORIZON]: the
+    /// ack of a revoke sent inside the horizon may be processed after it, and
+    /// [VisaMgr::revoke_acked] must still find it then; that ack arrives within the
+    /// node's RPC timeout, well inside one horizon.
+    ///
+    /// Every node's heartbeat calls this, so, like the visa store's own purge, it scans
+    /// at most once per [db::PURGE_MIN_INTERVAL].
+    fn prune(&mut self, now: Instant) {
+        if self
+            .last_prune
+            .is_some_and(|t| now.saturating_duration_since(t) < db::PURGE_MIN_INTERVAL)
+        {
+            return;
+        }
+        self.last_prune = Some(now);
+        self.handed_out
+            .retain(|_, until| now < *until + config::GRANT_HORIZON);
+        self.held.retain(|_, until| now < *until);
+    }
 }
 
 pub struct VisaWithMetadata {
@@ -53,7 +129,7 @@ enum VCtx {
 /// Outcome of re-checking an existing visa against a newer policy snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisaRecheck {
-    /// An actor could not be resolved; skip without bumping `checked_vinst`.
+    /// An actor could not be resolved; skip the visa.
     SkipUnresolvedActor,
     /// Still allowed and the selected route is unchanged.
     AllowSameRoute,
@@ -92,16 +168,10 @@ async fn path_for_flow(
     Ok(Some(node_id_path.into_iter().map(|id| id.into()).collect()))
 }
 
-/// Node path a future peer's VSAPI traffic will take: the peer itself, then `via_node`
-/// (the neighbour carrying the peer's topology message, hence its first hop), then
-/// `via_node`'s route to the node the visa service docks on.
-///
-/// The peer's own link is not in the router yet -- it only comes up when the peer
-/// connects -- so the first hop is stitched on from the peering rather than routed.
 /// True if the visa's dock PEP is for exactly this five-tuple: both addresses and both TCP
 /// ports. A visa with no dock PEP cannot match -- only full visas are stored, so that is a bug
 /// worth logging.
-fn dock_pep_matches_five_tuple(visa: &Visa, ft: &VsapiFiveTuple) -> bool {
+pub(crate) fn dock_pep_matches_five_tuple(visa: &Visa, ft: &VsapiFiveTuple) -> bool {
     let Some(dock_pep) = visa.dock_pep.as_ref() else {
         warn!(target: VISA, "found visa in store with no dock_pep ID={}", visa.issuer_id);
         return false;
@@ -117,20 +187,6 @@ fn dock_pep_matches_five_tuple(visa: &Visa, ft: &VsapiFiveTuple) -> bool {
     }
 }
 
-/// The node `node_addr` hands off to on `path`, given that it is one of the path's two ends.
-/// `None` if it is not an end (an intermediary has two neighbours, so the question is
-/// ambiguous). Bootstrap dedup asks "does this visa use the peer's link to that relay?", and
-/// the peer is always an end, so this answers it whichever way the path is oriented.
-fn path_neighbour_of_endpoint(path: &[IpAddr], node_addr: &IpAddr) -> Option<IpAddr> {
-    if path.first()? == node_addr {
-        path.get(1).copied()
-    } else if path.last()? == node_addr {
-        path.get(path.len().checked_sub(2)?).copied()
-    } else {
-        None
-    }
-}
-
 impl VisaWithMetadata {
     pub fn new(visa: Visa, metadata: db::VisaMetadata) -> Self {
         VisaWithMetadata { visa, metadata }
@@ -141,7 +197,8 @@ impl VisaMgr {
     pub fn new(db: db::VisaRepo) -> Self {
         VisaMgr {
             repo: db,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quarantine: Arc::new(Mutex::new(HashSet::new())),
+            horizons: Arc::new(Mutex::new(GrantHorizons::new())),
         }
     }
 
@@ -153,11 +210,18 @@ impl VisaMgr {
     ///   instructions.
     /// - On an egress node we send a full visa, no forwarding info.
     ///
+    /// In every context the copy's `prev_hop` names the node before `target_node` on the
+    /// path, and is unset on the ingress node and for a visa with no path of two or more
+    /// nodes (zl-zipline#245).
+    ///
+    /// Every path that delivers a copy to a node builds it here, so this is also where its
+    /// grant horizon is recorded ([GrantHorizons], zl-zipline#248).
     pub async fn actualize_visa_for_target_node(
         &self,
         mut visa: Visa,
         target_node: &IpAddr,
     ) -> Result<Visa, ServiceError> {
+        self.record_grant_horizon(visa.issuer_id, target_node);
         let md = self.repo.get_visa_metadata_by_id(visa.issuer_id)?;
 
         let Some(path) = md.path.as_ref() else {
@@ -180,8 +244,14 @@ impl VisaMgr {
             VCtx::Intermediary
         };
 
+        // Every node's copy names the node before it on the path: the only node it may accept
+        // a StreamIdRequest for this visa from (zl-zipline#245). The ingress node is first on
+        // the path, so its copy has none -- the flow starts there.
+        visa.prev_hop = prev_hop_in_path(path, target_node).copied();
+
         match vctx {
-            // The flow terminates here, so there is nothing to forward: full visa as-is.
+            // The flow terminates here, so there is nothing to forward: the full visa, with
+            // only its previous hop set above.
             VCtx::Egress => Ok(visa),
 
             // Both other roles forward one hop further along the path -- given [A, B, C, D],
@@ -206,292 +276,137 @@ impl VisaMgr {
         }
     }
 
-    /// Used when a node has already connected to the VS via the VSAPI and has called
-    /// `register_vss`.
+    /// The visas for the `register_vss` reply of `node_addr`, which has just registered
+    /// its VSS at `vss_addr`: only the node's copy of a NEW VS->VSS visa (J5b, see
+    /// [crate::core_visas::issue_vss_visa]).
     ///
-    /// Creates visas for:
-    /// - allow visa service to talk to node VSS.
-    ///
-    /// `node_addr` - The node, already connected and has just called `register_vss` over
-    /// VSAPI.  The idea is that the VS is next going to open a connection back to the node's
-    /// VSS so this can preempt the visa request.
-    ///
-    /// The visas returned here are any pending visas that should be installed on the
-    /// node `node_addr` which has just called to initialize vss.  If there are intermediary
-    /// nodes between the VS and `node_addr` those other visas are also created and set
-    /// PENDING on the relevant nodes -- but are not returned here.
-    ///
+    /// That copy has to ride in the reply: it is what lets the visa service open the VSS
+    /// connection, so it cannot be pushed over it. Everything else pending for the node --
+    /// its J5a VSAPI pair included -- is pushed over VSS once that connection is up, in
+    /// ingress-last order (gate g89 q4, see [VisaMgr::deliverable_visas_for_node]).
     pub async fn post_register_vss_visas_for_node(
         &self,
         asm: Arc<Assembly>,
         node_addr: &IpAddr,
         vss_addr: &SocketAddr,
+        session: Option<&str>,
     ) -> Result<Vec<Visa>, ServiceError> {
-        let mut visas = Vec::new();
-
-        // Start with any visas that may already be pending.
-        if let Ok(pendings) = self.get_pending_visas_for_node(node_addr).await {
-            for v in pendings {
-                let av = self.actualize_visa_for_target_node(v, node_addr).await?;
-                visas.push(av);
-            }
-        }
-
-        // The node may be reconnecting, in which case it may already have the core visas installed.
-        let vs_node_ft = make_fivetuple_tcp(
-            asm.config.get_vs_addr(),
-            node_addr.clone(),
-            0,
-            vss_addr.port(),
-        )?;
-        let has_vs_to_node_visa = self
-            .get_node_visa_by_five_tuple(node_addr, &vs_node_ft)
-            .await?
-            .is_some();
-
-        if !has_vs_to_node_visa {
-            let cres = self
-                .create_vs_to_node_vss_visa(asm.clone(), node_addr, vss_addr.port())
-                .await?;
-            let cres = self.actualize_visa_for_target_node(cres, node_addr).await?;
-            visas.push(cres);
-        } else {
-            debug!(
-                target: VISA,
-                "node {node_addr} already has VS->VSS visa installed, skipping creation"
-            );
-        }
-        Ok(visas)
+        let visa_id =
+            crate::core_visas::issue_vss_visa(&asm, node_addr, vss_addr.port(), session).await?;
+        let visa = self.repo.get_visa_by_id(visa_id)?;
+        Ok(vec![
+            self.actualize_visa_for_target_node(visa, node_addr).await?,
+        ])
     }
 
-    /// Mint (or reuse) one direction of the bootstrap flow that lets a not-yet-connected peer
-    /// reach the visa service's VSAPI port, which is how it connects in the first place.
-    ///
-    /// The rest of the bootstrap machinery lives in [crate::visa_bootstrap]; only the minting
-    /// is here, because it needs this module's private store and lookup helpers.
-    ///
-    /// The visa belongs to `future_peer` and is stored pending-install against it.
-    /// `via_node` is the already-connected neighbour whose topology message carries the
-    /// copy handed off when the peer shows up; it is also the peer's first hop, so the
-    /// path is anchored on it (see [crate::visa_bootstrap::path_for_future_peer]).
+    /// Mint one direction of a joining peer's bootstrap flow: the visa that lets `peer`
+    /// reach the visa service's VSAPI port through `relay` before it has a VS-API session
+    /// (ZODE_LINKS.md J3). Only [crate::visa_bootstrap::request_bootstrap_visas] calls this,
+    /// after checking the narrow rule; the rest of the bootstrap machinery lives there, and
+    /// only the minting is here, because it needs this module's private store helpers.
     ///
     /// `direction` picks which half of the flow this visa is for. A visa carries exactly one
     /// dock PEP and one path orientation, so the two halves cannot share one:
-    /// - [Direction::Forward] is the peer's own SYN, `peer:any -> vs:VSAPI`, ingressing at the
-    ///   peer and forwarded towards the node the visa service docks on.
-    /// - [Direction::Reverse] is the visa service's reply, `vs:VSAPI -> peer:any`, ingressing
-    ///   at the docking node and forwarded towards the peer.
+    /// - [Direction::Forward] is the peer's own requests, `peer:any -> vs:VSAPI`, ingressing
+    ///   at the peer and forwarded to the relay, where the visa service docks.
+    /// - [Direction::Reverse] is the visa service's replies, `vs:VSAPI -> peer:any`,
+    ///   ingressing at the relay and forwarded to the peer.
     ///
-    /// Call it once per direction: with only the forward visa the reply is dropped, because no
-    /// dock PEP matches it and no node on the forward path has a route back.
+    /// This deliberately bypasses policy evaluation: the peer has no actor until it has
+    /// authenticated, and a peering declared in policy *is* the authorization (J3). `policy`
+    /// is the caller's view, the one the peering was selected from, so the generation
+    /// recorded on the visa is the one that authorized it.
     ///
-    /// This deliberately bypasses policy evaluation. The peer cannot be evaluated --
-    /// it has no actor and no route until the link comes up -- and it needs none: a
-    /// peering declared in policy *is* the authorization for that peer to reach VSAPI.
+    /// The path is stitched from the peering, `[peer, relay]` (reversed for the reverse
+    /// half), never routed: the peer's link may not be in the router yet, and for a peer
+    /// that is still connected a routed path could run back through the peer itself. In v1
+    /// the relay is the node the visa service docks on (J3), so the path ends there.
     ///
-    /// `policy` is the caller's view, not a fresh read: the peering that authorizes this
-    /// visa was selected by the caller from that same view, so the generation recorded on
-    /// the visa has to come from it too, or a policy install landing mid-call stamps the
-    /// visa with a generation that never authorized it.
+    /// The visa carries no session keys. The peer's DH public key may still be stored from
+    /// its previous join, but it may have restarted with a new one, and nothing it holds now
+    /// has been authenticated: it authenticates over these visas.
     ///
-    /// TODO: Added as a HACK to get initial MULTINODE working. Should be re-evaluated later.
-    /// See: https://github.com/org-zpr/zpr-visaservice/issues/301
-    pub async fn vsapi_bootstrap_visa_for_future_peer(
+    /// Every call mints a NEW visa, valid for [BOOTSTRAP_VISA_LIFETIME] (J6). It is recorded
+    /// installed on both nodes at once, never pending: the relay hands both copies over
+    /// itself (installing its own, passing the peer's on in ZDP message 146), so nothing may
+    /// push them. The relay's state is written with the visa, so its VSS worker never sees
+    /// it pending. The peer's is set right after. The only VSS worker the peer can have then
+    /// is its previous session's, on a rejoin: that session's links are gone (R9), so a push
+    /// in between cannot reach the peer, and the worker is stopped once the rejoin is done
+    /// (see `visa_bootstrap::end_previous_join`).
+    pub async fn mint_bootstrap_visa(
         &self,
         asm: &Assembly,
-        policy: &Arc<Policy>,
-        future_peer: &IpAddr,
-        via_node: &IpAddr,
+        policy: &Policy,
+        peer: &IpAddr,
+        relay: &IpAddr,
         direction: Direction,
     ) -> Result<Visa, ServiceError> {
         let vs_addr = asm.config.get_vs_addr();
         let vsapi_port = asm.config.core.vsapi_port.unwrap_or(config::VSAPI_PORT);
-        // The wildcard port sits on the peer's side in both cases: it is the client, so its
-        // port is unknown until it picks one. This is also what `create_visa_with_path`
-        // derives for a BiDirectional packet in each direction, so the dedup lookup below
-        // compares equal to what was stored.
-        let ft = match direction {
-            Direction::Forward => make_fivetuple_tcp(*future_peer, vs_addr, 0, vsapi_port)?,
-            Direction::Reverse => make_fivetuple_tcp(vs_addr, *future_peer, vsapi_port, 0)?,
+        // The wildcard port sits on the peer's side in both directions: it is the client,
+        // so its port is unknown until it picks one. `create_visa_with_path` derives the same
+        // for a BiDirectional packet in each direction.
+        let (ft, path) = match direction {
+            Direction::Forward => (
+                make_fivetuple_tcp(*peer, vs_addr, 0, vsapi_port)?,
+                vec![*peer, *relay],
+            ),
+            Direction::Reverse => (
+                make_fivetuple_tcp(vs_addr, *peer, vsapi_port, 0)?,
+                vec![*relay, *peer],
+            ),
         };
-        // One neighbour can mint for the same peer from several places concurrently -- its
-        // topology sends (the policy-update fan-out, or every worker's initial sync after a VS
-        // restart) and a visa request pulling the visa. Without this the lookup below and the
-        // create further down interleave across their DB awaits and both mint, producing two
-        // visas with different IDs for one (peer, via_node).
-        //
-        // NOTE: Using one global lock, not per-peer -- bootstrap minting only happens while a
-        // peer is unconnected. (Switch to per-peer if this ever lands on a hot path.)
-        let _guard = self.bootstrap_lock.lock().await;
+        let pkt_data = PacketDesc {
+            five_tuple: ft,
+            comm_flags: CommFlag::BiDirectional,
+        };
+        let vwm = self
+            .create_visa_with_path(
+                // No session keys (see above).
+                KeySet::new(&[], &[]),
+                relay,
+                db::NodeVisaState::Installed,
+                &pkt_data,
+                &Hit::new_no_signal(0, direction),
+                Some(path),
+                BOOTSTRAP_VISA_ZPL,
+                policy.get_version().unwrap_or(0),
+                policy.vinst(),
+                SystemTime::now() + BOOTSTRAP_VISA_LIFETIME,
+            )
+            .await?;
+        self.visa_installed(vwm.visa.issuer_id, peer).await?;
+        Ok(vwm.visa)
+    }
 
-        // A bootstrap visa is delivered inside a neighbour's topology message, so it stays
-        // PendingInstall until `future_peer` itself connects and its own worker pushes it.
-        // Match on that state too, otherwise every set_topology mints a duplicate.
-        //
-        // Dedup is per (peer, via_node), not per five-tuple: the path is baked into the visa,
-        // so a peer with two connected neighbours needs one visa per neighbour. Sharing one
-        // would leave the second neighbour off the visa's path -- its own copy could not be
-        // actualized, and the peer's copy would forward over the wrong link.
-        if let Some(visa) = self
-            .find_node_visa_by_five_tuple(
-                future_peer,
-                &ft,
-                &[
+    /// Mark every visa installed on `node_addr` pending install again, and return their IDs.
+    ///
+    /// For a node that lost every visa it held (a rejoin wipes its links, R9) but keeps its
+    /// state in the visa service so it can `reconnect`: its VSS worker then pushes them all
+    /// again (ZODE_LINKS.md "Settled after the builder check"). Only the per-node install
+    /// state changes; the visas themselves are never touched. A visa whose state moved
+    /// meanwhile (to `PendingRevoke`, say) is left as it is.
+    pub async fn forget_installs_on_node(
+        &self,
+        node_addr: &IpAddr,
+    ) -> Result<Vec<u64>, ServiceError> {
+        let mut forgotten = Vec::new();
+        for id in self.get_installed_visa_ids_for_node(node_addr).await? {
+            if self
+                .repo
+                .transition_node_visa_state(
+                    *node_addr,
+                    id,
                     db::NodeVisaState::Installed,
                     db::NodeVisaState::PendingInstall,
-                ],
-                Some(via_node),
-            )
-            .await?
-        {
-            Ok(visa)
-        } else {
-            let pkt_data = PacketDesc {
-                five_tuple: ft,
-                comm_flags: CommFlag::BiDirectional,
-            };
-
-            // The path cannot be routed -- the peer's link is not up -- so hand it in
-            // explicitly. It has to be there: without it the peer's copy gets no fwd_pep
-            // and the relaying nodes get no copy at all, leaving the visa unusable.
-            //
-            // The path and the recorded generation come from different places on purpose.
-            // Everything policy-derived -- the peering that authorizes this visa, its
-            // link_id and cost, the generation stamped below -- comes from the caller's
-            // `policy`, so one mint cannot straddle two policy installs. The path is read
-            // live from the router instead, and has to be: actualization pushes a copy to
-            // every node on it, so it must name nodes whose links are actually up. A
-            // `PolicySnapshot` carries no topology at all (see `policy_mgr::PolicyState`),
-            // so there is no snapshot to take the path from.
-            let hit = Hit::new_no_signal(0, direction);
-            // [path_for_future_peer] is peer-first, which is the forward flow's orientation. The
-            // reply ingresses at the other end, so flip it: actualization decides each node's
-            // role from the path plus the ingress node, and `path[0]` is that node either way.
-            let mut path = path_for_future_peer(asm, future_peer, via_node)?;
-            if direction == Direction::Reverse {
-                path.reverse();
-            }
-            let ingress_node = path[0]; // path_for_future_peer is never empty
-
-            let visawmd = self
-                .create_visa_with_path(
-                    asm,
-                    &ingress_node,
-                    &pkt_data,
-                    &hit,
-                    Some(path),
-                    BOOTSTRAP_VISA_ZPL,
-                    policy.get_version().unwrap_or(0),
-                    policy.vinst(),
-                    SystemTime::now() + config::MAX_VISA_LIFETIME,
                 )
-                .await?;
-            Ok(visawmd.visa)
-        }
-    }
-
-    /// Find a visa *installed* on the node matching the given five-tuple.
-    pub async fn get_node_visa_by_five_tuple(
-        &self,
-        node_addr: &IpAddr,
-        ft: &VsapiFiveTuple,
-    ) -> Result<Option<Visa>, ServiceError> {
-        self.find_node_visa_by_five_tuple(node_addr, ft, &[db::NodeVisaState::Installed], None)
-            .await
-    }
-
-    /// Use a linear search of the node's visas in any of `states` to find a five-tuple match.
-    ///
-    /// `relay`, when given, additionally requires the visa's path to put that node next to
-    /// `node_addr`. A five-tuple match alone is ambiguous once the path matters: a node with
-    /// several links needs one visa per link for the same flow, because each visa carries a
-    /// single path.
-    ///
-    /// TODO: Need in-memory indexes for this.
-    async fn find_node_visa_by_five_tuple(
-        &self,
-        node_addr: &IpAddr,
-        ft: &VsapiFiveTuple,
-        states: &[db::NodeVisaState],
-        relay: Option<&IpAddr>,
-    ) -> Result<Option<Visa>, ServiceError> {
-        for state in states {
-            for visa in self.repo.get_visas_for_node_by_state(node_addr, *state)? {
-                if !dock_pep_matches_five_tuple(&visa, ft) {
-                    continue;
-                }
-                if let Some(relay) = relay {
-                    let md = self.repo.get_visa_metadata_by_id(visa.issuer_id)?;
-                    let neighbour = md
-                        .path
-                        .as_ref()
-                        .and_then(|p| path_neighbour_of_endpoint(p, node_addr));
-                    if neighbour.as_ref() != Some(relay) {
-                        continue;
-                    }
-                }
-                return Ok(Some(visa));
+                .await?
+            {
+                forgotten.push(id);
             }
         }
-        Ok(None)
-    }
-
-    /// Ask policy for a visa permitting this visa service to talk to the given node VSS addr.
-    /// Creating the visa has the side effect of storing it and marking it PENDING on every
-    /// node along the path.
-    ///
-    /// `node_addr` - node ZPR address hosting the VSS.
-    ///
-    /// `node_addr` is passed as the requesting node even though the flow runs the other way:
-    /// it is the node whose reply carries the visa (see
-    /// [VisaMgr::post_register_vss_visas_for_node]), and that is all `requesting_node` still
-    /// selects -- who is excluded from the background push. Path geometry comes from the
-    /// flow's source instead, see [path_for_flow].
-    async fn create_vs_to_node_vss_visa(
-        &self,
-        asm: Arc<Assembly>,
-        node_addr: &IpAddr,
-        vss_port: u16,
-    ) -> Result<Visa, ServiceError> {
-        // TODO: We may have this visa on hand already, if so return it and do not re-generate.
-
-        let pkt_data =
-            PacketDesc::new_tcp_with_addr(asm.config.get_vs_addr(), *node_addr, 0, vss_port)?;
-
-        // TODO: This call to return a FULL visa plus Route info.
-        // then we need to do some work.
-        self.create_visa_for_packet(asm, pkt_data, node_addr).await
-    }
-
-    /// `requesting_node_addr` - The visa is created as if this node has requested it.
-    ///
-    /// The returned visa is a full visa (TODO: return route info).
-    /// The visa needs to be crunched through PATH to determine what is sent to `requesting_node_addr` node.
-    async fn create_visa_for_packet(
-        &self,
-        asm: Arc<Assembly>,
-        pkt_data: PacketDesc,
-        requesting_node_addr: &IpAddr,
-    ) -> Result<Visa, ServiceError> {
-        // This will end up calling into `create_visa` which means we get a route
-        // and state will have been updated if any visas need to be sent to nodes.
-        //
-        // When it comes time to actually deliver a visa to a node
-        // we can use the PATH to create correct visa contents. The visa stored in state
-        // by ID is the FULL visa.
-        //
-        match request_visa_wait_response(
-            &asm,
-            requesting_node_addr,
-            pkt_data,
-            config::DEFAULT_VISA_REQ_TIMEOUT,
-        )
-        .await
-        {
-            Ok(VisaDecision::Allow(visa, _route)) => Ok(visa), // TODO: do something with the route
-            Ok(VisaDecision::Deny(dcode)) => Err(ServiceError::VisaDenied(dcode.to_string())),
-            Err(e) => Err(e),
-        }
+        Ok(forgotten)
     }
 
     /// Placeholder implementation, called concurrently.
@@ -502,6 +417,15 @@ impl VisaMgr {
     /// Note that visa state with respect to the requesting node is set to PENDING_INSTALL.
     ///
     /// A path is created from the route using the direction inforation in the hit.
+    ///
+    /// Once stored, the visa passes two commit checks before it is returned: the route
+    /// check ([VisaMgr::revoke_if_route_down]) and, given the revocation generation the
+    /// request read before it read its actors and policy (`commit_generation`), the check
+    /// against concurrent revocation ([VisaMgr::check_commit_generation]). The visa is
+    /// stored [db::CommitState::Pending], and so withheld from delivery, until both have
+    /// passed, when it is marked committed; one refused is revoked, left pending, and an
+    /// error returned. The mark is persisted: a visa the visa service crashed before
+    /// checking is revoked at the next start ([VisaMgr::revoke_uncommitted_visas]).
     ///
     /// This returns a FULL visa.
     pub async fn create_visa(
@@ -515,29 +439,189 @@ impl VisaMgr {
         policy_version: u64,
         vinst: u64,
         expiration_time: SystemTime,
+        commit_generation: u64,
     ) -> Result<VisaWithMetadata, ServiceError> {
         let path = path_for_flow(asm, &pdesc.five_tuple.source_addr, route).await?;
-        self.create_visa_with_path(
-            asm,
+        let vwmd = self
+            .create_visa_with_path(
+                session_key_for(asm, pdesc).await?,
+                requesting_node,
+                db::NodeVisaState::PendingInstall,
+                pdesc,
+                hit,
+                path,
+                source_zpl,
+                policy_version,
+                vinst,
+                expiration_time,
+            )
+            .await?;
+
+        // Test seam (zl-zipline#248): a revocation landing right after the store.
+        // Compiled out of release.
+        #[cfg(test)]
+        crate::visareq_worker::race_gate::pause_if_gated(
             requesting_node,
-            pdesc,
-            hit,
-            path,
-            source_zpl,
-            policy_version,
-            vinst,
-            expiration_time,
+            crate::visareq_worker::race_gate::Point::AfterStore,
         )
-        .await
+        .await;
+
+        // The path was derived from the live router after the route was chosen, so it
+        // must also still end where the destination is docked now.
+        let egress = match &vwmd.metadata.path {
+            Some(_) => {
+                crate::visa_policy::docking_node_for_addr(asm, &pdesc.five_tuple.dest_addr).await
+            }
+            None => None,
+        };
+        let mut checked = self
+            .revoke_if_route_down(
+                asm,
+                vwmd.visa.issuer_id,
+                &route.links,
+                vwmd.metadata.path.as_deref(),
+                egress,
+            )
+            .await;
+        if checked.is_ok() {
+            checked = self
+                .check_commit_generation(asm, vwmd.visa.issuer_id, commit_generation)
+                .await;
+        }
+        if checked.is_ok() {
+            checked = self.mark_committed(vwmd.visa.issuer_id).await;
+        }
+        // Deliverable if it passed; revoked (or quarantined), and still pending, if not.
+        checked.map(|()| vwmd)
+    }
+
+    /// Mark a visa that passed its commit checks committed ([db::CommitState]), making it
+    /// deliverable. A visa that cannot be marked stays withheld, so its request is
+    /// refused and the visa revoked ([VisaMgr::refuse_at_commit]).
+    async fn mark_committed(&self, visa_id: u64) -> Result<(), ServiceError> {
+        let why = match self.repo.mark_visa_committed(visa_id).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => "it expired before it was committed".to_string(),
+            Err(e) => format!("marking it committed failed: {e}"),
+        };
+        Err(self.refuse_at_commit(visa_id, &why).await)
+    }
+
+    /// Revoke every visa still [db::CommitState::Pending] its commit check: the visa
+    /// service stopped between such a visa's store and its check, so the check never
+    /// decided it (zl-zipline#248). Startup calls this before the workers and the VS-API
+    /// listener start. Such a visa is never delivered anyway; revoking it also takes it
+    /// off its nodes' pending lists. Returns the number quarantined, as
+    /// [VisaMgr::revoke_visa_ids] does; those stay pending, so withheld, and the next
+    /// start revokes them again.
+    pub async fn revoke_uncommitted_visas(&self) -> u32 {
+        let ids = self.repo.list_uncommitted_visa_ids();
+        if !ids.is_empty() {
+            info!(target: VISA, "revoking {} visa(s) left uncommitted by the previous run", ids.len());
+        }
+        self.revoke_visa_ids(&ids).await
+    }
+
+    /// Commit-time check for a just-stored visa (zl-zipline#224). A link on its route
+    /// may have gone down, or its id moved to another edge, after the route was chosen
+    /// and before the visa was stored; `path` is the visa's recorded node path, against
+    /// which each route link's endpoints are checked, and `egress` the destination's
+    /// docking node, at which that path must end;
+    /// the link-down revocation pass lists the visas stored when it ran, so it can miss
+    /// this one. Called once the visa is committed: if the link went down before this
+    /// check, the check catches it; if it goes down after, the pass finds the visa.
+    ///
+    /// A stale visa is marked `PendingRevoke` and an error is returned either way, so
+    /// `create_visa` never hands it out. If the revocation write fails, the visa is also
+    /// quarantined -- never handed out by [VisaMgr::get_pending_visas_for_node], which
+    /// also retries the revocation -- and an error is returned so `create_visa` does not
+    /// return it either. This works whether a route link went down or was removed.
+    pub(crate) async fn revoke_if_route_down(
+        &self,
+        asm: &Assembly,
+        visa_id: u64,
+        links: &[LinkId],
+        path: Option<&[IpAddr]>,
+        egress: Option<IpAddr>,
+    ) -> Result<(), ServiceError> {
+        // With a recorded path, it must end at the destination's docking node
+        // (`egress`, looked up afresh): the path itself was derived from the mutable
+        // router after the route was chosen, so a link id moved in between would
+        // otherwise validate against a path to the wrong node.
+        let ends_ok = match (path, egress) {
+            (Some(p), Some(e)) => p.last() == Some(&e),
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if ends_ok && asm.topo_mgr.route_still_valid(links, path) {
+            // The route looks valid now, but a link may have gone down and come back
+            // up since the visa was stored: its revocation pass then revoked the visa
+            // already, and link recovery must not make it issuable again.
+            if !self.repo.is_issuable(visa_id) {
+                return Err(ServiceError::Internal(format!(
+                    "visa {visa_id}: revoked while it was issued"
+                )));
+            }
+            return Ok(());
+        }
+        // Revoked, but never hand it out: the requester would otherwise get an Allow
+        // and a visa on a route that is already down.
+        Err(self
+            .refuse_at_commit(visa_id, "a link on its route went down while it was issued")
+            .await)
+    }
+
+    /// Commit check against concurrent revocation (zl-zipline#248), for visa `visa_id`
+    /// that [VisaMgr::create_visa] just stored from a request that read the revocation
+    /// generation `generation` ([crate::revocation::RevocationLedger::generation]) before
+    /// it read its actors and policy.
+    ///
+    /// If no reconciler pass overlapped the request
+    /// ([crate::revocation::RevocationLedger::no_pass_overlapped]), every pass for a write
+    /// the request did not see lists the visas after this one was stored, and revokes it
+    /// if it must. Otherwise a pass may have read the state or listed the visas before
+    /// this one was stored: the visa is revoked and the request refused, whatever the
+    /// state now says -- the state the visa service holds may not show the change yet
+    /// (a trusted service's new attributes are refreshed only for actors behind live
+    /// visas). The node re-requests.
+    async fn check_commit_generation(
+        &self,
+        asm: &Assembly,
+        visa_id: u64,
+        generation: u64,
+    ) -> Result<(), ServiceError> {
+        if asm.revocations.no_pass_overlapped(generation) {
+            return Ok(());
+        }
+        Err(self
+            .refuse_at_commit(visa_id, "a revocation pass ran while it was issued")
+            .await)
+    }
+
+    /// Revoke a just-stored visa that must not be handed out, and return the error its
+    /// request is refused with. `why` names the cause in the logs and the error. If the
+    /// revocation write fails, the visa is also quarantined ([VisaMgr::quarantine]): it
+    /// is never handed out, and its revocation is retried.
+    async fn refuse_at_commit(&self, visa_id: u64, why: &str) -> ServiceError {
+        warn!(target: VISA, "visa {visa_id}: {why}; revoking it");
+        if let Err(e) = self.mark_visa_revoked(visa_id).await {
+            self.quarantine(visa_id);
+            return ServiceError::Internal(format!(
+                "visa {visa_id}: {why}, and revoking it failed: {e}"
+            ));
+        }
+        ServiceError::Internal(format!("visa {visa_id}: {why}; revoked"))
     }
 
     /// As [VisaMgr::create_visa], but with the node path supplied rather than derived from
-    /// a route. For visas whose path cannot be routed -- see
-    /// [VisaMgr::vsapi_bootstrap_visa_for_future_peer].
+    /// a route, and the requesting node's install state given (every other node on the path
+    /// starts pending install). For visas whose path is not routed -- see
+    /// [VisaMgr::mint_bootstrap_visa].
     async fn create_visa_with_path(
         &self,
-        asm: &Assembly,
+        session_key: KeySet,
         requesting_node: &IpAddr,
+        requester_state: db::NodeVisaState,
         pdesc: &PacketDesc,
         hit: &Hit,
         path: Option<Vec<IpAddr>>,
@@ -610,19 +694,11 @@ impl VisaMgr {
             metadata.signal_msgs.push(sig.message.clone());
         }
 
-        let mut ingress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.source_addr).await?;
-        let mut egress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.dest_addr).await?;
-
-        if ingress_key.is_empty() || egress_key.is_empty() {
-            ingress_key.clear();
-            egress_key.clear();
-        }
-
         let pep = DockPep {
             pep,
             source_addr: pdesc.five_tuple.source_addr.clone(),
             dest_addr: pdesc.five_tuple.dest_addr.clone(),
-            session_key: KeySet::new(&ingress_key, &egress_key),
+            session_key,
         };
 
         let visa = Visa {
@@ -633,25 +709,236 @@ impl VisaMgr {
             dock_pep: Some(pep),
             fwd_pep: None,
             cons: None,
+            // Per node: set when the visa is actualized for each node on its path
+            // (see [VisaMgr::actualize_visa_for_target_node]).
+            prev_hop: None,
         };
 
-        // The store also updates the visa state along the path.
+        // A visa a request will commit-check is stored pending that check, so withheld
+        // from delivery until it passes ([VisaMgr::create_visa]); bootstrap visas are
+        // installed at once.
+        let commit = if requester_state == db::NodeVisaState::PendingInstall {
+            db::CommitState::Pending
+        } else {
+            db::CommitState::Committed
+        };
+        // The store also updates the visa state along the path: `requester_state` for the
+        // requesting node, pending install for every other node on the path.
         self.repo
-            .store_visa(&visa, metadata.clone(), db::NodeVisaState::PendingInstall)
+            .store_visa(&visa, metadata.clone(), requester_state, commit)
             .await?;
 
         info!("created visa {visa_id}");
         Ok(VisaWithMetadata::new(visa, metadata))
     }
 
+    /// Visas waiting to be installed on `node_addr`. Quarantined visas (see
+    /// [VisaMgr::revoke_if_route_down]) are never returned; this call also retries
+    /// their revocation, so housekeeping drives the retry.
     pub async fn get_pending_visas_for_node(
         &self,
         node_addr: &IpAddr,
     ) -> Result<Vec<Visa>, ServiceError> {
-        let visas = self
+        self.retry_quarantined_revocations().await;
+        let snapshot = self
             .repo
             .get_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)?;
+        // Test seam (zl-zipline#248): a commit check finishing after the rows were read.
+        // Compiled out of release.
+        #[cfg(test)]
+        crate::visareq_worker::race_gate::pause_if_gated(
+            node_addr,
+            crate::visareq_worker::race_gate::Point::AfterPendingSnapshot,
+        )
+        .await;
+        // The copy's state is read again: a revoke written after the rows were read
+        // leaves it no longer `PendingInstall` here. A copy refused at commit stays
+        // uncommitted, so withheld.
+        let visas = snapshot
+            .into_iter()
+            .filter(|v| {
+                !self.is_withheld(v.issuer_id)
+                    && self.repo.get_node_visa_state(v.issuer_id, node_addr)
+                        == Some(db::NodeVisaState::PendingInstall)
+            })
+            .collect();
         Ok(visas)
+    }
+
+    /// The visas pending on `node_addr` that may be pushed to it now: those from
+    /// [VisaMgr::get_pending_visas_for_node], minus any copy for the *ingress* of a visa's
+    /// path (its first node) while another node on the path has not yet acknowledged its
+    /// own copy.
+    ///
+    /// This is the "ingress last" rule (gate g89 q4, ZODE_LINKS.md J11). The ingress is
+    /// where a flow enters the fabric, and installing a visa there is what makes the node
+    /// use it -- for a visa superseding one with the same five-tuple, it starts the rebind.
+    /// Holding the ingress copy back until every other hop holds its copy means the rebind
+    /// never reaches a hop that cannot bind it. The VSS worker's push goes through here, so
+    /// the rule holds whichever order the acknowledgements arrive in. A visa with no path
+    /// has one node and no ordering.
+    pub async fn deliverable_visas_for_node(
+        &self,
+        node_addr: &IpAddr,
+    ) -> Result<Vec<Visa>, ServiceError> {
+        let pending = self.get_pending_visas_for_node(node_addr).await?;
+        Ok(pending
+            .into_iter()
+            .filter(|v| self.other_hops_installed_if_ingress(v.issuer_id, node_addr))
+            .collect())
+    }
+
+    /// True unless `node_addr` is the first node of the visa's path and some other node on
+    /// the path has not acknowledged its copy (is not `Installed`). See
+    /// [VisaMgr::deliverable_visas_for_node].
+    fn other_hops_installed_if_ingress(&self, visa_id: u64, node_addr: &IpAddr) -> bool {
+        let Ok(md) = self.repo.get_visa_metadata_by_id(visa_id) else {
+            return false; // gone meanwhile: nothing to deliver
+        };
+        match md.path.as_deref() {
+            Some([ingress, rest @ ..]) if ingress == node_addr => rest.iter().all(|hop| {
+                self.repo.get_node_visa_state(visa_id, hop) == Some(db::NodeVisaState::Installed)
+            }),
+            _ => true,
+        }
+    }
+
+    /// Record that a copy of `visa_id` for `node` may land there until one
+    /// [config::GRANT_HORIZON] from now ([GrantHorizons]). A path that decides whether a
+    /// copy goes out must record this before it decides: a revoke acked between the
+    /// decision and the record would otherwise find no horizon and be torn down, while
+    /// the copy still goes out after it.
+    fn record_grant_horizon(&self, visa_id: u64, node: &IpAddr) {
+        self.horizons
+            .lock()
+            .unwrap()
+            .handed_out
+            .insert((visa_id, *node), Instant::now() + config::GRANT_HORIZON);
+    }
+
+    /// Whether `visa_id` may still be granted to `node_addr`: staged there as
+    /// `PendingInstall` or `Installed`, and not withheld ([VisaMgr::is_withheld]). For visas prepared before
+    /// a caller took the topology lock (`register_vss`): one revoked, acknowledged or
+    /// quarantined meanwhile must not be granted again.
+    ///
+    /// The hold is checked before the state is read (see
+    /// [VisaMgr::get_pending_visas_for_node]).
+    pub fn still_grantable(&self, visa_id: u64, node_addr: &IpAddr) -> bool {
+        !self.is_withheld(visa_id)
+            && matches!(
+                self.repo.get_node_visa_state(visa_id, node_addr),
+                Some(db::NodeVisaState::PendingInstall | db::NodeVisaState::Installed)
+            )
+    }
+
+    /// The visas among `ids` that `node_addr` may fetch by ID (`visaRequestById`), each
+    /// actualized for `node_addr` ([VisaMgr::actualize_visa_for_target_node]). An ID the
+    /// node may not have is left out: the schema reads a missing visa as "does not exist
+    /// for that node". See [VisaMgr::fetchable_by_node] for the rule (zl-zipline#262).
+    ///
+    /// A node fetches a visa by ID only when it does not hold it, typically on a Stream ID
+    /// Request from its previous hop. Its copy is then usually still waiting for the VSS
+    /// push, which cannot reach it yet (no VSS connection during a join, or a restart).
+    /// So the fetch hands out every copy the push would deliver now, or already has.
+    ///
+    /// The fetch is read-only (gate g121 q3): it never marks a copy `Installed`. The VSS
+    /// push stays the only acknowledged delivery, so ingress last waits on real
+    /// acknowledgements; the push of a copy already fetched is a no-op on the node.
+    pub async fn visas_for_node_by_ids(
+        &self,
+        node_addr: &IpAddr,
+        ids: &[u64],
+    ) -> Result<Vec<Visa>, ServiceError> {
+        let mut visas = Vec::with_capacity(ids.len());
+        for &id in ids {
+            // The horizon goes first ([VisaMgr::record_grant_horizon]); building the copy
+            // records it again, later. Only for a copy staged on the node, so a node
+            // asking for arbitrary IDs cannot grow the horizon map.
+            if self.repo.get_node_visa_state(id, node_addr).is_some() {
+                self.record_grant_horizon(id, node_addr);
+            }
+            if !self.fetchable_by_node(id, node_addr) {
+                debug!(target: VISA, "node {node_addr} requested visa {id}: not deliverable to it");
+                continue;
+            }
+            // Test seam (zl-zipline#248): a revoke sent and acked while the fetched copy
+            // is being built. Compiled out of release.
+            #[cfg(test)]
+            crate::visareq_worker::race_gate::pause_if_gated(
+                node_addr,
+                crate::visareq_worker::race_gate::Point::AfterFetchCheck,
+            )
+            .await;
+            match self.get_visa_with_metadata_by_id(id).await? {
+                Some(vwm) => match self
+                    .actualize_visa_for_target_node(vwm.visa, node_addr)
+                    .await
+                {
+                    Ok(v) => visas.push(v),
+                    Err(_) => {
+                        debug!(target: VISA, "node {node_addr} requested visa {id} but actualization failed")
+                    }
+                },
+                None => debug!(target: VISA, "node {node_addr} requested visa {id} but not found"),
+            }
+        }
+        Ok(visas)
+    }
+
+    /// Whether `node_addr` may fetch its copy of `visa_id` by ID: the copy is
+    /// `Installed` (already delivered), or `PendingInstall` and the VSS push would deliver
+    /// it now -- the push holds back only the ingress copy, until every other hop has
+    /// acknowledged its own ([VisaMgr::deliverable_visas_for_node]). A quarantined copy is
+    /// never fetchable. These are [VisaMgr::still_grantable]'s states, but the node state
+    /// is read once here: a copy turned `PendingRevoke` by a concurrent sweep or link-down
+    /// between two reads must not pass as delivered.
+    ///
+    /// The hold is checked before the state is read (see
+    /// [VisaMgr::get_pending_visas_for_node]).
+    fn fetchable_by_node(&self, visa_id: u64, node_addr: &IpAddr) -> bool {
+        if self.is_withheld(visa_id) {
+            return false;
+        }
+        match self.repo.get_node_visa_state(visa_id, node_addr) {
+            Some(db::NodeVisaState::Installed) => true,
+            Some(db::NodeVisaState::PendingInstall) => {
+                self.other_hops_installed_if_ingress(visa_id, node_addr)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `visa_id` must not be delivered now: not committed ([db::CommitState]) or
+    /// quarantined ([VisaMgr::quarantine]). The commit state is read first: a visa
+    /// refused at commit is quarantined while it stays uncommitted, so reading in this
+    /// order can never miss both.
+    fn is_withheld(&self, visa_id: u64) -> bool {
+        self.repo.is_uncommitted(visa_id) || self.quarantine.lock().unwrap().contains(&visa_id)
+    }
+
+    /// Quarantine a visa whose revocation write failed: it is never handed out by
+    /// [VisaMgr::get_pending_visas_for_node], which also retries the revocation until
+    /// it succeeds. Covers visas installed or pending on any route, whatever later
+    /// happens to the link that made them stale.
+    pub(crate) fn quarantine(&self, visa_id: u64) {
+        self.quarantine.lock().unwrap().insert(visa_id);
+    }
+
+    /// Try again to revoke every quarantined visa; drop each one whose revocation
+    /// now succeeds (or that no longer exists).
+    async fn retry_quarantined_revocations(&self) {
+        let ids: Vec<u64> = self.quarantine.lock().unwrap().iter().copied().collect();
+        for visa_id in ids {
+            match self.mark_visa_revoked(visa_id).await {
+                Ok(_) => {
+                    self.quarantine.lock().unwrap().remove(&visa_id);
+                    info!(target: VISA, "visa {visa_id}: quarantined stale visa revoked on retry");
+                }
+                Err(e) => {
+                    warn!(target: VISA, "visa {visa_id}: quarantined stale visa still not revoked: {e}")
+                }
+            }
+        }
     }
 
     pub async fn get_pending_visa_ids_for_node(
@@ -695,7 +982,7 @@ impl VisaMgr {
     }
 
     /// Register that visa `visa_id` has been installed on node at ZPR address
-    /// `node_addr`.
+    /// `node_addr`, after the node acknowledged a push.
     ///
     /// This is a CAS (Compare And Swap) `PendingInstall -> Installed`: if the
     /// check-all-visas-due-to-new-policy sweep marked the node `PendingRevoke`
@@ -706,6 +993,44 @@ impl VisaMgr {
         visa_id: u64,
         node_addr: &IpAddr,
     ) -> Result<(), ServiceError> {
+        self.install_cas(visa_id, node_addr).await?;
+        Ok(())
+    }
+
+    /// Decide, in one store step, whether `node_addr`'s copy of `visa_id` is handed out
+    /// in a VS-API reply (zl-zipline#248): the `PendingInstall -> Installed` CAS, run
+    /// before the reply is built. `false` -- the copy was revoked, acknowledged or never
+    /// staged, or the visa is quarantined -- means it must not go out. A revoke after the
+    /// CAS moves the copy to `PendingRevoke` and goes out over VSS; if it overtakes the
+    /// reply, the grant horizon ([VisaMgr::revoke_acked]) sends it once more.
+    pub async fn grant_copy(&self, visa_id: u64, node_addr: &IpAddr) -> Result<bool, ServiceError> {
+        if self.is_withheld(visa_id) {
+            return Ok(false);
+        }
+        // Test seam (zl-zipline#248): a revocation landing while the grant waits for the
+        // store. Compiled out of release.
+        #[cfg(test)]
+        crate::visareq_worker::race_gate::pause_if_gated(
+            node_addr,
+            crate::visareq_worker::race_gate::Point::InsideGrant,
+        )
+        .await;
+        let installed = self.install_cas(visa_id, node_addr).await?
+            // Already `Installed`: a VSS push delivered the copy first, so handing it out
+            // again grants nothing new.
+            || self.repo.get_node_visa_state(visa_id, node_addr)
+                == Some(db::NodeVisaState::Installed);
+        // Checked again after the CAS (codex pass 4): a revocation whose write failed
+        // while the grant waited for the store quarantines the visa but leaves the copy
+        // `PendingInstall`, so the CAS still applies. The copy then stays `Installed`
+        // without going out; the quarantine retry marks it `PendingRevoke`, and the node,
+        // not holding it, acks the revoke.
+        Ok(installed && !self.is_withheld(visa_id))
+    }
+
+    /// The `PendingInstall -> Installed` CAS behind [VisaMgr::visa_installed] and
+    /// [VisaMgr::grant_copy]. Returns whether it applied, logging why when it did not.
+    async fn install_cas(&self, visa_id: u64, node_addr: &IpAddr) -> Result<bool, ServiceError> {
         let applied = self
             .repo
             .transition_node_visa_state(
@@ -729,7 +1054,7 @@ impl VisaMgr {
                 }
             }
         }
-        Ok(())
+        Ok(applied)
     }
 
     /// Snapshot of `(visa_id, metadata)` for all live visas — for the sweep.
@@ -737,27 +1062,8 @@ impl VisaMgr {
         self.repo.list_visa_metadata().await
     }
 
-    /// Apply an allow verdict to a visa at policy generation `vinst`. See [db::VisaRepo::record_allow_verdict].
-    pub async fn record_allow_verdict(
-        &self,
-        visa_id: u64,
-        vinst: u64,
-    ) -> Result<bool, ServiceError> {
-        Ok(self.repo.record_allow_verdict(visa_id, vinst).await?)
-    }
-
-    /// Apply a deny verdict to a visa at policy generation `vinst`. See [db::VisaRepo::record_deny_verdict].
-    pub async fn record_deny_verdict(
-        &self,
-        visa_id: u64,
-        vinst: u64,
-    ) -> Result<bool, ServiceError> {
-        Ok(self.repo.record_deny_verdict(visa_id, vinst).await?)
-    }
-
-    /// Mark every node of a visa `PendingRevoke` with no policy-generation gate. Used by
-    /// the attribute-change sweep, where the policy `vinst` has not moved and so the
-    /// verdict recorders would no-op. See [db::VisaRepo::mark_visa_revoked].
+    /// Mark every node of a visa `PendingRevoke`. Used by the visa sweep. See
+    /// [db::VisaRepo::mark_visa_revoked].
     pub async fn mark_visa_revoked(&self, visa_id: u64) -> Result<bool, ServiceError> {
         Ok(self.repo.mark_visa_revoked(visa_id).await?)
     }
@@ -773,7 +1079,9 @@ impl VisaMgr {
         self.repo.visa_has_node_refs(visa_id).await
     }
 
-    /// The visa IDs for a node currently marked `PendingRevoke`.
+    /// The visa IDs for a node currently marked `PendingRevoke`, minus those whose revoke
+    /// the node acked inside the grant horizon and that wait to be sent once more
+    /// ([VisaMgr::revoke_acked]).
     pub async fn get_pending_revoke_visa_ids_for_node(
         &self,
         node_addr: &IpAddr,
@@ -781,13 +1089,33 @@ impl VisaMgr {
         let ids = self
             .repo
             .get_visa_ids_for_node_by_state(node_addr, db::NodeVisaState::PendingRevoke)?;
-        Ok(ids)
+        let horizons = self.horizons.lock().unwrap();
+        let now = Instant::now();
+        Ok(ids
+            .into_iter()
+            .filter(|id| !horizons.is_held(*id, node_addr, now))
+            .collect())
     }
 
     /// Post-ack VSS revoke teardown, keeping the two-step ordering in one place: drop
     /// the node from the record if it is still `PendingRevoke`, then remove the
     /// whole visa once no node references remain.
-    pub async fn revoke_acked(&self, node_addr: IpAddr, visa_id: u64) {
+    ///
+    /// The ack of a revoke sent (`sent_at`, taken before the RPC) while the node's copy
+    /// may still land ([GrantHorizons], zl-zipline#248) tears nothing down: the revoke may
+    /// have overtaken the grant, however late its ack is processed. The copy stays
+    /// `PendingRevoke`, held back until the horizon has passed, and the next heartbeat
+    /// after it sends the revoke once more; that ack tears it down.
+    pub async fn revoke_acked(&self, node_addr: IpAddr, visa_id: u64, sent_at: Instant) {
+        {
+            let mut horizons = self.horizons.lock().unwrap();
+            let until = horizons.may_land_until(visa_id, &node_addr);
+            if sent_at < until {
+                horizons.held.insert((visa_id, node_addr), until);
+                debug!(target: VISA, "visa {visa_id}: revoke acked by {node_addr} while its grant may still land; sending it once more after the grant horizon");
+                return;
+            }
+        }
         if let Err(e) = self
             .repo
             .remove_node_if_pending_revoke(node_addr, visa_id)
@@ -811,6 +1139,10 @@ impl VisaMgr {
     /// TODO: Possibly needs more thought for how to deal with cases where an auth service
     /// is removed by policy.
     ///
+    /// A bootstrap visa ([BOOTSTRAP_VISA_ZPL]) is not evaluated either: it was minted from
+    /// the relay's policy peering with the joiner, so it is rechecked against that alone
+    /// (`visa_bootstrap::bootstrap_visa_authorized`), whatever the route or link state.
+    ///
     /// ### returns
     /// - `SkipUnresolvedActor` = an actor could not be resolved (skip, don't bump)
     /// - `AllowSameRoute` = still allowed on the same route
@@ -827,6 +1159,17 @@ impl VisaMgr {
         metadata: &VisaMetadata,
         psnap: &PolicySnapshot,
     ) -> Result<VisaRecheck, ServiceError> {
+        if metadata.zpl == BOOTSTRAP_VISA_ZPL {
+            // Its path is stitched from the peering and never moves, so "same route" holds
+            // for as long as the peering does.
+            return Ok(
+                if crate::visa_bootstrap::bootstrap_visa_authorized(asm, psnap, metadata) {
+                    VisaRecheck::AllowSameRoute
+                } else {
+                    VisaRecheck::Revoke
+                },
+            );
+        }
         // TODO: comm_flags is not persisted; for now default to BiDirectional.
         let pkt = PacketDesc {
             five_tuple: metadata.five_tuple.clone(),
@@ -835,9 +1178,12 @@ impl VisaMgr {
         let src_zpr = metadata.five_tuple.source_addr;
         let dst_zpr = metadata.five_tuple.dest_addr;
 
-        let (Ok(Some(src)), Ok(Some(dst))) = (
-            asm.actor_mgr.get_actor_by_zpr_addr(&src_zpr).await,
-            asm.actor_mgr.get_actor_by_zpr_addr(&dst_zpr).await,
+        // A genuinely absent actor is unresolved (skipped); a store read error
+        // is propagated, so a sweep counts it as a failure and keeps the work
+        // for a retry instead of treating the visa as settled (#63 review).
+        let (Some(src), Some(dst)) = (
+            asm.actor_mgr.get_actor_by_zpr_addr(&src_zpr).await?,
+            asm.actor_mgr.get_actor_by_zpr_addr(&dst_zpr).await?,
         ) else {
             return Ok(VisaRecheck::SkipUnresolvedActor);
         };
@@ -928,20 +1274,65 @@ impl VisaMgr {
     /// already cleared by `remove_visas_for_node`) is dropped here instead of
     /// waiting for TTL.
     ///
+    /// Returns the number of visas whose revocation could not be persisted (quarantined
+    /// in memory only, see [VisaMgr::revoke_visa_ids]). A caller that must know the
+    /// revocation is durable records an obligation instead, or as well (a disconnect,
+    /// zl-zipline#290): the reconciler keeps it until this returns 0.
     pub async fn remove_visas_for_actors(
         &self,
         actor_addrs: &[IpAddr],
-    ) -> Result<(), ServiceError> {
+    ) -> Result<u32, ServiceError> {
         if actor_addrs.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
-        for id in self.get_visa_ids_for_actors(actor_addrs).await? {
+        let ids = self.get_visa_ids_for_actors(actor_addrs).await?;
+        Ok(self.revoke_visa_ids(&ids).await)
+    }
+
+    /// As [VisaMgr::remove_visas_for_actors], for actors that have vanished, but leaving
+    /// out bootstrap visas ([BOOTSTRAP_VISA_ZPL]). A joiner's bootstrap visas are minted
+    /// from the relay's peering before the joiner has an actor, so a departed node that
+    /// is rejoining has them while its old actor is gone: revoking them would cut it off
+    /// from the visa service it authenticates with. The sweep re-checks them against
+    /// the peering instead (zl-zipline#290).
+    ///
+    /// Returns the number of visas quarantined, as [VisaMgr::revoke_visa_ids] does.
+    pub async fn remove_visas_for_vanished_actors(
+        &self,
+        actor_addrs: &[IpAddr],
+    ) -> Result<u32, ServiceError> {
+        let mut ids = self.get_visa_ids_for_actors(actor_addrs).await?;
+        ids.retain(|id| {
+            !self
+                .repo
+                .get_visa_metadata_by_id(*id)
+                .is_ok_and(|md| md.zpl == BOOTSTRAP_VISA_ZPL)
+        });
+        Ok(self.revoke_visa_ids(&ids).await)
+    }
+
+    /// Revoke each of `ids` everywhere: mark every node holding it `PendingRevoke`, so VSS
+    /// housekeeping revokes it from those nodes and removes it on their acks. A visa with
+    /// no node left to revoke from is removed at once instead of waiting for its TTL.
+    /// A visa whose revocation write fails is quarantined ([VisaMgr::quarantine]): never
+    /// handed out, and its revocation retried by housekeeping. The rest carry on. The visas
+    /// themselves are never changed.
+    ///
+    /// Returns the number of visas quarantined: a caller that must know the revocation
+    /// is durable (the reconciler, zl-zipline#289) treats any as a failure, because a
+    /// restart loses the in-memory quarantine. A caller that only revokes as a fast
+    /// path, such as a disconnect, records an obligation first (zl-zipline#290).
+    pub async fn revoke_visa_ids(&self, ids: &[u64]) -> u32 {
+        let mut quarantined = 0u32;
+        for &id in ids {
             // Log-and-continue: one failure must not strand the remaining visas.
             match self.repo.mark_visa_revoked(id).await {
                 Ok(true) => {}
                 Ok(false) => continue, // vanished/expired between query and mark
                 Err(e) => {
-                    warn!(target: VISA, "failed to mark visa {id} revoked for departed actor: {e}");
+                    self.quarantine(id);
+                    quarantined += 1;
+                    warn!(target: VISA, "failed to mark visa {id} revoked, quarantined for retry: {e}");
                     continue;
                 }
             }
@@ -952,11 +1343,13 @@ impl VisaMgr {
                 }
             }
         }
-        Ok(())
+        quarantined
     }
 
-    /// Drop expired visas from the in-memory store. Called by housekeeping.
+    /// Drop expired visas from the in-memory store, and grant horizons that have passed.
+    /// Called by housekeeping.
     pub fn purge_expired_visas(&self) -> Result<(), ServiceError> {
+        self.horizons.lock().unwrap().prune(Instant::now());
         self.repo.purge_expired()?;
         Ok(())
     }
@@ -1018,6 +1411,46 @@ impl VisaMgr {
     }
 }
 
+/// The session key for a visa on `pdesc`: the source actor's A2A DH public key as the ingress
+/// key and the destination actor's as the egress key, or no keys at all unless both actors
+/// sent one.
+///
+/// A flow between a node and the visa service gets no keys either (gate g100). Those are a
+/// node's core visas -- its VSAPI pair (J5a), its VSS visa (J5b) and their renewals (J9) --
+/// and they must carry exactly the session keys of the visas they supersede, because a node
+/// refuses to rebind a live stream onto a visa whose session keys differ (J11). The first of
+/// them, the bootstrap pair, cannot carry keys: the joiner has not authenticated, so it has
+/// no authenticated key yet ([VisaMgr::mint_bootstrap_visa]). So none of them does. The
+/// traffic on these flows is the VS-API and VSS connections, which run over TLS of their
+/// own. (Neither TLS client verifies the server's certificate yet: see `vss_worker`.)
+async fn session_key_for(asm: &Assembly, pdesc: &PacketDesc) -> Result<KeySet, ServiceError> {
+    if is_node_vs_flow(asm, pdesc).await? {
+        return Ok(KeySet::new(&[], &[]));
+    }
+    let ingress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.source_addr).await?;
+    let egress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.dest_addr).await?;
+    if ingress_key.is_empty() || egress_key.is_empty() {
+        return Ok(KeySet::new(&[], &[]));
+    }
+    Ok(KeySet::new(&ingress_key, &egress_key))
+}
+
+/// True if `pdesc` runs between the visa service and a node, in either direction: the flows
+/// of a node's core visas (`core_visas`).
+async fn is_node_vs_flow(asm: &Assembly, pdesc: &PacketDesc) -> Result<bool, ServiceError> {
+    let vs = asm.config.get_vs_addr();
+    let ft = &pdesc.five_tuple;
+    let other = if ft.source_addr == vs {
+        ft.dest_addr
+    } else if ft.dest_addr == vs {
+        ft.source_addr
+    } else {
+        return Ok(false);
+    };
+    let actor = asm.actor_mgr.get_actor_by_zpr_addr(&other).await?;
+    Ok(actor.is_some_and(|a| a.is_node()))
+}
+
 /// Gets public key as bytes.
 /// Returns empty bytes when the actor's key is not found.
 async fn a2a_dh_pubkey_bytes(asm: &Assembly, addr: &IpAddr) -> Result<Vec<u8>, ServiceError> {
@@ -1047,6 +1480,13 @@ fn to_forwarding_visa(mut visa: Visa, fwd_pep: FwdPep) -> Visa {
     visa
 }
 
+/// The node that hands off to `target_node` on `path`: the one before it, since the path runs
+/// in flow order. `None` if `target_node` is the ingress node or is not on the path at all.
+fn prev_hop_in_path<'a>(path: &'a [IpAddr], target_node: &IpAddr) -> Option<&'a IpAddr> {
+    let pos = path.iter().position(|n| n == target_node)?;
+    path.get(pos.checked_sub(1)?)
+}
+
 /// The node `target_node` hands off to on `path`: the next one along, since the path runs in
 /// flow order. `None` if `target_node` is the egress node or is not on the path at all.
 fn next_hop_in_path<'a>(path: &'a [IpAddr], target_node: &IpAddr) -> Option<&'a IpAddr> {
@@ -1058,7 +1498,6 @@ fn next_hop_in_path<'a>(path: &'a [IpAddr], target_node: &IpAddr) -> Option<&'a 
 mod tests {
     use super::*;
     use crate::db::{FakeDb, VisaRepo};
-    use crate::packet::make_fivetuple_tcp;
     use crate::test_helpers::{
         make_adapter_actor_defexp, make_node_actor_defexp, make_pdesc, make_visa,
     };
@@ -1116,462 +1555,6 @@ mod tests {
         assert_eq!(next_hop_in_path(&path, &unknown), None);
     }
 
-    #[tokio::test]
-    async fn test_get_node_visa_by_five_tuple_found() {
-        let mgr = make_mgr().await;
-        let node_addr: IpAddr = NODE_ADDR.parse().unwrap();
-        let visa = make_visa(1, std::time::Duration::from_secs(60));
-
-        let metadata = db::VisaMetadata::new(
-            node_addr.clone(),
-            0,
-            0,
-            "zpl".to_string(),
-            Direction::Forward,
-            None,
-            &make_pdesc(),
-        );
-
-        mgr.repo
-            .store_visa(&visa, metadata, db::NodeVisaState::Installed)
-            .await
-            .unwrap();
-
-        let ft = make_fivetuple_tcp(
-            SRC_ADDR.parse().unwrap(),
-            DST_ADDR.parse().unwrap(),
-            1234,
-            443,
-        )
-        .unwrap();
-
-        let result = mgr
-            .get_node_visa_by_five_tuple(&node_addr, &ft)
-            .await
-            .unwrap();
-
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().issuer_id, 1);
-    }
-
-    #[tokio::test]
-    async fn test_get_node_visa_by_five_tuple_not_found_empty() {
-        let mgr = make_mgr().await;
-        let node_addr: IpAddr = NODE_ADDR.parse().unwrap();
-
-        let ft = make_fivetuple_tcp(
-            SRC_ADDR.parse().unwrap(),
-            DST_ADDR.parse().unwrap(),
-            1234,
-            443,
-        )
-        .unwrap();
-
-        let result = mgr
-            .get_node_visa_by_five_tuple(&node_addr, &ft)
-            .await
-            .unwrap();
-
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_get_node_visa_by_five_tuple_wrong_ports() {
-        let mgr = make_mgr().await;
-        let node_addr: IpAddr = NODE_ADDR.parse().unwrap();
-        let visa = make_visa(2, std::time::Duration::from_secs(60));
-        let metadata = db::VisaMetadata::new(
-            node_addr.clone(),
-            0,
-            0,
-            "zpl".to_string(),
-            Direction::Forward,
-            None,
-            &make_pdesc(),
-        );
-
-        mgr.repo
-            .store_visa(&visa, metadata, db::NodeVisaState::Installed)
-            .await
-            .unwrap();
-
-        let ft = make_fivetuple_tcp(
-            SRC_ADDR.parse().unwrap(),
-            DST_ADDR.parse().unwrap(),
-            1234,
-            8080, // wrong dest_port
-        )
-        .unwrap();
-
-        let result = mgr
-            .get_node_visa_by_five_tuple(&node_addr, &ft)
-            .await
-            .unwrap();
-
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_get_node_visa_by_five_tuple_pending_not_matched() {
-        // Visas in PendingInstall state should not be returned.
-        let mgr = make_mgr().await;
-        let node_addr: IpAddr = NODE_ADDR.parse().unwrap();
-        let visa = make_visa(3, std::time::Duration::from_secs(60));
-        let metadata = db::VisaMetadata::new(
-            node_addr.clone(),
-            0,
-            0,
-            "zpl".to_string(),
-            Direction::Forward,
-            None,
-            &make_pdesc(),
-        );
-
-        mgr.repo
-            .store_visa(&visa, metadata, db::NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
-
-        let ft = make_fivetuple_tcp(
-            SRC_ADDR.parse().unwrap(),
-            DST_ADDR.parse().unwrap(),
-            1234,
-            443,
-        )
-        .unwrap();
-
-        let result = mgr
-            .get_node_visa_by_five_tuple(&node_addr, &ft)
-            .await
-            .unwrap();
-
-        assert!(result.is_none());
-    }
-
-    /// Callers that pass PendingInstall explicitly (the bootstrap-visa dedup) must match a
-    /// created-but-not-yet-delivered visa, otherwise they mint a duplicate on every pass.
-    #[tokio::test]
-    async fn test_find_node_visa_by_five_tuple_matches_pending_when_requested() {
-        let mgr = make_mgr().await;
-        let node_addr: IpAddr = NODE_ADDR.parse().unwrap();
-        let visa = make_visa(4, std::time::Duration::from_secs(60));
-        let metadata = db::VisaMetadata::new(
-            node_addr.clone(),
-            0,
-            0,
-            "zpl".to_string(),
-            Direction::Forward,
-            None,
-            &make_pdesc(),
-        );
-
-        mgr.repo
-            .store_visa(&visa, metadata, db::NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
-
-        let ft = make_fivetuple_tcp(
-            SRC_ADDR.parse().unwrap(),
-            DST_ADDR.parse().unwrap(),
-            1234,
-            443,
-        )
-        .unwrap();
-
-        let result = mgr
-            .find_node_visa_by_five_tuple(
-                &node_addr,
-                &ft,
-                &[
-                    db::NodeVisaState::Installed,
-                    db::NodeVisaState::PendingInstall,
-                ],
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(result.expect("pending visa should match").issuer_id, 4);
-    }
-
-    /// Stand up the minimum a bootstrap mint needs: one connected node, which the visa
-    /// service docks on. Returns that node's address, usable as `via_node`.
-    async fn add_vs_docking_node(asm: &Assembly) -> IpAddr {
-        let node_addr: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
-        asm.topo_mgr.add_node(node_addr).unwrap();
-        asm.actor_mgr
-            .hack_set_vs_docking_node(&node_addr)
-            .await
-            .unwrap();
-        node_addr
-    }
-
-    /// A bootstrap visa must be mintable for a peer that has no actor and no route of its
-    /// own -- that is the entire point, the link is not up yet. Going through the normal
-    /// visa request pipeline would deny NoRoute here. Also asserts the dedup: a second
-    /// call reuses the first visa rather than minting a duplicate.
-    #[tokio::test]
-    async fn test_vsapi_bootstrap_visa_for_future_peer_no_route_no_actor() {
-        let asm = crate::assembly::tests::new_assembly_for_tests(None).await;
-        let via_node = add_vs_docking_node(&asm).await;
-        // Never added to actor_mgr or topo_mgr: an unconnected peer.
-        let future_peer: IpAddr = "fd5a:5052:3000::7".parse().unwrap();
-
-        let visa = asm
-            .visa_mgr
-            .vsapi_bootstrap_visa_for_future_peer(
-                &asm,
-                &asm.policy_mgr.get_current(),
-                &future_peer,
-                &via_node,
-                Direction::Forward,
-            )
-            .await
-            .expect("bootstrap visa must not need a route from the peer itself");
-
-        let dock_pep = visa.dock_pep.as_ref().expect("full visa has a dock_pep");
-        assert_eq!(dock_pep.source_addr, future_peer);
-        assert_eq!(dock_pep.dest_addr, asm.config.get_vs_addr());
-        match &dock_pep.pep {
-            DockPepType::TCP(tpep) => {
-                assert_eq!(tpep.source_port, 0, "any source port");
-                assert_eq!(
-                    tpep.dest_port,
-                    asm.config.core.vsapi_port.unwrap_or(config::VSAPI_PORT)
-                );
-            }
-            other => panic!("expected a TCP dock pep, got {other:?}"),
-        }
-
-        // Stored pending-install against the peer, so its own worker installs it on connect.
-        let pending = asm
-            .visa_mgr
-            .get_pending_visa_ids_for_node(&future_peer)
-            .await
-            .unwrap();
-        assert_eq!(pending, vec![visa.issuer_id]);
-
-        let again = asm
-            .visa_mgr
-            .vsapi_bootstrap_visa_for_future_peer(
-                &asm,
-                &asm.policy_mgr.get_current(),
-                &future_peer,
-                &via_node,
-                Direction::Forward,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            again.issuer_id, visa.issuer_id,
-            "second call must reuse the pending visa, not mint a duplicate"
-        );
-    }
-
-    /// A peer with two connected neighbours gets one bootstrap visa per neighbour: the path is
-    /// baked into the visa, so sharing one would leave the second neighbour off it. Deduping
-    /// still holds per neighbour -- asking twice for the same relay reuses.
-    #[tokio::test]
-    async fn test_bootstrap_visa_is_per_relay_not_per_five_tuple() {
-        let asm = crate::assembly::tests::new_assembly_for_tests(None).await;
-        let via_a = add_vs_docking_node(&asm).await; // docks the VS
-        let via_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
-        let future_peer: IpAddr = "fd5a:5052:3000::7".parse().unwrap();
-
-        // via_b reaches the VS docking node through a link to via_a.
-        asm.topo_mgr.add_node(via_b).unwrap();
-        asm.topo_mgr
-            .add_link(via_a, via_b, LinkId("link-ab".into()), vec![], 1)
-            .unwrap();
-
-        let visa_a = asm
-            .visa_mgr
-            .vsapi_bootstrap_visa_for_future_peer(
-                &asm,
-                &asm.policy_mgr.get_current(),
-                &future_peer,
-                &via_a,
-                Direction::Forward,
-            )
-            .await
-            .unwrap();
-        let visa_b = asm
-            .visa_mgr
-            .vsapi_bootstrap_visa_for_future_peer(
-                &asm,
-                &asm.policy_mgr.get_current(),
-                &future_peer,
-                &via_b,
-                Direction::Forward,
-            )
-            .await
-            .unwrap();
-
-        assert_ne!(
-            visa_a.issuer_id, visa_b.issuer_id,
-            "each relay needs its own visa: one visa carries one path"
-        );
-
-        // Each visa hands off from the peer to its own relay, and stages that relay.
-        for (visa, via) in [(&visa_a, via_a), (&visa_b, via_b)] {
-            let md = asm
-                .visa_mgr
-                .repo
-                .get_visa_metadata_by_id(visa.issuer_id)
-                .unwrap();
-            let path = md.path.expect("bootstrap visa has an explicit path");
-            assert_eq!(path[0], future_peer, "the peer is the ingress node");
-            assert_eq!(path[1], via, "the peer hands off to its own relay");
-            assert_eq!(
-                asm.visa_mgr.repo.get_node_visa_state(visa.issuer_id, &via),
-                Some(db::NodeVisaState::PendingInstall),
-                "the relay on the path is staged"
-            );
-        }
-
-        // Dedup still applies per relay.
-        let again = asm
-            .visa_mgr
-            .vsapi_bootstrap_visa_for_future_peer(
-                &asm,
-                &asm.policy_mgr.get_current(),
-                &future_peer,
-                &via_b,
-                Direction::Forward,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            again.issuer_id, visa_b.issuer_id,
-            "same relay must reuse its visa, not mint another"
-        );
-    }
-
-    /// The relaying node is on the bootstrap visa's path, so it is staged PendingInstall too
-    /// and its install ack applies. Without that staging the ack would find no entry and the
-    /// VS would never learn the relay installed the visa.
-    #[tokio::test]
-    async fn test_bootstrap_visa_stages_the_relaying_node() {
-        let asm = crate::assembly::tests::new_assembly_for_tests(None).await;
-        let via_node = add_vs_docking_node(&asm).await;
-        let future_peer: IpAddr = "fd5a:5052:3000::7".parse().unwrap();
-
-        let visa = asm
-            .visa_mgr
-            .vsapi_bootstrap_visa_for_future_peer(
-                &asm,
-                &asm.policy_mgr.get_current(),
-                &future_peer,
-                &via_node,
-                Direction::Forward,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            asm.visa_mgr
-                .repo
-                .get_node_visa_state(visa.issuer_id, &via_node),
-            Some(db::NodeVisaState::PendingInstall),
-            "the relaying node must be staged for the visa it forwards"
-        );
-
-        asm.visa_mgr
-            .visa_installed(visa.issuer_id, &via_node)
-            .await
-            .unwrap();
-        assert_eq!(
-            asm.visa_mgr
-                .repo
-                .get_node_visa_state(visa.issuer_id, &via_node),
-            Some(db::NodeVisaState::Installed),
-            "the relay's install ack must apply"
-        );
-    }
-
-    /// The peer installs this visa as its own ingress node, so its copy must carry a
-    /// fwd_pep pointing at the neighbour that relays for it -- otherwise it has nowhere to
-    /// send its VSAPI traffic. The relaying neighbour must also be queued a copy.
-    #[tokio::test]
-    async fn test_vsapi_bootstrap_visa_actualizes_with_fwd_pep_to_via_node() {
-        let asm = crate::assembly::tests::new_assembly_for_tests(None).await;
-        let via_node = add_vs_docking_node(&asm).await;
-        let future_peer: IpAddr = "fd5a:5052:3000::9".parse().unwrap();
-
-        let visa = asm
-            .visa_mgr
-            .vsapi_bootstrap_visa_for_future_peer(
-                &asm,
-                &asm.policy_mgr.get_current(),
-                &future_peer,
-                &via_node,
-                Direction::Forward,
-            )
-            .await
-            .unwrap();
-        let md = asm
-            .visa_mgr
-            .get_visa_metadata_by_id(visa.issuer_id)
-            .await
-            .unwrap()
-            .expect("metadata for a just-created visa");
-        assert_eq!(
-            md.path,
-            Some(vec![future_peer, via_node]),
-            "path runs from the peer through its first hop to the VS docking node"
-        );
-
-        let actualized = asm
-            .visa_mgr
-            .actualize_visa_for_target_node(visa.clone(), &future_peer)
-            .await
-            .unwrap();
-        let fwd_pep = actualized
-            .fwd_pep
-            .as_ref()
-            .expect("the peer's copy must forward");
-        assert_eq!(fwd_pep.next_hop, via_node);
-
-        // The relaying neighbour needs its own copy to let the traffic through.
-        let pending = asm
-            .visa_mgr
-            .get_pending_visa_ids_for_node(&via_node)
-            .await
-            .unwrap();
-        assert!(pending.contains(&visa.issuer_id));
-    }
-
-    /// The mint must hold `bootstrap_lock` across its whole check-then-create. Two neighbours
-    /// minting for the same future peer would otherwise interleave at the DB awaits, both see
-    /// no visa, and mint duplicates. Holding the lock here has to stall a concurrent mint;
-    /// with the clock paused the timeout can only fire because the mint is blocked on it.
-    #[tokio::test(start_paused = true)]
-    async fn test_vsapi_bootstrap_visa_mint_is_serialized() {
-        let asm = crate::assembly::tests::new_assembly_for_tests(None).await;
-        let via_node = add_vs_docking_node(&asm).await;
-        let future_peer: IpAddr = "fd5a:5052:3000::8".parse().unwrap();
-
-        let guard = asm.visa_mgr.bootstrap_lock.lock().await;
-        // Named local: the future outlives the statement, so this cannot be a temporary.
-        let policy = asm.policy_mgr.get_current();
-        let mut mint = Box::pin(asm.visa_mgr.vsapi_bootstrap_visa_for_future_peer(
-            &asm,
-            &policy,
-            &future_peer,
-            &via_node,
-            Direction::Forward,
-        ));
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), &mut mint)
-                .await
-                .is_err(),
-            "mint must block while the bootstrap lock is held"
-        );
-
-        drop(guard);
-        mint.await.expect("mint completes once the lock is free");
-    }
-
     // --- actualize_visa_for_target_node tests ---
 
     // Path nodes used by actualize tests; distinct from the constants above.
@@ -1606,7 +1589,12 @@ mod tests {
             &make_pdesc(),
         );
         mgr.repo
-            .store_visa(&visa, metadata, db::NodeVisaState::PendingInstall)
+            .store_visa(
+                &visa,
+                metadata,
+                db::NodeVisaState::PendingInstall,
+                db::CommitState::Committed,
+            )
             .await
             .unwrap();
         visa
@@ -1629,7 +1617,12 @@ mod tests {
             &make_pdesc(),
         );
         mgr.repo
-            .store_visa(&visa, metadata, db::NodeVisaState::PendingInstall)
+            .store_visa(
+                &visa,
+                metadata,
+                db::NodeVisaState::PendingInstall,
+                db::CommitState::Committed,
+            )
             .await
             .unwrap();
         visa
@@ -1648,6 +1641,7 @@ mod tests {
             .unwrap();
         assert_eq!(result.issuer_id, 1);
         assert!(result.fwd_pep.is_none());
+        assert!(result.prev_hop.is_none(), "no path, no previous hop");
     }
 
     /// Path with only one node → visa returned unchanged.
@@ -1663,6 +1657,49 @@ mod tests {
             .unwrap();
         assert_eq!(result.issuer_id, 1);
         assert!(result.fwd_pep.is_none());
+        // A single-node visa never arrives by StreamIdRequest, so it names no
+        // previous hop (zl-zipline#245, g65 q2).
+        assert!(
+            result.prev_hop.is_none(),
+            "single-node visa, no previous hop"
+        );
+    }
+
+    /// Each node's copy names the node before it on the flow-order path as its previous
+    /// hop, which is the only node it may accept a StreamIdRequest for the visa from
+    /// (zl-zipline#245). The ingress node has none: the flow starts there. The reverse
+    /// visa stores its own flow order [C, B, A], so the roles and previous hops flip with it.
+    #[tokio::test]
+    async fn test_actualize_sets_prev_hop_from_flow_order_path() {
+        let mgr = make_mgr().await;
+        let a: IpAddr = PATH_NODE_A.parse().unwrap();
+        let b: IpAddr = PATH_NODE_B.parse().unwrap();
+        let c: IpAddr = PATH_NODE_C.parse().unwrap();
+        let mut reverse_path = three_node_path();
+        reverse_path.reverse();
+        let forward = store_test_visa(&mgr, 1, Some(three_node_path())).await;
+        let reverse = store_test_visa(&mgr, 2, Some(reverse_path)).await;
+
+        // (visa, target node, expected prev_hop): ingress, intermediary, egress per direction.
+        let cases = [
+            (&forward, a, None),
+            (&forward, b, Some(a)),
+            (&forward, c, Some(b)),
+            (&reverse, c, None),
+            (&reverse, b, Some(c)),
+            (&reverse, a, Some(b)),
+        ];
+        for (visa, node, expected) in cases {
+            let result = mgr
+                .actualize_visa_for_target_node(visa.clone(), &node)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.prev_hop, expected,
+                "visa {} actualized for {node}",
+                visa.issuer_id
+            );
+        }
     }
 
     /// Ingress context (first node + Forward) → full visa with fwd_pep pointing to the second path node.
@@ -1855,6 +1892,8 @@ mod tests {
         asm.topo_mgr
             .add_link(mid, dst, LinkId("link-mid-dst".into()), vec![], 1)
             .unwrap();
+        // MID carries SRC-DST traffic, so policy must list it as transit (zl-zipline#255).
+        asm.topo_mgr.set_transit_nodes(&[mid]);
         for (adapter, node, cn) in [
             (MH_SRC_ADAPTER, src, "mh-src-adapter"),
             (MH_DST_ADAPTER, dst, "mh-dst-adapter"),
@@ -1898,6 +1937,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -1935,6 +1975,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -1985,6 +2026,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2034,6 +2076,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2119,6 +2162,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2157,6 +2201,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + config::MAX_VISA_LIFETIME,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2180,7 +2225,10 @@ mod tests {
             None,
             &make_pdesc(),
         );
-        mgr.repo.store_visa(&visa, md, state).await.unwrap();
+        mgr.repo
+            .store_visa(&visa, md, state, db::CommitState::Committed)
+            .await
+            .unwrap();
     }
 
     /// visa_installed is a CAS: once the node is PendingRevoke (sweep denied it
@@ -2190,7 +2238,7 @@ mod tests {
         let mgr = make_mgr().await;
         let node: IpAddr = NODE_ADDR.parse().unwrap();
         store_node_visa(&mgr, 800, node, db::NodeVisaState::PendingInstall).await;
-        assert!(mgr.repo.record_deny_verdict(800, 1).await.unwrap());
+        assert!(mgr.repo.mark_visa_revoked(800).await.unwrap());
 
         mgr.visa_installed(800, &node).await.unwrap();
 
@@ -2201,29 +2249,134 @@ mod tests {
         assert_eq!(revoke_ids, vec![800]);
     }
 
-    /// revoke_acked drops the node ref and then removes the now-orphaned visa.
+    /// grant_copy (zl-zipline#248): a copy staged `PendingInstall` is granted (and becomes
+    /// `Installed`); one already `Installed` -- a VSS push delivered it first -- is granted
+    /// too (codex P2); a revoked copy, a quarantined visa or an unstaged node is refused.
     #[tokio::test]
-    async fn test_revoke_acked_removes_node_then_orphan_visa() {
+    async fn test_grant_copy() {
         let mgr = make_mgr().await;
         let node: IpAddr = NODE_ADDR.parse().unwrap();
-        store_node_visa(&mgr, 810, node, db::NodeVisaState::Installed).await;
-        assert!(mgr.repo.record_deny_verdict(810, 1).await.unwrap());
+        store_node_visa(&mgr, 830, node, db::NodeVisaState::PendingInstall).await;
+        assert!(mgr.grant_copy(830, &node).await.unwrap());
+        assert_eq!(
+            mgr.repo.get_node_visa_state(830, &node),
+            Some(db::NodeVisaState::Installed)
+        );
+        assert!(
+            mgr.grant_copy(830, &node).await.unwrap(),
+            "already installed"
+        );
 
-        mgr.revoke_acked(node, 810).await;
+        store_node_visa(&mgr, 831, node, db::NodeVisaState::PendingInstall).await;
+        assert!(mgr.mark_visa_revoked(831).await.unwrap());
+        assert!(!mgr.grant_copy(831, &node).await.unwrap(), "revoked");
+
+        store_node_visa(&mgr, 832, node, db::NodeVisaState::PendingInstall).await;
+        mgr.quarantine(832);
+        assert!(!mgr.grant_copy(832, &node).await.unwrap(), "quarantined");
+
+        let other: IpAddr = "fd5a:5052::99".parse().unwrap();
+        assert!(
+            !mgr.grant_copy(830, &other).await.unwrap(),
+            "not staged there"
+        );
+    }
+
+    /// zl-zipline#248 (codex pass 4, P1): a visa quarantined while the grant waits for the
+    /// install CAS -- a revocation whose write failed, leaving the copy `PendingInstall` --
+    /// is not handed out, whether the CAS then applies or a VSS push installed the copy
+    /// first.
+    #[tokio::test]
+    async fn test_a_copy_quarantined_while_the_grant_waits_is_not_handed_out() {
+        use crate::visareq_worker::race_gate;
+        let mgr = make_mgr().await;
+        let node: IpAddr = "fd5a:5052::248:4".parse().unwrap();
+        for (visa_id, pushed_meanwhile) in [(833u64, false), (834u64, true)] {
+            store_node_visa(&mgr, visa_id, node, db::NodeVisaState::PendingInstall).await;
+            let (parked, resume) = race_gate::arm(node, race_gate::Point::InsideGrant);
+            let grant = tokio::spawn({
+                let mgr = mgr.clone();
+                async move { mgr.grant_copy(visa_id, &node).await.unwrap() }
+            });
+            tokio::time::timeout(Duration::from_secs(5), parked.notified())
+                .await
+                .expect("the grant must pass its first withheld check");
+            race_gate::disarm(&node);
+            if pushed_meanwhile {
+                mgr.visa_installed(visa_id, &node).await.unwrap();
+            }
+            // The revocation's write failed: quarantined, the node state unchanged.
+            mgr.quarantine(visa_id);
+            resume.notify_one();
+            assert!(
+                !grant.await.unwrap(),
+                "visa {visa_id} (pushed meanwhile: {pushed_meanwhile}) is quarantined"
+            );
+        }
+    }
+
+    /// zl-zipline#248 (Copilot, VS#81): a copy that passed the fetch-by-ID check may
+    /// still go out after a revoke sent and acked meanwhile, so that ack is held and the
+    /// revoke sent once more: the copy's horizon is published before the check, not
+    /// only once the copy is built.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_revoke_acked_while_a_fetched_copy_is_built_is_held() {
+        use crate::visareq_worker::race_gate;
+        let mgr = make_mgr().await;
+        let node: IpAddr = "fd5a:5052::248:5".parse().unwrap();
+        let next: IpAddr = "fd5a:5052::248:6".parse().unwrap();
+        // A second hop keeps the visa alive when `node`'s copy is torn down.
+        store_path_visa(&mgr, 835, vec![node, next], db::NodeVisaState::Installed).await;
+        // Past the startup floor: only the fetch's own horizon can hold the ack.
+        tokio::time::advance(config::GRANT_HORIZON + Duration::from_secs(1)).await;
+
+        let (parked, resume) = race_gate::arm(node, race_gate::Point::AfterFetchCheck);
+        let fetch = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.visas_for_node_by_ids(&node, &[835]).await.unwrap() }
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the fetch must pass its check");
+        race_gate::disarm(&node);
+        assert!(mgr.mark_visa_revoked(835).await.unwrap());
+        mgr.revoke_acked(node, 835, Instant::now()).await;
+        resume.notify_one();
+
+        let fetched: Vec<u64> = fetch.await.unwrap().iter().map(|v| v.issuer_id).collect();
+        assert_eq!(fetched, vec![835], "the copy passed the check and goes out");
+        assert_eq!(
+            mgr.repo.get_node_visa_state(835, &node),
+            Some(db::NodeVisaState::PendingRevoke),
+            "the ack is held: the fetched copy may land after the revoke"
+        );
+    }
+
+    /// revoke_acked drops the node ref and then removes the now-orphaned visa (past the
+    /// startup floor of the grant horizon).
+    #[tokio::test(start_paused = true)]
+    async fn test_revoke_acked_removes_node_then_orphan_visa() {
+        let mgr = make_mgr().await;
+        tokio::time::advance(config::GRANT_HORIZON).await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        store_node_visa(&mgr, 810, node, db::NodeVisaState::Installed).await;
+        assert!(mgr.repo.mark_visa_revoked(810).await.unwrap());
+
+        mgr.revoke_acked(node, 810, Instant::now()).await;
 
         assert!(!mgr.visa_has_node_refs(810).await);
         assert!(mgr.repo.get_visa_by_id(810).is_err());
     }
 
-    /// revoke_acked misses when the node is not PendingRevoke (an allow verdict
-    /// canceled the revoke mid-RPC): the record survives.
+    /// revoke_acked misses when the node is not PendingRevoke: the record
+    /// survives.
     #[tokio::test]
     async fn test_revoke_acked_leaves_record_when_not_pending_revoke() {
         let mgr = make_mgr().await;
         let node: IpAddr = NODE_ADDR.parse().unwrap();
         store_node_visa(&mgr, 811, node, db::NodeVisaState::Installed).await;
 
-        mgr.revoke_acked(node, 811).await;
+        mgr.revoke_acked(node, 811, Instant::now()).await;
 
         assert!(mgr.repo.get_visa_by_id(811).is_ok());
         assert!(mgr.visa_has_node_refs(811).await);
@@ -2336,6 +2489,8 @@ mod tests {
         asm.topo_mgr
             .add_link(b, c, LinkId("bc".into()), vec![], 1)
             .unwrap();
+        // b carries a-c traffic, so policy must list it as transit (zl-zipline#255).
+        asm.topo_mgr.set_transit_nodes(&[b]);
         for (addr, cn) in [(a, "node-a"), (c, "node-c")] {
             asm.actor_mgr
                 .add_node(
@@ -2457,7 +2612,43 @@ mod tests {
     /// Store a visa across the path [a, b, c] (a is the requesting node, Installed;
     /// b and c PendingInstall).
     async fn store_multihop_visa(mgr: &VisaMgr, id: u64, a: IpAddr, b: IpAddr, c: IpAddr) {
+        store_path_visa(mgr, id, vec![a, b, c], db::NodeVisaState::Installed).await;
+    }
+
+    /// Store a visa across `path`, requested by its first node (the ingress), which is
+    /// left in `requester_state`; every other node on the path is PendingInstall.
+    async fn store_path_visa(
+        mgr: &VisaMgr,
+        id: u64,
+        path: Vec<IpAddr>,
+        requester_state: db::NodeVisaState,
+    ) {
         let visa = make_visa(id, Duration::from_secs(60));
+        let md = db::VisaMetadata::new(
+            path[0],
+            0,
+            0,
+            String::new(),
+            Direction::Forward,
+            Some(path),
+            &make_pdesc(),
+        );
+        mgr.repo
+            .store_visa(&visa, md, requester_state, db::CommitState::Committed)
+            .await
+            .unwrap();
+    }
+
+    /// Ingress last (gate g89 q4, ZODE_LINKS.md J11): on a three-node path [A, B, C] the
+    /// ingress A's pending copy is held back until B and C have both acknowledged theirs.
+    /// B and C are deliverable from the start.
+    #[tokio::test]
+    async fn test_ingress_copy_deliverable_only_after_every_other_node_installed() {
+        let mgr = make_mgr().await;
+        let a: IpAddr = "fd5a:5052::a".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::b".parse().unwrap();
+        let c: IpAddr = "fd5a:5052::c".parse().unwrap();
+        let visa = make_visa(820, Duration::from_secs(60));
         let md = db::VisaMetadata::new(
             a,
             0,
@@ -2468,9 +2659,164 @@ mod tests {
             &make_pdesc(),
         );
         mgr.repo
-            .store_visa(&visa, md, db::NodeVisaState::Installed)
+            .store_visa(
+                &visa,
+                md,
+                db::NodeVisaState::PendingInstall,
+                db::CommitState::Committed,
+            )
             .await
             .unwrap();
+        let has = |v: Vec<Visa>| v.iter().any(|v| v.issuer_id == 820);
+
+        assert!(has(mgr.deliverable_visas_for_node(&b).await.unwrap()));
+        assert!(has(mgr.deliverable_visas_for_node(&c).await.unwrap()));
+        assert!(!has(mgr.deliverable_visas_for_node(&a).await.unwrap()));
+
+        mgr.visa_installed(820, &b).await.unwrap();
+        assert!(
+            !has(mgr.deliverable_visas_for_node(&a).await.unwrap()),
+            "C has not acknowledged yet"
+        );
+
+        mgr.visa_installed(820, &c).await.unwrap();
+        assert!(has(mgr.deliverable_visas_for_node(&a).await.unwrap()));
+    }
+
+    /// A visa with no path has no ingress ordering: its one node gets it at once.
+    #[tokio::test]
+    async fn test_pathless_visa_is_deliverable_at_once() {
+        let mgr = make_mgr().await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        store_node_visa(&mgr, 821, node, db::NodeVisaState::PendingInstall).await;
+        let ready = mgr.deliverable_visas_for_node(&node).await.unwrap();
+        assert!(ready.iter().any(|v| v.issuer_id == 821));
+    }
+
+    // --- visas_for_node_by_ids (visaRequestById, zl-zipline#262) ---
+
+    /// The IDs of the visas `node` gets back when it fetches `ids` by ID.
+    async fn fetched_ids(mgr: &VisaMgr, node: &IpAddr, ids: &[u64]) -> Vec<u64> {
+        mgr.visas_for_node_by_ids(node, ids)
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v.issuer_id)
+            .collect()
+    }
+
+    /// The race of zl-zipline#262, made deterministic: on the path [relay, zb] the relay
+    /// requested the visa and holds its copy (Installed), while zb's copy still waits for
+    /// the VSS push (PendingInstall). The relay sends a Stream ID Request, so zb fetches
+    /// the visa by ID. zb is not the ingress, so the push would deliver its copy now, and
+    /// the fetch must too: zb's own copy, naming the relay as its previous hop.
+    #[tokio::test]
+    async fn test_fetch_by_id_returns_pending_non_ingress_copy() {
+        let mgr = make_mgr().await;
+        let relay: IpAddr = "fd5a:5052::a".parse().unwrap();
+        let zb: IpAddr = "fd5a:5052::b".parse().unwrap();
+        store_path_visa(&mgr, 1016, vec![relay, zb], db::NodeVisaState::Installed).await;
+
+        let visas = mgr.visas_for_node_by_ids(&zb, &[1016]).await.unwrap();
+
+        assert_eq!(visas.len(), 1, "zb must get its pending copy");
+        assert_eq!(visas[0].issuer_id, 1016);
+        assert_eq!(
+            visas[0].prev_hop,
+            Some(relay),
+            "zb's copy, actualized for zb"
+        );
+    }
+
+    /// Ingress last holds for the fetch as for the push (gate g89 q4): on [A, B, C] with
+    /// every copy pending, the ingress A cannot fetch its copy while B or C has not
+    /// acknowledged theirs. B and C can fetch theirs from the start.
+    #[tokio::test]
+    async fn test_fetch_by_id_ingress_copy_only_after_every_other_hop_installed() {
+        let mgr = make_mgr().await;
+        let a: IpAddr = "fd5a:5052::a".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::b".parse().unwrap();
+        let c: IpAddr = "fd5a:5052::c".parse().unwrap();
+        store_path_visa(&mgr, 1100, vec![a, b, c], db::NodeVisaState::PendingInstall).await;
+
+        assert_eq!(fetched_ids(&mgr, &b, &[1100]).await, vec![1100]);
+        assert_eq!(fetched_ids(&mgr, &c, &[1100]).await, vec![1100]);
+        assert!(fetched_ids(&mgr, &a, &[1100]).await.is_empty());
+
+        mgr.visa_installed(1100, &b).await.unwrap();
+        assert!(
+            fetched_ids(&mgr, &a, &[1100]).await.is_empty(),
+            "C has not acknowledged yet"
+        );
+
+        mgr.visa_installed(1100, &c).await.unwrap();
+        assert_eq!(fetched_ids(&mgr, &a, &[1100]).await, vec![1100]);
+    }
+
+    /// An Installed copy is fetchable: a pathless visa, and the requesting ingress's copy
+    /// while the other hops are still pending (ingress last holds back pending copies only).
+    #[tokio::test]
+    async fn test_fetch_by_id_returns_installed_copy() {
+        let mgr = make_mgr().await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        store_node_visa(&mgr, 1110, node, db::NodeVisaState::Installed).await;
+        assert_eq!(fetched_ids(&mgr, &node, &[1110]).await, vec![1110]);
+
+        let a: IpAddr = "fd5a:5052::a".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::b".parse().unwrap();
+        store_path_visa(&mgr, 1111, vec![a, b], db::NodeVisaState::Installed).await;
+        assert_eq!(fetched_ids(&mgr, &a, &[1111]).await, vec![1111]);
+    }
+
+    /// Nothing the node may not have is fetchable: a visa off its path, an unknown ID, a
+    /// copy being revoked (PendingRevoke), and a quarantined copy, even an Installed one.
+    #[tokio::test]
+    async fn test_fetch_by_id_withholds_off_path_unknown_revoked_and_quarantined() {
+        let mgr = make_mgr().await;
+        let a: IpAddr = "fd5a:5052::a".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::b".parse().unwrap();
+        let off_path: IpAddr = "fd5a:5052::dead".parse().unwrap();
+
+        store_path_visa(&mgr, 1120, vec![a, b], db::NodeVisaState::Installed).await;
+        assert!(fetched_ids(&mgr, &off_path, &[1120]).await.is_empty());
+        assert!(fetched_ids(&mgr, &b, &[9999]).await.is_empty());
+
+        store_path_visa(&mgr, 1121, vec![a, b], db::NodeVisaState::Installed).await;
+        mgr.mark_visa_revoked(1121).await.unwrap();
+        assert!(fetched_ids(&mgr, &a, &[1121]).await.is_empty());
+        assert!(fetched_ids(&mgr, &b, &[1121]).await.is_empty());
+
+        store_path_visa(&mgr, 1122, vec![a, b], db::NodeVisaState::Installed).await;
+        mgr.quarantine(1122);
+        assert!(fetched_ids(&mgr, &a, &[1122]).await.is_empty());
+        assert!(fetched_ids(&mgr, &b, &[1122]).await.is_empty());
+    }
+
+    /// The fetch is read-only (gate g121 q3): handing out a pending copy does not mark it
+    /// Installed. The VSS push stays the only acknowledged delivery, so ingress last still
+    /// waits on real acknowledgements.
+    #[tokio::test]
+    async fn test_fetch_by_id_changes_no_install_state() {
+        let mgr = make_mgr().await;
+        let a: IpAddr = "fd5a:5052::a".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::b".parse().unwrap();
+        let c: IpAddr = "fd5a:5052::c".parse().unwrap();
+        store_path_visa(&mgr, 1130, vec![a, b, c], db::NodeVisaState::PendingInstall).await;
+
+        for node in [a, b, c] {
+            mgr.visas_for_node_by_ids(&node, &[1130]).await.unwrap();
+        }
+
+        for node in [a, b, c] {
+            assert_eq!(
+                mgr.repo.get_node_visa_state(1130, &node),
+                Some(db::NodeVisaState::PendingInstall)
+            );
+        }
+        assert!(
+            fetched_ids(&mgr, &a, &[1130]).await.is_empty(),
+            "the ingress copy is still held back"
+        );
     }
 
     /// Multihop [A, B, C] visa; intermediary B departs. The visa's other nodes go
@@ -2521,10 +2867,339 @@ mod tests {
     }
 
     /// A node with no visas is a no-op.
+    /// A revocation whose state write fails quarantines the visa, as the link-down and
+    /// commit-time revocations do: it is never handed out meanwhile, and the next
+    /// pending-visa read retries the revocation.
+    #[tokio::test]
+    async fn test_failed_revoke_visa_ids_quarantines_the_visa() {
+        use crate::db::FaultMode;
+        use crate::test_helpers::{build_sweep_asm_with_db, create_routed_sweep_visa};
+        let (asm, node_a, db) = build_sweep_asm_with_db(true).await;
+        let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
+
+        db.set_set_ex_fault(FaultMode::Reject);
+        asm.visa_mgr.revoke_visa_ids(&[id]).await;
+        let pending = asm
+            .visa_mgr
+            .get_pending_visas_for_node(&node_a)
+            .await
+            .unwrap();
+        assert!(pending.iter().all(|v| v.issuer_id != id), "quarantined");
+
+        db.set_set_ex_fault(FaultMode::None);
+        asm.visa_mgr
+            .get_pending_visas_for_node(&node_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap(),
+            vec![id],
+            "the quarantine retry revoked it"
+        );
+    }
+
     #[tokio::test]
     async fn test_remove_visas_for_node_noop() {
         let mgr = make_mgr().await;
         let node: IpAddr = "fd5a:5052::beef".parse().unwrap();
         mgr.remove_visas_for_node(&node).await.unwrap();
+    }
+
+    /// One VSS heartbeat's revoke round for `node`, as `vss_worker::send_pending_revokes`
+    /// runs it, against a fake node holding the visa IDs in `held`: the node drops every
+    /// revoked ID (a revoke of an ID it does not hold is done, as in core) and acks all of
+    /// them. Returns the IDs sent.
+    async fn heartbeat_revokes(mgr: &VisaMgr, node: IpAddr, held: &mut HashSet<u64>) -> Vec<u64> {
+        let sent_at = Instant::now();
+        let ids = mgr
+            .get_pending_revoke_visa_ids_for_node(&node)
+            .await
+            .unwrap();
+        for id in &ids {
+            held.remove(id);
+            mgr.revoke_acked(node, *id, sent_at).await;
+        }
+        ids
+    }
+
+    /// zl-zipline#248 window 3: a grant built for `node` (`deliver` builds the copy and
+    /// records it handed out), then revoked; the fake node applies the revoke first (and
+    /// acks it), then the grant. Once the grant horizon has passed, the next heartbeat
+    /// sends the revoke once more and the node holds nothing.
+    async fn assert_overtaken_revoke_is_resent(mgr: &VisaMgr, visa: Visa, node: IpAddr) {
+        let id = visa.issuer_id;
+        // Built 20 s after start: its horizon outlasts the startup floor, so the hold
+        // must follow the copy's own horizon. (The test visa lives 60 s.)
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let copy = mgr
+            .actualize_visa_for_target_node(visa, &node)
+            .await
+            .unwrap();
+        mgr.visa_installed(id, &node).await.unwrap();
+        assert!(mgr.mark_visa_revoked(id).await.unwrap());
+
+        let mut held = HashSet::new();
+        assert_eq!(heartbeat_revokes(mgr, node, &mut held).await, vec![id]);
+        held.insert(copy.issuer_id); // the overtaken grant lands
+        assert!(
+            heartbeat_revokes(mgr, node, &mut held).await.is_empty(),
+            "inside the horizon the revoke is held back, not re-sent at once"
+        );
+
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert!(
+            heartbeat_revokes(mgr, node, &mut held).await.is_empty(),
+            "past the startup floor but inside the copy's horizon: still held back"
+        );
+        tokio::time::advance(config::GRANT_HORIZON - Duration::from_secs(15)).await;
+        assert_eq!(
+            heartbeat_revokes(mgr, node, &mut held).await,
+            vec![id],
+            "after the horizon the revoke is sent once more"
+        );
+        assert!(held.is_empty(), "the node holds nothing");
+        assert_eq!(
+            mgr.repo.get_node_visa_state(id, &node),
+            None,
+            "the second ack tears the node's copy down"
+        );
+        assert!(heartbeat_revokes(mgr, node, &mut held).await.is_empty());
+    }
+
+    /// Window 3 for a VS-API reply: the requester's copy.
+    #[tokio::test(start_paused = true)]
+    async fn test_revoke_overtaking_a_reply_grant_is_resent_after_the_horizon() {
+        let mgr = make_mgr().await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        store_node_visa(&mgr, 820, node, db::NodeVisaState::PendingInstall).await;
+        let visa = mgr.repo.get_visa_by_id(820).unwrap();
+        assert_overtaken_revoke_is_resent(&mgr, visa, node).await;
+    }
+
+    /// Window 3 for a VSS push (`distribute_visa_on_path`) racing a heartbeat revoke: an
+    /// on-path node's copy.
+    #[tokio::test(start_paused = true)]
+    async fn test_revoke_overtaking_a_pushed_grant_is_resent_after_the_horizon() {
+        let mgr = make_mgr().await;
+        let visa = store_test_visa(&mgr, 821, Some(three_node_path())).await;
+        assert_overtaken_revoke_is_resent(&mgr, visa, PATH_NODE_B.parse().unwrap()).await;
+    }
+
+    /// A revoke acked after the copy's horizon (and the startup floor) is torn down at
+    /// once: no second send.
+    #[tokio::test(start_paused = true)]
+    async fn test_revoke_acked_after_the_horizon_is_torn_down_at_once() {
+        let mgr = make_mgr().await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        store_node_visa(&mgr, 822, node, db::NodeVisaState::PendingInstall).await;
+        let visa = mgr.repo.get_visa_by_id(822).unwrap();
+        mgr.actualize_visa_for_target_node(visa, &node)
+            .await
+            .unwrap();
+        mgr.visa_installed(822, &node).await.unwrap();
+        // Past both the copy's horizon and the startup floor.
+        tokio::time::advance(config::GRANT_HORIZON + Duration::from_secs(1)).await;
+        assert!(mgr.mark_visa_revoked(822).await.unwrap());
+
+        let mut held = HashSet::new();
+        assert_eq!(heartbeat_revokes(&mgr, node, &mut held).await, vec![822]);
+        assert!(
+            mgr.repo.get_visa_by_id(822).is_err(),
+            "torn down at the first ack"
+        );
+        assert!(heartbeat_revokes(&mgr, node, &mut held).await.is_empty());
+    }
+
+    /// The startup floor: a copy handed out before a restart has no recorded horizon, so
+    /// for `GRANT_HORIZON` after start every ack is held back, and the revoke is sent once
+    /// more after it.
+    #[tokio::test(start_paused = true)]
+    async fn test_startup_floor_holds_back_an_early_ack() {
+        let mgr = make_mgr().await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        store_node_visa(&mgr, 823, node, db::NodeVisaState::Installed).await;
+        assert!(mgr.mark_visa_revoked(823).await.unwrap());
+
+        let mut held = HashSet::from([823]);
+        assert_eq!(heartbeat_revokes(&mgr, node, &mut held).await, vec![823]);
+        assert!(
+            mgr.repo.get_visa_by_id(823).is_ok(),
+            "an early ack is held back"
+        );
+        assert!(heartbeat_revokes(&mgr, node, &mut held).await.is_empty());
+
+        tokio::time::advance(config::GRANT_HORIZON + Duration::from_secs(1)).await;
+        assert_eq!(heartbeat_revokes(&mgr, node, &mut held).await, vec![823]);
+        assert!(mgr.repo.get_visa_by_id(823).is_err());
+    }
+
+    /// zl-zipline#248 (codex pass 2, P2): the horizon is judged by when the revoke was
+    /// sent, not when its ack is processed. A revoke sent while the copy may still land
+    /// may have been overtaken by the grant however late its ack is processed: it is held,
+    /// and sent once more.
+    #[tokio::test(start_paused = true)]
+    async fn test_revoke_sent_inside_the_horizon_is_held_however_late_its_ack() {
+        let mgr = make_mgr().await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        store_node_visa(&mgr, 825, node, db::NodeVisaState::PendingInstall).await;
+        // Built 20 s after start: the copy may land until 50 s. (The test visa lives 60 s.)
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let visa = mgr.repo.get_visa_by_id(825).unwrap();
+        mgr.actualize_visa_for_target_node(visa, &node)
+            .await
+            .unwrap();
+        mgr.visa_installed(825, &node).await.unwrap();
+        assert!(mgr.mark_visa_revoked(825).await.unwrap());
+
+        let sent_at = Instant::now();
+        assert_eq!(
+            mgr.get_pending_revoke_visa_ids_for_node(&node)
+                .await
+                .unwrap(),
+            vec![825]
+        );
+        // The ack is processed only after the copy's horizon.
+        tokio::time::advance(config::GRANT_HORIZON + Duration::from_secs(1)).await;
+        mgr.revoke_acked(node, 825, sent_at).await;
+
+        assert_eq!(
+            mgr.repo.get_node_visa_state(825, &node),
+            Some(db::NodeVisaState::PendingRevoke),
+            "a revoke sent inside the horizon is not torn down at its ack"
+        );
+        assert_eq!(
+            mgr.get_pending_revoke_visa_ids_for_node(&node)
+                .await
+                .unwrap(),
+            vec![825],
+            "it is sent once more, the horizon having passed"
+        );
+    }
+
+    /// zl-zipline#248 (codex pass 2, P1): a copy whose commit check refuses it after the
+    /// pending rows were read -- the revoke written, the visa left uncommitted, as
+    /// `create_visa` does -- is not handed out.
+    #[tokio::test]
+    async fn test_a_copy_refused_after_the_pending_snapshot_is_not_handed_out() {
+        use crate::visareq_worker::race_gate;
+        let mgr = make_mgr().await;
+        let node: IpAddr = "fd5a:5052::248:3".parse().unwrap();
+        let visa = make_visa(826, Duration::from_secs(60));
+        let md = db::VisaMetadata::new(
+            node,
+            0,
+            0,
+            String::new(),
+            Direction::Forward,
+            None,
+            &make_pdesc(),
+        );
+        mgr.repo
+            .store_visa(
+                &visa,
+                md,
+                db::NodeVisaState::PendingInstall,
+                db::CommitState::Pending,
+            )
+            .await
+            .unwrap();
+
+        let (parked, resume) = race_gate::arm(node, race_gate::Point::AfterPendingSnapshot);
+        let fetch = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.get_pending_visas_for_node(&node).await.unwrap() }
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the fetch must read the pending rows");
+        race_gate::disarm(&node);
+        // The commit check refuses the copy.
+        assert!(mgr.mark_visa_revoked(826).await.unwrap());
+        resume.notify_one();
+
+        assert!(
+            fetch.await.unwrap().is_empty(),
+            "the refused copy is not handed out"
+        );
+    }
+
+    /// Horizons are pruned by housekeeping, but only one grant horizon after their time
+    /// (codex pass 3, P2): a revoke sent inside a copy's horizon may have its ack
+    /// processed after the horizon, and must still find it.
+    #[tokio::test(start_paused = true)]
+    async fn test_purge_prunes_horizons_one_horizon_after_their_time() {
+        let mgr = make_mgr().await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        store_node_visa(&mgr, 824, node, db::NodeVisaState::PendingInstall).await;
+        let visa = mgr.repo.get_visa_by_id(824).unwrap();
+        mgr.actualize_visa_for_target_node(visa, &node)
+            .await
+            .unwrap();
+        tokio::time::advance(config::GRANT_HORIZON + Duration::from_secs(1)).await;
+        mgr.purge_expired_visas().unwrap();
+        assert_eq!(
+            mgr.horizons.lock().unwrap().handed_out.len(),
+            1,
+            "kept for one more horizon"
+        );
+        tokio::time::advance(config::GRANT_HORIZON).await;
+        mgr.purge_expired_visas().unwrap();
+        assert!(mgr.horizons.lock().unwrap().handed_out.is_empty());
+    }
+
+    /// The ack of a revoke sent inside the copy's horizon, processed after the horizon
+    /// and after a prune, is still held back (codex pass 3, P2): the revoke may have
+    /// overtaken the grant, so it is sent once more rather than torn down.
+    #[tokio::test(start_paused = true)]
+    async fn test_late_ack_of_a_revoke_sent_inside_the_horizon_survives_a_prune() {
+        let mgr = make_mgr().await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        // Past the startup floor, so only the copy's own horizon counts.
+        tokio::time::advance(config::GRANT_HORIZON + Duration::from_secs(1)).await;
+        store_node_visa(&mgr, 827, node, db::NodeVisaState::PendingInstall).await;
+        let visa = mgr.repo.get_visa_by_id(827).unwrap();
+        mgr.actualize_visa_for_target_node(visa, &node)
+            .await
+            .unwrap();
+        assert!(mgr.mark_visa_revoked(827).await.unwrap());
+        let sent_at = Instant::now();
+
+        tokio::time::advance(config::GRANT_HORIZON + Duration::from_secs(1)).await;
+        mgr.purge_expired_visas().unwrap();
+        mgr.revoke_acked(node, 827, sent_at).await;
+        assert_eq!(
+            mgr.repo.get_node_visa_state(827, &node),
+            Some(db::NodeVisaState::PendingRevoke),
+            "the copy is kept for the revoke to be sent once more"
+        );
+    }
+
+    /// Horizon pruning is throttled like the store's purge (codex pass 3, P2): every
+    /// node's heartbeat calls it, but it scans at most once per interval.
+    #[tokio::test(start_paused = true)]
+    async fn test_horizon_pruning_is_throttled() {
+        let mgr = make_mgr().await;
+        let node: IpAddr = NODE_ADDR.parse().unwrap();
+        store_node_visa(&mgr, 828, node, db::NodeVisaState::PendingInstall).await;
+        let visa = mgr.repo.get_visa_by_id(828).unwrap();
+        mgr.actualize_visa_for_target_node(visa, &node)
+            .await
+            .unwrap();
+        // Just before the entry may go: this purge scans and keeps it.
+        tokio::time::advance(2 * config::GRANT_HORIZON - Duration::from_millis(100)).await;
+        mgr.purge_expired_visas().unwrap();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        mgr.purge_expired_visas().unwrap();
+        assert_eq!(
+            mgr.horizons.lock().unwrap().handed_out.len(),
+            1,
+            "a purge inside the interval does not scan"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        mgr.purge_expired_visas().unwrap();
+        assert!(mgr.horizons.lock().unwrap().handed_out.is_empty());
     }
 }

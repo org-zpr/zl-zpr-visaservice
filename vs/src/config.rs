@@ -29,9 +29,10 @@ pub const EVENT_QUEUE_DEPTH: usize = 1024;
 // patch >= the minimum): pre-1.0, an advanced compiler minor means "probably
 // won't work with this visa service", so vs rejects it (zipline#114). This
 // constant therefore moves in lockstep with zplc's minor on every zplc minor
-// bump.
+// bump. 0.21 (zl-zipline#256): routes follow Policy.transitNodes, which a
+// 0.20 policy does not carry.
 pub const POLICY_MIN_COMPILER_MAJOR: u32 = 0;
-pub const POLICY_MIN_COMPILER_MINOR: u32 = 20;
+pub const POLICY_MIN_COMPILER_MINOR: u32 = 21;
 pub const POLICY_MIN_COMPILER_PATCH: u32 = 0;
 
 /// Retry hint (seconds) sent with `temporarilyUnavailable` when an OIDC
@@ -76,12 +77,82 @@ pub const VS_ZPR_ADDR: Ipv6Addr = Ipv6Addr::new(
 /// Maximum allowed clock skew allowed during node authentication, in seconds.
 pub const MAX_CLOCK_SKEW_SECS: u64 = 180;
 
+/// Lifetime of a visa-service-minted OIDC login nonce (`getLoginNonce`,
+/// zl-zipline#232), in seconds. Long enough for an interactive browser login.
+pub const LOGIN_NONCE_TTL_SECS: u64 = 300;
+
+/// Maximum number of unexpired outstanding login nonces one node actor session
+/// may hold; minting past it is refused with `quotaExceeded` (zl-zipline#232).
+pub const LOGIN_NONCE_MAX_PER_ACTOR: usize = 4;
+
+/// Retry hint (seconds) sent with `temporarilyUnavailable` when a node's login
+/// is refused because policy changed while it was authorized (zl-zipline#232).
+pub const LOGIN_POLICY_CHANGED_RETRY_SECS: u32 = 1;
+
+/// How long the visa service waits, after one end of a direct Zode link newly reports it
+/// `down`, before it sends `setTopology` to both ends again so the owner makes one more
+/// attempt (zl-zipline#268; ZODE_LINKS.md rules 6, 13 and 13a).
+///
+/// Why 5 s (operator, pd gate g149 q2):
+/// - A silent link is reported only once the Zodes' keep-alive gives up (3 s period, three
+///   misses: about 9-12 s), but a closed connection is reported at once. Waiting keeps the
+///   retry from landing in the same instant as the fault.
+/// - The two ends detect a silent link independently, up to one 3 s keep-alive period apart.
+///   5 s lets the second end's `down` coalesce into the pending re-proposal.
+/// - The owner then redials about once a second for its 10 s link-up window
+///   (`LINK_UP_WINDOW` in zl-zpr-core), so an outage that clears within about 15 s of the
+///   first `down` heals by itself. A longer one ends in `failed`, and rule 13a stops
+///   proposing the link until something about the pair changes.
+/// - Much longer only keeps the pair on the relay for no benefit.
+pub const LINK_REPROPOSE_DELAY: Duration = Duration::from_secs(5);
+
+/// How long every link of a Zode must stay down, after one of them is reported `down`,
+/// before the visa service treats the Zode as departed and removes it: its actor (and
+/// with it the services it provides), its router node, its VSS worker, its visas and its
+/// managed address (zl-zipline#284; ZODE_LINKS.md "Loss").
+///
+/// Why 10 s (operator, pd gate g193 q3):
+/// - A crashed Zode is noticed only once its peers' keep-alive gives up (about 9-12 s).
+///   With this grace and a DNS cache period of 30 s on top, a crashed service stops
+///   resolving within about 52 s, inside the 60 s the DNS demo allows. A 15 s grace would
+///   leave about 3 s of slack, a 5 s grace about 13 s.
+/// - Too short costs little: a Zode removed while still alive (a long partition) rejoins
+///   as `reset` on its own, losing only what any node `authenticate` drops anyway.
+/// - Too long only keeps a departed Zode visible to DNS and the admin API for longer.
+///
+/// A Zode that rejoins within the grace is kept: a rejoin always starts a new VS-API
+/// session, and the check removes only the session it was scheduled for.
+pub const ZODE_DEPARTURE_GRACE: Duration = Duration::from_secs(10);
+
 pub const MAX_VISA_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
 /// A visa must be valid for at least this long to be worth issuing. Below this the node
 /// install (see [VSS_START_DELAY]) plus the round trip eats the whole lifetime, and under
 /// one second the visa store's seconds-granularity TTL truncates to zero and drops it.
 pub const MIN_VISA_LIFETIME: Duration = Duration::from_secs(30);
+
+/// How long after the visa service builds a node's copy of a visa for delivery that copy
+/// may still reach the node and be installed there (zl-zipline#248). A revoke the node
+/// acknowledges inside this horizon may have overtaken the grant (the node treats a
+/// revoke of a visa it does not hold as done), so the visa service keeps the copy
+/// `PendingRevoke` and sends the revoke once more after the horizon (see
+/// `VisaMgr::revoke_acked`). For the first `GRANT_HORIZON` after start, every copy counts
+/// as inside its horizon: a reply sent just before a restart can still arrive.
+///
+/// The contract this relies on: a node discards a VS-API reply that arrives after its RPC
+/// timeout, and that timeout stays under `GRANT_HORIZON` (core: `DEFAULT_RPC_TIMEOUT`,
+/// 10 s). A VSS push is ordered with the revokes on its connection once sent.
+pub const GRANT_HORIZON: Duration = Duration::from_secs(30);
+
+/// How long before a trusted-service attribute expires the visa-request path re-queries
+/// its source (zl-zipline#275). A visa cannot outlive the attributes it was granted on,
+/// and one that would live under [MIN_VISA_LIFETIME] is denied, so an attribute refreshed
+/// only once expired would deny every request in its last [MIN_VISA_LIFETIME]. Refreshing
+/// in the last 45 s instead leaves a visa issued then more than the floor: the extra 15 s
+/// cover the refresh itself and the request round trip.
+///
+/// Must stay under `trusted_services::MIN_ATTRIBUTE_TTL` (checked at compile time there).
+pub const ATTRIBUTE_REFRESH_AHEAD: Duration = Duration::from_secs(MIN_VISA_LIFETIME.as_secs() + 15);
 
 pub const DEFAULT_AUTH_EXPIRATION: Duration = Duration::from_secs(4 * 60 * 60); // 4 hours
 
@@ -133,6 +204,11 @@ pub struct VSConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct CoreSection {
     /// The visa service bind address - this is a constant baked into entire ZPR system only override for testing.
+    ///
+    /// The VS-API and admin listeners bind it at startup, before ValKey. If
+    /// it is not an address on a local interface (or a listener port is in
+    /// use), `vs` logs the address and the OS error and exits with status 1
+    /// (zl-zipline#266). A listener that stops later also stops `vs`.
     pub vs_addr: Option<IpAddr>,
 
     /// VSAPI port used by nodes to talk to the visa service VS API.
@@ -460,28 +536,31 @@ mod test {
         let mut inner = Vec::new();
         capnp::serialize::write_message(&mut inner, &msg).unwrap();
 
-        // zplc at tip is 0.20.0: its containers must load.
-        let current = crate::test_helpers::make_container_bytes(0, 20, 0, &inner);
+        // zplc on feature/zodes is 0.21.0 (Policy.transitNodes is enforced,
+        // zl-zipline#227): its containers must load.
+        let current = crate::test_helpers::make_container_bytes(0, 21, 0, &inner);
         let loaded = libeval::pio::load_policy_from_container(
             &bytes::Bytes::from(current),
             &POLICY_MIN_VERSION,
         );
         assert!(
             loaded.is_ok(),
-            "a 0.20.0-compiled policy container must load against POLICY_MIN_VERSION {}: {:?}",
+            "a 0.21.0-compiled policy container must load against POLICY_MIN_VERSION {}: {:?}",
             POLICY_MIN_VERSION,
             loaded.err()
         );
 
         // The previous minor must be rejected — exact-minor matching.
-        let previous = crate::test_helpers::make_container_bytes(0, 19, 3, &inner);
+        // A 0.20.x container has no transitNodes: loaded, it would deny every
+        // multi-hop route as NoRoute instead of being refused.
+        let previous = crate::test_helpers::make_container_bytes(0, 20, 1, &inner);
         assert!(
             libeval::pio::load_policy_from_container(
                 &bytes::Bytes::from(previous),
                 &POLICY_MIN_VERSION
             )
             .is_err(),
-            "a 0.19.x-compiled policy container must be rejected by POLICY_MIN_VERSION {} (exact-minor match)",
+            "a 0.20.x-compiled policy container must be rejected by POLICY_MIN_VERSION {} (exact-minor match)",
             POLICY_MIN_VERSION
         );
     }

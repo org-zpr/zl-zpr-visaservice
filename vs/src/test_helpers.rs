@@ -24,7 +24,6 @@ use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, PacketDesc, TcpUdpPep, Vi
 use zpr::write_to::WriteTo;
 
 use crate::assembly::Assembly;
-use crate::assembly::tests::new_assembly_for_tests;
 use crate::error::{ResolverError, ServiceError};
 use crate::policy_mgr::DnsResolver;
 
@@ -525,20 +524,45 @@ pub fn make_oidc_policy_with_proxy_service(
 /// `service_id` in its [key::SERVICES] attribute, and the flow's dest port must
 /// be `port` (zipline#167 regression test).
 pub fn make_allow_policy_for_tcp_service(service_id: &str, port: u16) -> Vec<u8> {
+    make_allow_policy_for_tcp_services(&[(service_id, port)])
+}
+
+/// As [make_allow_policy_for_tcp_service], with one unconditional ALLOW
+/// communication policy per `(service_id, port)`.
+pub fn make_allow_policy_for_tcp_services(services: &[(&str, u16)]) -> Vec<u8> {
+    make_allow_tcp_policy(services, None)
+}
+
+/// As [make_allow_policy_for_tcp_service], with the ALLOW conditioned on the client
+/// actor's `cond_key` attribute equalling `cond_value`.
+pub fn make_allow_policy_for_tcp_service_with_client_cond(
+    service_id: &str,
+    port: u16,
+    cond_key: &str,
+    cond_value: &str,
+) -> Vec<u8> {
+    make_allow_tcp_policy(&[(service_id, port)], Some((cond_key, cond_value)))
+}
+
+/// Build the policy container for [make_allow_policy_for_tcp_services], with an
+/// optional `(key, value)` equality condition on the client of every com policy.
+fn make_allow_tcp_policy(services: &[(&str, u16)], client_cond: Option<(&str, &str)>) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
     {
         let mut policy_bldr = msg.init_root::<capnp_policy::policy::Builder>();
         policy_bldr.set_created("2024-01-01T00:00:00Z");
         policy_bldr.set_version(1);
         policy_bldr.set_metadata("");
-        let mut coms = policy_bldr.reborrow().init_com_policies(1);
-        let mut com = coms.reborrow().get(0);
-        com.set_allow(true);
-        com.set_service_id(service_id);
-        let mut scopes = com.reborrow().init_scope(1);
-        let mut scope = scopes.reborrow().get(0);
-        scope.set_protocol(6); // TCP
-        scope.init_port().set_port_num(port);
+        init_allow_tcp_com_policies(&mut policy_bldr, services);
+        if let Some((cond_key, cond_value)) = client_cond {
+            let mut coms = policy_bldr.reborrow().get_com_policies().unwrap();
+            for i in 0..coms.len() {
+                let mut cond = coms.reborrow().get(i).init_client_conds(1).get(0);
+                cond.set_key(cond_key);
+                cond.set_op(capnp_policy::AttrOp::Eq);
+                cond.init_value(1).set(0, cond_value);
+            }
+        }
     }
     let mut bytes = Vec::new();
     capnp::serialize::write_message(&mut bytes, &msg).unwrap();
@@ -548,6 +572,29 @@ pub fn make_allow_policy_for_tcp_service(service_id: &str, port: u16) -> Vec<u8>
         crate::config::POLICY_MIN_COMPILER_PATCH,
         &bytes,
     )
+}
+
+/// Write one unconditional ALLOW communication policy per `(service_id, port)` (TCP) into
+/// `policy_bldr`. Writes nothing for an empty `services`.
+fn init_allow_tcp_com_policies(
+    policy_bldr: &mut capnp_policy::policy::Builder<'_>,
+    services: &[(&str, u16)],
+) {
+    if services.is_empty() {
+        return;
+    }
+    let mut coms = policy_bldr
+        .reborrow()
+        .init_com_policies(services.len() as u32);
+    for (i, (service_id, port)) in services.iter().enumerate() {
+        let mut com = coms.reborrow().get(i as u32);
+        com.set_allow(true);
+        com.set_service_id(service_id);
+        let mut scopes = com.reborrow().init_scope(1);
+        let mut scope = scopes.reborrow().get(0);
+        scope.set_protocol(6); // TCP
+        scope.init_port().set_port_num(*port);
+    }
 }
 
 /// Build a policy container in which `service_id` (TCP `port`) is hosted by any
@@ -617,9 +664,9 @@ pub fn make_peering(node_a: IpAddr, node_b: IpAddr, link_id: &str, attrs: Vec<At
     Peering {
         link_id: link_id.to_string(),
         node_a,
-        substrate_a: NetAddr::new_for_ip_or_host(&node_a.to_string(), 0),
+        substrate_a: Some(NetAddr::new_for_ip_or_host(&node_a.to_string(), 0)),
         node_b,
-        substrate_b: NetAddr::new_for_ip_or_host(&node_b.to_string(), 0),
+        substrate_b: Some(NetAddr::new_for_ip_or_host(&node_b.to_string(), 0)),
         attributes: attrs,
     }
 }
@@ -627,14 +674,70 @@ pub fn make_peering(node_a: IpAddr, node_b: IpAddr, link_id: &str, attrs: Vec<At
 /// Build the container bytes of a policy whose topology is the given peerings
 /// (an empty slice gives a valid policy with no topology).
 pub fn policy_with_peerings(peerings: &[Peering]) -> Vec<u8> {
+    policy_with_peerings_and_node_cns(peerings, &[])
+}
+
+/// As [policy_with_peerings], plus one node join policy per `(zpr_addr, cn)`, in the shape
+/// the compiler emits for a node: match `device.zpr.adapter.cn eq <cn>` and
+/// `zpr.addr eq <zpr_addr>`, flagged `node`. This is what `Policy::node_cn_for_addr` reads.
+pub fn policy_with_peerings_and_node_cns(
+    peerings: &[Peering],
+    node_cns: &[(IpAddr, &str)],
+) -> Vec<u8> {
+    policy_with_peerings_cns_and_tcp_services(peerings, node_cns, &[])
+}
+
+/// As [policy_with_peerings_and_node_cns], plus one unconditional ALLOW communication policy
+/// per `(service_id, port)`, as in [make_allow_policy_for_tcp_services].
+pub fn policy_with_peerings_cns_and_tcp_services(
+    peerings: &[Peering],
+    node_cns: &[(IpAddr, &str)],
+    services: &[(&str, u16)],
+) -> Vec<u8> {
+    policy_with_peerings_cns_services_and_transit(peerings, node_cns, services, &[])
+}
+
+/// As [policy_with_peerings_cns_and_tcp_services], with `Policy.transitNodes` =
+/// `transit` (left unset when empty, which means no node is transit-capable).
+pub fn policy_with_peerings_cns_services_and_transit(
+    peerings: &[Peering],
+    node_cns: &[(IpAddr, &str)],
+    services: &[(&str, u16)],
+    transit: &[IpAddr],
+) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
     {
         let mut policy = msg.init_root::<capnp_policy::policy::Builder>();
         policy.reborrow().set_created("1970-01-01T00:00:00Z");
+        init_allow_tcp_com_policies(&mut policy, services);
         if !peerings.is_empty() {
             let mut topo = policy.reborrow().init_topology(peerings.len() as u32);
             for (i, p) in peerings.iter().enumerate() {
                 p.write_to(&mut topo.reborrow().get(i as u32));
+            }
+        }
+        if !node_cns.is_empty() {
+            let mut jps = policy.reborrow().init_join_policies(node_cns.len() as u32);
+            for (i, (addr, cn)) in node_cns.iter().enumerate() {
+                let mut jp = jps.reborrow().get(i as u32);
+                {
+                    let mut matches = jp.reborrow().init_match(2);
+                    let mut cn_cond = matches.reborrow().get(0);
+                    cn_cond.set_key(key::CN);
+                    cn_cond.set_op(capnp_policy::AttrOp::Eq);
+                    cn_cond.init_value(1).set(0, cn);
+                    let mut addr_cond = matches.reborrow().get(1);
+                    addr_cond.set_key(key::ZPR_ADDR);
+                    addr_cond.set_op(capnp_policy::AttrOp::Eq);
+                    addr_cond.init_value(1).set(0, addr.to_string());
+                }
+                jp.init_flags(1).set(0, capnp_policy::JoinFlag::Node);
+            }
+        }
+        if !transit.is_empty() {
+            let mut list = policy.reborrow().init_transit_nodes(transit.len() as u32);
+            for (i, addr) in transit.iter().enumerate() {
+                list.set(i as u32, addr.to_string());
             }
         }
     }
@@ -674,7 +777,24 @@ pub fn make_container_bytes(maj: u32, min: u32, patch: u32, policy: &[u8]) -> Ve
 /// The default (empty) policy denies everything (NoMatch), so with a route
 /// present the eval still denies — either way the sweep sees a deny.
 pub async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
-    let asm = new_assembly_for_tests(None).await;
+    let (asm, node_a, _db) = build_sweep_asm_with_db(with_link).await;
+    (asm, node_a)
+}
+
+/// As [build_sweep_asm], but also hands back the [crate::db::FakeDb] so a test can
+/// inject state-DB faults.
+pub async fn build_sweep_asm_with_db(
+    with_link: bool,
+) -> (Arc<Assembly>, IpAddr, Arc<crate::db::FakeDb>) {
+    let (asm, event_rx, db) = crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+    std::mem::forget(event_rx);
+    let (asm, node_a) = build_sweep_asm_on(asm, with_link).await;
+    (asm, node_a, db)
+}
+
+/// As [build_sweep_asm], on a caller-built assembly (e.g. one whose fake DB and
+/// event queue the test holds).
+pub async fn build_sweep_asm_on(asm: Assembly, with_link: bool) -> (Arc<Assembly>, IpAddr) {
     let node_a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
     let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
     asm.actor_mgr
@@ -719,6 +839,117 @@ pub async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
     (Arc::new(asm), node_a)
 }
 
+// ---- transit fixtures (zl-zipline#255) ----
+
+/// The third node of [build_transit_asm]: linked to both sweep nodes, so the only
+/// other way between them besides their direct link.
+pub const TRANSIT_NODE_C: &str = "fd5a:5052:3000::3";
+
+/// The sweep assembly ([build_sweep_asm], linked: A `::1` -- B `::2` over link `l`,
+/// adapters `::4000::a` on A and `::4000::b` on B) plus a connected node C
+/// ([TRANSIT_NODE_C]) linked to both, over `ac` and `cb`. Returns (asm, A, B, C).
+/// Nothing is transit-capable yet: that comes from policy ([transit_policy]).
+pub async fn build_transit_asm() -> (Arc<Assembly>, IpAddr, IpAddr, IpAddr) {
+    let (asm, a, b, c, _db) = build_transit_asm_with_db().await;
+    (asm, a, b, c)
+}
+
+/// As [build_transit_asm], but also hands back the [crate::db::FakeDb] so a test can
+/// inject state-DB faults.
+pub async fn build_transit_asm_with_db() -> (
+    Arc<Assembly>,
+    IpAddr,
+    IpAddr,
+    IpAddr,
+    Arc<crate::db::FakeDb>,
+) {
+    let (asm, node_a, db) = build_sweep_asm_with_db(true).await;
+    let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+    let node_c: IpAddr = TRANSIT_NODE_C.parse().unwrap();
+    asm.actor_mgr
+        .add_node(
+            &make_node_actor_defexp(TRANSIT_NODE_C, "nc", "10.0.0.3:3"),
+            false,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    asm.topo_mgr.add_node(node_c).unwrap();
+    asm.topo_mgr
+        .add_link(node_a, node_c, LinkId("ac".into()), vec![], 1)
+        .unwrap();
+    asm.topo_mgr
+        .add_link(node_c, node_b, LinkId("cb".into()), vec![], 1)
+        .unwrap();
+    (asm, node_a, node_b, node_c, db)
+}
+
+/// Container bytes of the policy for [build_transit_asm]: a node join policy per node
+/// with its CN (so a policy pass keeps all three connected and judges their links with
+/// those CNs), the three links `l`, `ac` and `cb`, and `transitNodes` = `transit`.
+pub fn transit_policy(transit: &[IpAddr]) -> Vec<u8> {
+    let (a, b, c) = transit_asm_nodes();
+    let peerings = [
+        make_peering(a, b, "l", vec![]),
+        make_peering(a, c, "ac", vec![]),
+        make_peering(c, b, "cb", vec![]),
+    ];
+    policy_with_peerings_cns_services_and_transit(
+        &peerings,
+        &[(a, "na"), (b, "nb"), (c, "nc")],
+        &[],
+        transit,
+    )
+}
+
+/// The nodes A, B and C of [build_transit_asm].
+fn transit_asm_nodes() -> (IpAddr, IpAddr, IpAddr) {
+    (
+        "fd5a:5052:3000::1".parse().unwrap(),
+        "fd5a:5052:3000::2".parse().unwrap(),
+        TRANSIT_NODE_C.parse().unwrap(),
+    )
+}
+
+/// Have every node of [build_transit_asm] report its links, the way link-state reports
+/// do. Under R14 a link is up only while both ends report it up. C reports A and B
+/// up; A and B report C up, and each other only if `direct_up`. So A--C and C--B end
+/// up, and A--B ends up or down as `direct_up` says.
+pub fn report_transit_asm_links(asm: &Assembly, direct_up: bool) {
+    use zpr::vsapi_types::{LinkState, LinkStateReport};
+    let (a, b, c) = transit_asm_nodes();
+    let cn_of = move |n: &IpAddr| {
+        [(a, "na"), (b, "nb"), (c, "nc")]
+            .iter()
+            .find(|(addr, _)| addr == n)
+            .map(|(_, cn)| cn.to_string())
+    };
+    let up = |cns: &[&str]| -> Vec<LinkStateReport> {
+        cns.iter()
+            .map(|cn| LinkStateReport {
+                peer_cn: cn.to_string(),
+                state: LinkState::Up,
+            })
+            .collect()
+    };
+    let (a_peers, b_peers) = if direct_up {
+        (up(&["nc", "nb"]), up(&["nc", "na"]))
+    } else {
+        (up(&["nc"]), up(&["nc"]))
+    };
+    for (reporter, peers) in [(c, up(&["na", "nb"])), (a, a_peers), (b, b_peers)] {
+        asm.topo_mgr.record_link_states_with_cns(
+            &asm.topo_mgr.ops_now(),
+            &reporter,
+            None,
+            peers,
+            &cn_of,
+        );
+    }
+    assert_eq!(asm.topo_mgr.link_up(&a, &b), direct_up);
+    assert!(asm.topo_mgr.link_up(&a, &c) && asm.topo_mgr.link_up(&c, &b));
+}
+
 /// Create a single-node visa held (PendingInstall) by `req` for the given
 /// five-tuple, seeded at `vinst`. Returns its id. Its path is `req` alone, so a
 /// sweep on the linked assembly sees the route move and revokes it; use
@@ -742,12 +973,25 @@ pub async fn create_routed_sweep_visa(asm: &Arc<Assembly>, req: &IpAddr, vinst: 
 
 /// Create the sweep visa (`::4000::a` -> `::4000::b`, TCP 80) held by `req` on
 /// `route`, seeded at `vinst`. Returns its id.
-async fn create_sweep_visa_on_route(
+pub async fn create_sweep_visa_on_route(
     asm: &Arc<Assembly>,
     req: &IpAddr,
     vinst: u64,
     route: &Route,
 ) -> u64 {
+    try_create_sweep_visa_on_route(asm, req, vinst, route)
+        .await
+        .unwrap()
+}
+
+/// As [create_sweep_visa_on_route], but returns the issuance result instead of
+/// unwrapping it.
+pub async fn try_create_sweep_visa_on_route(
+    asm: &Arc<Assembly>,
+    req: &IpAddr,
+    vinst: u64,
+    route: &Route,
+) -> Result<u64, crate::error::ServiceError> {
     let pdesc = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 1234, 80).unwrap();
     let hit = Hit::new_no_signal(0, Direction::Forward);
     let vwmd = asm
@@ -762,10 +1006,10 @@ async fn create_sweep_visa_on_route(
             0,
             vinst,
             SystemTime::now() + DEFAULT_EXPIRES,
+            asm.revocations.generation(),
         )
-        .await
-        .unwrap();
-    vwmd.visa.issuer_id
+        .await?;
+    Ok(vwmd.visa.issuer_id)
 }
 
 // ---- attribute-change sweep ----
@@ -841,6 +1085,24 @@ pub fn register_ts(asm: &Arc<Assembly>, attrs: &[(&str, &str)]) -> Arc<MutableTr
 /// Give the stored actor at `zpr_addr` an attribute from [TS_SOURCE], standing in for
 /// data the actor picked up from that source under the previous snapshot.
 pub async fn seed_source_attr(asm: &Arc<Assembly>, zpr_addr: &str, ts_key: &str, value: &str) {
+    seed_source_attr_expiring(
+        asm,
+        zpr_addr,
+        ts_key,
+        value,
+        SystemTime::now() + Duration::from_secs(600),
+    )
+    .await;
+}
+
+/// As [seed_source_attr], with the seeded attribute expiring at `expires`.
+pub async fn seed_source_attr_expiring(
+    asm: &Arc<Assembly>,
+    zpr_addr: &str,
+    ts_key: &str,
+    value: &str,
+    expires: SystemTime,
+) {
     let addr: IpAddr = zpr_addr.parse().unwrap();
     let mut actor = asm
         .actor_mgr
@@ -852,7 +1114,7 @@ pub async fn seed_source_attr(asm: &Arc<Assembly>, zpr_addr: &str, ts_key: &str,
         .add_attribute(
             AttributeSource::new(TS_SOURCE)
                 .builder(ts_key)
-                .expires_in(Duration::from_secs(600))
+                .expires(expires)
                 .value(value),
         )
         .unwrap();

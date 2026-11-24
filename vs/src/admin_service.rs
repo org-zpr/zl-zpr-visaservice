@@ -39,9 +39,8 @@ use crate::admin_apikeys::Permission;
 use crate::apikey::ApiKey;
 use crate::assembly::Assembly;
 use crate::counters::CounterType;
-use crate::db::Role;
+use crate::db::{Obligation, Role};
 use crate::error::ServiceError;
-use crate::event_mgr::VsEvent;
 use crate::logging::targets::ADMIN;
 use crate::policy_mgr::DEFAULT_POLICY_ID;
 use crate::visa_mgr::VisaMgr;
@@ -89,19 +88,21 @@ struct ProtocolDetails {
     dest_port: Option<u16>,
 }
 
-/// Blocking start of the admin server.
+/// Blocking start of the admin server on `listener`, which the caller has
+/// already bound and put into the listening state (zl-zipline#266: `main`
+/// binds it at startup so a bad `vs_addr` stops the process at once).
 /// TODO: Do I need a handle or something to stop this cleanly?
 pub async fn start_admin_server(
     key_file: &Path,
     cert_file: &Path,
-    listen: SocketAddr,
+    listener: TcpListener,
     asm: &Arc<Assembly>,
 ) {
     debug!(target: ADMIN, "admin service starting");
     let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
     serve(
         rustls_tls_acceptor(key_file, cert_file),
-        listen,
+        listener,
         shared_state,
     )
     .await;
@@ -223,12 +224,16 @@ fn admin_app(state: SharedState) -> Router {
         .with_state(state.clone())
 }
 
-async fn serve(tls_acceptor: TlsAcceptor, listen: SocketAddr, state: SharedState) {
+/// Accept admin HTTPS connections on `listener` and serve each one in its own
+/// task. An accept error is logged and retried after a short pause.
+async fn serve(tls_acceptor: TlsAcceptor, listener: TcpListener, state: SharedState) {
     let app = admin_app(state);
-    let listener = TcpListener::bind(listen).await.unwrap_or_else(|e| {
-        panic!("failed to bind admin https listener on {listen}: {e}");
-    });
-    info!(target: ADMIN, "admin https service listening on {listen} (TLS)");
+    match listener.local_addr() {
+        Ok(listen) => info!(target: ADMIN, "admin https service listening on {listen} (TLS)"),
+        Err(e) => {
+            info!(target: ADMIN, "admin https service listening (TLS); local address unknown: {e}")
+        }
+    }
 
     loop {
         let tower_service = app.clone();
@@ -349,14 +354,17 @@ async fn install_policy(
     {
         Ok(vinst) => {
             info!(target: ADMIN, "policy updated successfully, new vinst={vinst}");
-            // fire event!
-            let evt = VsEvent::PolicyUpdated(vinst);
-            if let Err(e) = rstate.asm.event_mgr.record_event(evt).await {
-                warn!(target: ADMIN, "failed to record policy updated event: {}", e);
-            }
+            // The install recorded its revocation obligation before it committed
+            // (zl-zipline#289); start the reconciler pass that satisfies it.
+            rstate.asm.event_mgr.kick_reconcile();
         }
         Err(e) => {
             error!(target: ADMIN, "failed to update policy: {}", e);
+            // The policy write may have landed although it returned an error (a lost
+            // reply): the reconciler publishes it then, or drops the obligation of a
+            // write that never landed (zl-zipline#290). Kick it now rather than at
+            // the next sweeper tick.
+            rstate.asm.event_mgr.kick_reconcile();
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -1015,21 +1023,36 @@ async fn flush_service_cache(
     debug!(target: ADMIN, "DELETE /admin/services/{}/cache", svc_id);
 
     // Clone the Arcs and drop the read guard before awaiting the flush.
-    let (ts_mgr, event_mgr) = {
+    let (ts_mgr, event_mgr, revocations) = {
         let rstate = state.read().await;
-        (rstate.asm.ts_mgr.clone(), rstate.asm.event_mgr.clone())
+        (
+            rstate.asm.ts_mgr.clone(),
+            rstate.asm.event_mgr.clone(),
+            rstate.asm.revocations.clone(),
+        )
     };
+    if !ts_mgr.has_source(&svc_id) {
+        return StatusCode::NOT_FOUND;
+    }
 
-    match ts_mgr.flush_one(&svc_id).await {
+    // The reloaded data can make live visas unacceptable: record the obligation
+    // durably before the reload, and hold its guard across it (zl-zipline#289). A
+    // failed record fails the request: nothing would re-check the visas.
+    let obligation = match revocations.begin(Obligation::attributes(Vec::new())).await {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!(target: ADMIN, "could not record the revocation obligation for flushing {}: {}", svc_id, e);
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+    let flushed = ts_mgr.flush_one(&svc_id).await;
+    drop(obligation);
+    // Kick whatever the outcome: a failed reload may have changed part of the data.
+    event_mgr.kick_reconcile();
+
+    match flushed {
         Ok(()) => {
-            // The flush itself is done. If the event cannot be queued we lose only the
-            // sweep of existing visas -- new visa decisions are still protected by the
-            // per-actor revision check. The event carries no source id (the reconcile
-            // is unscoped), so name the source here where it is known.
-            info!(target: ADMIN, "flushed trusted service {}, queueing revalidation", svc_id);
-            if let Err(e) = event_mgr.record_event(VsEvent::TrustedServiceChange).await {
-                error!(target: ADMIN, "flushed trusted service {} but could not queue revalidation: {}", svc_id, e);
-            }
+            info!(target: ADMIN, "flushed trusted service {}, revalidation queued", svc_id);
             StatusCode::ACCEPTED
         }
         Err(ServiceError::TrustedServiceNotFound(_)) => StatusCode::NOT_FOUND,
@@ -1130,18 +1153,30 @@ async fn service_changed(
     };
 
     // Clone the Arcs and drop the read guard before awaiting.
-    let (ts_mgr, event_mgr, actor_mgr) = {
+    let (ts_mgr, event_mgr, actor_mgr, revocations) = {
         let rstate = state.read().await;
         (
             rstate.asm.ts_mgr.clone(),
             rstate.asm.event_mgr.clone(),
             rstate.asm.actor_mgr.clone(),
+            rstate.asm.revocations.clone(),
         )
     };
 
     if !ts_mgr.has_source(&svc_id) {
         return StatusCode::NOT_FOUND;
     }
+
+    // The changed data can make live visas unacceptable: record the obligation
+    // durably before marking anything stale, and hold its guard until the marks are
+    // done (zl-zipline#289). A failed record fails the request.
+    let obligation = match revocations.begin(Obligation::attributes(Vec::new())).await {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!(target: ADMIN, "could not record the revocation obligation for the change to {}: {}", svc_id, e);
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
 
     match identities {
         // "Everything changed": same effect as DELETE .../cache.
@@ -1201,11 +1236,8 @@ async fn service_changed(
         }
     }
 
-    // Same failure posture as flush_service_cache: losing the event loses only
-    // the sweep of existing visas; new decisions still hit the revision check.
-    if let Err(e) = event_mgr.record_event(VsEvent::TrustedServiceChange).await {
-        error!(target: ADMIN, "trusted service {} change recorded but could not queue revalidation: {}", svc_id, e);
-    }
+    drop(obligation);
+    event_mgr.kick_reconcile();
     StatusCode::ACCEPTED
 }
 
@@ -1427,11 +1459,16 @@ async fn add_revoke(
 }
 
 /// Stringify a substrate address as a parseable `host:port`. IPv6 hosts get bracketed
-/// (`[fd5a:5052::1]:5000`); IPv4 and hostname forms are left plain.
-fn stringify_netaddr(addr: &NetAddr) -> String {
-    match &addr.host {
-        NetworkHost::Ip(ip) => SocketAddr::new(*ip, addr.port).to_string(),
-        NetworkHost::Hostname(h) => format!("{}:{}", h, addr.port),
+/// (`[fd5a:5052::1]:5000`); IPv4 and hostname forms are left plain. An address that policy
+/// does not give (`None`: the relay observes it, zl-zipline#264) is the empty string,
+/// which no parser of this API can mistake for an address.
+fn stringify_netaddr(addr: Option<&NetAddr>) -> String {
+    match addr {
+        None => String::new(),
+        Some(addr) => match &addr.host {
+            NetworkHost::Ip(ip) => SocketAddr::new(*ip, addr.port).to_string(),
+            NetworkHost::Hostname(h) => format!("{}:{}", h, addr.port),
+        },
     }
 }
 
@@ -1473,8 +1510,8 @@ async fn get_network(
                 let mut bldr =
                     NodeConnection::builder(node_addr.clone(), peer.remote_zpr_addr.clone())
                         .link_id(peer.link_id.clone())
-                        .node_a_substrate(stringify_netaddr(&peer.local_substrate))
-                        .node_b_substrate(stringify_netaddr(&peer.remote_substrate));
+                        .node_a_substrate(stringify_netaddr(peer.local_substrate.as_ref()))
+                        .node_b_substrate(stringify_netaddr(peer.remote_substrate.as_ref()));
 
                 if let Ok(link_desc) = psnap
                     .policy()
@@ -1515,7 +1552,9 @@ async fn get_network(
             let mut matched = false;
             for (i, nc) in topo.iter_mut().enumerate() {
                 if nc.is_link_between(&node_addr, &peer_addr) {
-                    if i < declared {
+                    // A link that link-state reports put down stays in the router
+                    // graph (zl-zipline#224) but is not UP.
+                    if i < declared && rstate.asm.topo_mgr.link_up(&node_addr, &peer_addr) {
                         nc.set_status(ConnectionType::UP);
                     }
                     matched = true;
@@ -1940,6 +1979,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2123,6 +2163,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2138,6 +2179,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2153,6 +2195,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2479,6 +2522,7 @@ mod tests {
                 policy_version,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2535,6 +2579,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2589,6 +2634,7 @@ mod tests {
                 0,
                 0,
                 SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+                asm.revocations.generation(),
             )
             .await
             .unwrap();
@@ -2699,6 +2745,49 @@ mod tests {
             assert_eq!(nc.node_a_substrate, format!("[{}]:0", nc.node_a_addr));
             assert_eq!(nc.node_b_substrate, format!("[{}]:0", nc.node_b_addr));
             assert_eq!(nc.link_attrs.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    /// A declared link whose link-state reports put it down is DOWN, even though it
+    /// stays in the router graph (zl-zipline#224).
+    async fn test_get_network_link_reported_down_is_down() {
+        use libeval::route::LinkId;
+
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let addr_a: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let addr_b: IpAddr = "fd5a:5052::11".parse().unwrap();
+        install_ab_peering(&asm, addr_a, addr_b).await;
+        for (addr, cn) in [("fd5a:5052::10", "node-a"), ("fd5a:5052::11", "node-b")] {
+            asm.actor_mgr
+                .add_node(
+                    &make_node_actor_defexp(addr, cn, "[fd5a:5052::100]:1234"),
+                    false,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        asm.topo_mgr.add_node(addr_a).unwrap();
+        asm.topo_mgr.add_node(addr_b).unwrap();
+        asm.topo_mgr
+            .add_link(addr_a, addr_b, LinkId("link-ab".into()), vec![], 1)
+            .unwrap();
+        // A reports an empty snapshot: its link to B is not up.
+        asm.topo_mgr.record_link_states_with_cns(
+            &asm.topo_mgr.ops_now(),
+            &addr_a,
+            None,
+            vec![],
+            &|_: &IpAddr| None,
+        );
+
+        let details = fetch_network(&asm).await;
+
+        assert_eq!(details.network.len(), 1);
+        for nc in &details.network {
+            assert!(nc.is_link_between(&addr_a, &addr_b));
+            assert!(matches!(nc.ctype, ConnectionType::DOWN));
         }
     }
 
@@ -2994,9 +3083,26 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 1);
         // The revalidation of existing visas is queued for the event worker.
+        assert_obligation_recorded_and_kicked(&asm, &mut event_rx).await;
+    }
+
+    /// A trusted-service change recorded one attribute revocation obligation and
+    /// kicked the reconciler (zl-zipline#289).
+    async fn assert_obligation_recorded_and_kicked(
+        asm: &Arc<Assembly>,
+        event_rx: &mut tokio::sync::mpsc::Receiver<crate::event_mgr::VsEvent>,
+    ) {
+        let pending = asm.revocations.start_pass().await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "one obligation must be pending: {:?}",
+            *pending
+        );
+        assert_eq!(pending[0].1.kind, crate::db::ObligationKind::Attributes);
         match event_rx.try_recv() {
-            Ok(VsEvent::TrustedServiceChange) => {}
-            other => panic!("expected TrustedServiceChange event, got {other:?}"),
+            Ok(crate::event_mgr::VsEvent::Reconcile) => {}
+            other => panic!("expected a Reconcile kick, got {other:?}"),
         }
     }
 
@@ -3122,10 +3228,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 1);
-        match event_rx.try_recv() {
-            Ok(VsEvent::TrustedServiceChange) => {}
-            other => panic!("expected TrustedServiceChange event, got {other:?}"),
-        }
+        assert_obligation_recorded_and_kicked(&asm, &mut event_rx).await;
     }
 
     /// A targeted body forgets the listed actor's revision for this source
@@ -3177,10 +3280,7 @@ mod tests {
         );
         // Targeted notification does NOT flush the whole service.
         assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 0);
-        match event_rx.try_recv() {
-            Ok(VsEvent::TrustedServiceChange) => {}
-            other => panic!("expected TrustedServiceChange event, got {other:?}"),
-        }
+        assert_obligation_recorded_and_kicked(&asm, &mut event_rx).await;
     }
 
     /// Malformed bodies are 400 (zipline#79): non-JSON, an unknown field, and
@@ -4344,10 +4444,11 @@ mod tests {
 #[cfg(test)]
 mod e2e_actor_guard {
     use std::collections::HashMap;
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::IpAddr;
     use std::path::Path;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
+    use tokio::net::TcpListener;
 
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -4494,18 +4595,10 @@ mod e2e_actor_guard {
     /// writes out) and return the base URL plus a client trusting that cert.
     /// The server is verified up and serving OUR cert before this returns.
     ///
-    /// Port selection under cargo's parallel test harness is inherently racy:
-    /// the OS-assigned probe listener must be dropped before
-    /// `start_admin_server` re-binds the port, and another test or process can
-    /// claim it in that gap, panicking the server task. `start_admin_server`
-    /// takes only a `SocketAddr` — threading a pre-bound listener through it
-    /// would be a production-code change, and zipline#33 is docs-and-tests
-    /// only — so instead the race is made detectable-and-retryable here: a
-    /// lost bind panics the spawned task, `JoinHandle::is_finished()` exposes
-    /// that, and the loop probes a fresh port. A successful response on the
-    /// cert-pinned client proves the port is served by THIS server (no other
-    /// process holds this test's freshly generated key), so the returned base
-    /// URL can never point at a foreign squatter.
+    /// `start_admin_server` takes an already-bound listener (zl-zipline#266),
+    /// so the port is bound here on `127.0.0.1:0` and handed over: no other
+    /// test or process can claim it in between. (Before #266 the server bound
+    /// a `SocketAddr` itself and this helper had to retry a probe-port race.)
     async fn start_real_admin_server(asm: &Arc<Assembly>, dir: &Path) -> (String, reqwest::Client) {
         let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let cert_path = dir.join("admin-tls-cert.pem");
@@ -4519,46 +4612,33 @@ mod e2e_actor_guard {
             .build()
             .unwrap();
 
-        for _ in 0..10 {
-            // Ephemeral port: bind-and-release, then hand it to the real server.
-            let port = {
-                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                probe.local_addr().unwrap().port()
-            };
-            let listen: SocketAddr = SocketAddr::from(([127, 0, 0, 1], port));
-            let asm = asm.clone();
-            let (key_path, cert_path) = (key_path.clone(), cert_path.clone());
-            let handle = tokio::spawn(async move {
-                start_admin_server(&key_path, &cert_path, listen, &asm).await;
-            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let asm = asm.clone();
+        let handle = tokio::spawn(async move {
+            start_admin_server(&key_path, &cert_path, listener, &asm).await;
+        });
 
-            let base = format!("https://127.0.0.1:{port}");
-            for _ in 0..250 {
-                if handle.is_finished() {
-                    // The bind panicked: something else claimed the port in
-                    // the probe-to-bind gap. Retry with a fresh port.
-                    break;
-                }
-                // Any HTTP status back (401 — no API key) proves the TLS
-                // server on `port` presented our pinned cert; a connect or
-                // handshake error means not up yet (or a foreign squatter,
-                // in which case our task's bind panic ends the inner loop).
-                if client
-                    .get(format!("{base}/admin/stats"))
-                    .send()
-                    .await
-                    .is_ok()
-                {
-                    return (base, client);
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+        let base = format!("https://127.0.0.1:{port}");
+        for _ in 0..250 {
             assert!(
-                handle.is_finished(),
-                "admin server on {base} neither served nor failed within 5s"
+                !handle.is_finished(),
+                "admin server task on {base} ended before it served"
             );
+            // Any HTTP status back (401 — no API key) proves the TLS server
+            // on `port` presented our pinned cert; a connect or handshake
+            // error means not up yet.
+            if client
+                .get(format!("{base}/admin/stats"))
+                .send()
+                .await
+                .is_ok()
+            {
+                return (base, client);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("could not win a free port for the admin server in 10 attempts");
+        panic!("admin server on {base} did not serve within 5s");
     }
 
     /// GET `url` with the API key, retrying while the server task binds.

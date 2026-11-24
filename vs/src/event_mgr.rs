@@ -3,7 +3,6 @@
 //! are not able to report back success/failure to the "caller".
 
 use futures::future::join_all;
-use futures::stream::{self, StreamExt};
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -13,16 +12,17 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use zpr::vsapi::v1::DisconnectReason;
-use zpr::vsapi_types::ServiceDescriptor;
 
 use libeval::eval::EvalContext;
 
-use crate::actor_attributes::refresh_actors;
+use crate::actor_attributes::{refresh_actors, restamp_node_services};
 use crate::assembly::Assembly;
+use crate::db::{Obligation, ObligationKind};
 use crate::error::ServiceError;
 use crate::logging::targets::EVENT;
 use crate::policy_mgr::PolicySnapshot;
-use crate::visa_reconciler::{SweepReason, revalidate_visas};
+use crate::topology_mgr::TopoOps;
+use crate::visa_reconciler::revalidate_visas;
 
 #[derive(Debug)]
 pub enum VsEvent {
@@ -33,15 +33,11 @@ pub enum VsEvent {
     /// EventManager takes care of state updates.
     ActorLeaves(IpAddr, DisconnectReason),
 
-    /// Indicates that policy has been successfully updated. Pass the new `vinst`.
-    PolicyUpdated(u64),
-
-    /// The attribute data behind a trusted service changed (an admin refreshed it).
-    /// Handler reconciles *all* stale or TTL-expired trusted attributes on the actors
-    /// behind live visas, then re-checks those visas. Deliberately not scoped to the
-    /// source that changed: `stale_sources_for_actor` already narrows the fetch to
-    /// sources whose revision actually moved, so a source id would buy nothing.
-    TrustedServiceChange,
+    /// Revocation obligations may be pending (zl-zipline#289): run one reconciler pass,
+    /// [reconcile_obligations]. Queued after every write that records an obligation, by
+    /// the auth-expiry sweeper's loop and at startup. It carries nothing: the pass reads
+    /// the obligations from the state DB, so a lost or duplicate kick is harmless.
+    Reconcile,
 }
 
 #[derive(Clone)]
@@ -52,6 +48,23 @@ pub struct EventMgr {
 impl EventMgr {
     pub fn new(event_queue: mpsc::Sender<VsEvent>) -> Self {
         EventMgr { event_queue }
+    }
+
+    /// Non-blocking enqueue; false when the queue is full. Test-only: lets a
+    /// test fill the bounded queue.
+    #[cfg(test)]
+    pub fn try_record_event_for_tests(&self, event: VsEvent) -> bool {
+        self.event_queue.try_send(event).is_ok()
+    }
+
+    /// Ask the event worker for a reconciler pass ([VsEvent::Reconcile]) without
+    /// waiting: safe under any lock and from the event worker itself. A full queue
+    /// drops the kick, which is harmless -- the obligations stay in the state DB and
+    /// the auth-expiry sweeper's loop kicks again.
+    pub fn kick_reconcile(&self) {
+        if self.event_queue.try_send(VsEvent::Reconcile).is_err() {
+            debug!(target: EVENT, "event queue full; the next sweeper tick re-kicks the reconciler");
+        }
     }
 
     pub async fn record_event(&self, event: VsEvent) -> Result<(), ServiceError> {
@@ -78,17 +91,210 @@ pub async fn launch(asm: Arc<Assembly>, mut event_rx: mpsc::Receiver<VsEvent>) {
                     error!(target: EVENT, "failed to handle actor leave event: {}", e);
                 }
             }
-            VsEvent::PolicyUpdated(vinst) => {
-                if let Err(e) = handle_policy_updated(&asm, vinst).await {
-                    error!(target: EVENT, "failed to handle policy updated event: {}", e);
-                }
-            }
-            VsEvent::TrustedServiceChange => {
-                handle_trusted_service_change(&asm).await;
-            }
+            VsEvent::Reconcile => reconcile_obligations(&asm).await,
         }
     }
     info!(target: EVENT, "event manager shutting down");
+}
+
+/// One reconciler pass (zl-zipline#289; see [crate::revocation] for the invariant).
+///
+/// Starts a pass on the ledger (waiting out every writer holding an obligation
+/// guard, so every listed obligation's write has landed), then satisfies the
+/// listed obligations with one sweep under the current state, and deletes them only
+/// if every step completed. Anything short of that leaves the work pending; the
+/// auth-expiry sweeper's loop kicks the next pass. Runs on the event worker only,
+/// so passes never overlap. The pass ends when `pending` drops, on every path out
+/// (a panic included): only then does the generation turn even again
+/// ([crate::revocation::Pass]), so a visa request overlapping any part of the pass
+/// is refused at commit.
+pub(crate) async fn reconcile_obligations(asm: &Arc<Assembly>) {
+    let pending = match asm.revocations.start_pass().await {
+        Ok(pending) => pending,
+        Err(e) => {
+            error!(target: EVENT, "failed to list revocation obligations: {e}");
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let seqs: Vec<u64> = pending.iter().map(|(seq, _)| *seq).collect();
+    match satisfy_obligations(asm, &pending).await {
+        PassOutcome::Satisfied => {}
+        PassOutcome::SweepPending => {
+            // The policy step completed: running it again would re-push the policy
+            // and move the re-authentication deadline out on every retry. Leave
+            // only the sweep pending, as one attribute obligation naming every
+            // listed actor, recorded before the listed ones are deleted.
+            let actors: Vec<IpAddr> = pending
+                .iter()
+                .flat_map(|(_, ob)| ob.actors.iter().copied())
+                .collect();
+            if let Err(e) = asm.revocations.begin(Obligation::attributes(actors)).await {
+                error!(target: EVENT, "failed to record the pending sweep: {e}; the policy step will run again");
+                return;
+            }
+            warn!(target: EVENT, "the visa sweep did not complete; left pending for the next sweeper tick");
+        }
+        PassOutcome::Pending => {
+            warn!(target: EVENT, "{} revocation obligation(s) left pending; the next sweeper tick retries", pending.len());
+            return;
+        }
+    }
+    if let Err(e) = asm.revocations.complete(&seqs).await {
+        // Harmless: the next pass repeats the work and deletes them then.
+        error!(target: EVENT, "failed to delete revocation obligations: {e}");
+    }
+}
+
+/// How far a pass got ([satisfy_obligations]).
+enum PassOutcome {
+    /// Everything completed: the listed obligations are satisfied.
+    Satisfied,
+    /// The policy step completed, a later step did not: only the sweep is left.
+    SweepPending,
+    /// Nothing that can be kept completed: all of it is left pending.
+    Pending,
+}
+
+/// The work of one pass over `pending`, in order:
+/// 0. a policy obligation's policy is published first ([catch_up_policy]); one whose
+///    install never stored its policy is satisfied with nothing to do;
+/// 1. if any other obligation is a policy install, the policy pass ([policy_pass])
+///    against the current policy;
+/// 2. the attribute refresh of the actors behind live visas, then the sweep of every
+///    live visa ([revalidate_visas]) -- an actor without a live visa is re-checked
+///    lazily, by the revision check on its next visa request; every refresh must be
+///    persisted and the sweep must record every verdict under a policy generation that did not move meanwhile (a sweep
+///    under a superseded generation applies no revocations, so a newer install's
+///    pass has to decide);
+/// 3. every visa of an actor an obligation names that no longer exists is revoked:
+///    the sweep skips visas whose actor it cannot resolve, and an actor is gone when
+///    a failed write cleaned it up or an undo removed it.
+async fn satisfy_obligations(asm: &Arc<Assembly>, pending: &[(u64, Obligation)]) -> PassOutcome {
+    let Some(published) = catch_up_policy(asm, pending).await else {
+        return PassOutcome::Pending;
+    };
+    // A policy obligation whose vinst is still above the published one belongs to an
+    // install whose write never landed: it changed nothing, so it is satisfied
+    // without a policy pass (which would move the re-authentication deadline).
+    let landed = |ob: &Obligation| ob.vinst.is_none_or(|vinst| vinst <= published);
+    let never_landed = pending.iter().filter(|(_, ob)| !landed(ob)).count();
+    if never_landed > 0 {
+        info!(target: EVENT, "reconcile: dropping {never_landed} policy obligation(s) whose install was never stored");
+    }
+    if never_landed == pending.len() {
+        return PassOutcome::Satisfied;
+    }
+    let policy_step = pending
+        .iter()
+        .any(|(_, ob)| ob.kind == ObligationKind::Policy && landed(ob));
+    if policy_step {
+        match policy_pass(asm).await {
+            Ok(true) => {}
+            // A newer install committed during the refresh; its pass applies.
+            Ok(false) => return PassOutcome::Pending,
+            Err(e) => {
+                error!(target: EVENT, "policy pass failed: {e}");
+                return PassOutcome::Pending;
+            }
+        }
+    }
+    let unfinished = if policy_step {
+        PassOutcome::SweepPending
+    } else {
+        PassOutcome::Pending
+    };
+
+    // One snapshot for the refresh and the sweep. The refresh writes the actors'
+    // attributes back before the sweep re-reads them; after a policy pass it costs
+    // nothing more (only stale actors are fetched).
+    let psnap = asm.policy_mgr.get_current_snapshot();
+    let (refreshed, unresolved, failed) =
+        refresh_actors(asm, live_visa_actor_addrs(asm).await).await;
+    info!(
+        target: EVENT,
+        "reconcile: actors refreshed={refreshed} unresolved={unresolved} failed={}",
+        failed.len()
+    );
+    // ponytail: a full sweep of every live visa per pass; sweep only the visas
+    // touching the obligations' actors if sweeps get costly.
+    let failures = revalidate_visas(asm, &psnap).await;
+    // A refresh that failed left that actor's old claims in the store, and the sweep
+    // judged it on them: keep the work pending until the refresh lands.
+    if failures > 0
+        || !failed.is_empty()
+        || asm.policy_mgr.get_current_snapshot().vinst() != psnap.vinst()
+    {
+        return unfinished;
+    }
+
+    if revoke_visas_of_vanished_actors(asm, pending).await {
+        PassOutcome::Satisfied
+    } else {
+        unfinished
+    }
+}
+
+/// Step 0 of [satisfy_obligations] (zl-zipline#290): a policy obligation completes
+/// only once the policy it names is published. If the published vinst is below the
+/// highest vinst a listed policy obligation names, catch up with the store
+/// ([crate::policy_mgr::PolicyMgr::catch_up_with_store]): publish a policy whose
+/// write landed but was never published. Returns the published vinst after that,
+/// or `None` if the catch-up failed (everything stays pending).
+async fn catch_up_policy(asm: &Arc<Assembly>, pending: &[(u64, Obligation)]) -> Option<u64> {
+    if let Some(target) = pending.iter().filter_map(|(_, ob)| ob.vinst).max()
+        && let Err(e) = asm.policy_mgr.catch_up_with_store(target).await
+    {
+        error!(target: EVENT, "reconcile: failed to catch up with the stored policy: {e}");
+        return None;
+    }
+    Some(asm.policy_mgr.get_current_snapshot().vinst())
+}
+
+/// Step 3 of [satisfy_obligations]: revoke every visa of each actor named in
+/// `pending` that no longer exists. False if an actor lookup or the visa listing
+/// failed.
+async fn revoke_visas_of_vanished_actors(
+    asm: &Arc<Assembly>,
+    pending: &[(u64, Obligation)],
+) -> bool {
+    let mut vanished = Vec::new();
+    for addr in pending.iter().flat_map(|(_, ob)| ob.actors.iter()) {
+        match asm.actor_mgr.get_actor_by_zpr_addr(addr).await {
+            Ok(Some(_)) => {}
+            Ok(None) => vanished.push(*addr),
+            Err(e) => {
+                warn!(target: EVENT, "reconcile: failed to look up actor {addr}: {e}");
+                return false;
+            }
+        }
+    }
+    vanished.sort();
+    vanished.dedup();
+    if vanished.is_empty() {
+        return true;
+    }
+    info!(target: EVENT, "reconcile: revoking the visas of vanished actors {vanished:?}");
+    // A visa whose revoke cannot be recorded is quarantined in memory for retry
+    // ([crate::visa_mgr::VisaMgr::revoke_visa_ids]), which a restart loses, and the
+    // sweep skips it (its actor is gone): keep the obligation until it is persisted.
+    match asm
+        .visa_mgr
+        .remove_visas_for_vanished_actors(&vanished)
+        .await
+    {
+        Ok(0) => true,
+        Ok(quarantined) => {
+            warn!(target: EVENT, "reconcile: {quarantined} revoke(s) of vanished actors' visas not persisted; kept pending");
+            false
+        }
+        Err(e) => {
+            warn!(target: EVENT, "reconcile: failed to revoke the visas of vanished actors: {e}");
+            false
+        }
+    }
 }
 
 /// TODO: Does not do anything yet.
@@ -107,49 +313,91 @@ async fn handle_actor_leaves(
     Ok(())
 }
 
-/// Re-push the current auth-services list to all connected nodes. The list is the
-/// policy's OIDC identity providers (see `ActorMgr::get_auth_services_list`), so it
-/// can only change when policy does.
-async fn push_auth_services_all_nodes(asm: &Arc<Assembly>) -> Result<(), ServiceError> {
-    let auth_services = asm.actor_mgr.get_auth_services_list(asm.clone()).await?;
-    set_services_all_nodes(asm, &auth_services).await
-}
-
-/// Helper to use the VSS on all connected nodes to update the auth services list.
-async fn set_services_all_nodes(
-    asm: &Arc<Assembly>,
-    service_set: &[ServiceDescriptor],
-) -> Result<(), ServiceError> {
-    let node_list = asm.actor_mgr.list_node_addrs().await.unwrap_or_default();
-
-    // Make RPC calls to the nodes in parallel.
-
-    stream::iter(node_list)
-        .for_each_concurrent(None, |naddr| {
-            let asm = asm.clone();
-            let service_list: Vec<ServiceDescriptor> = service_set.to_vec();
-            async move {
-                debug!(
-                    target: EVENT,
-                    "attempting to use VSS to set_services on node {naddr}"
-                );
-                if let Some(vss_h) = asm.vss_mgr.get_handle(&naddr) {
-                    if let Err(e) = vss_h.set_services(service_list).await {
-                        error!(
-                            target: EVENT,
-                            "failed to set_services on node {}: {}",
-                            naddr,
-                            e
-                        );
-                    }
-                }
+/// Send `setTopology` from `psnap` to every node in `nodes` that has a VSS worker, in
+/// parallel. A node without one is skipped (it gets topology when its worker starts).
+/// Failures are logged. Never call this under a [TopoOps]: it waits on node RPCs.
+pub(crate) async fn send_topology_to(asm: &Assembly, psnap: &PolicySnapshot, nodes: &[IpAddr]) {
+    let futs = nodes.iter().filter_map(|naddr| {
+        asm.vss_mgr.get_handle(naddr).map(|vss_handle| async move {
+            if let Err(e) = vss_handle.set_topology(psnap.clone()).await {
+                error!(target: EVENT, "failed to set topology for node {}: {}", naddr, e);
             }
         })
-        .await;
-    Ok(())
+    });
+    join_all(futs).await;
 }
 
-async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), ServiceError> {
+/// Push a policy pass's results to each of `node_addrs` over its VSS: the node's
+/// topology under `psnap`, then the current auth-services list (OIDC providers are
+/// declared in policy, so it can change with it), then -- if `request_reauth` -- the
+/// request to re-authenticate the node and its docked adapters (zipline#123).
+///
+/// One detached task per node (g101): a node whose VSS is slow or unreachable, where
+/// every call waits out its RPC timeout, delays only its own pushes, never the policy
+/// pass or the install queued behind it. A node's calls keep their order. Two passes'
+/// tasks for one node may interleave, which is harmless: a `setTopology` or
+/// `setServices` command makes the node's worker re-send the current topology and
+/// services list at its next heartbeat, and a second re-auth request only repeats
+/// the first.
+///
+/// Failures are logged. The deadline rule in `auth_sweep` re-sends a re-auth request
+/// to whoever still owes, so a missed one costs one sweep period, not the obligation.
+async fn push_policy_to_nodes(
+    asm: &Arc<Assembly>,
+    psnap: &PolicySnapshot,
+    node_addrs: &[IpAddr],
+    request_reauth: bool,
+) {
+    if node_addrs.is_empty() {
+        return;
+    }
+    let services = match asm.actor_mgr.get_auth_services_list(asm.clone()).await {
+        Ok(services) => Some(services),
+        Err(e) => {
+            error!(target: EVENT, "failed to refresh auth services after policy update: {e}");
+            None
+        }
+    };
+    for &naddr in node_addrs {
+        // A node without a worker gets all of this when its worker starts.
+        let Some(vss) = asm.vss_mgr.get_handle(&naddr) else {
+            continue;
+        };
+        let psnap = psnap.clone();
+        let services = services.clone();
+        let asm = asm.clone();
+        tokio::spawn(async move {
+            if let Err(e) = vss.set_topology(psnap).await {
+                error!(target: EVENT, "failed to set topology for node {naddr}: {e}");
+            }
+            if let Some(services) = services {
+                if let Err(e) = vss.set_services(services).await {
+                    error!(target: EVENT, "failed to set_services on node {naddr}: {e}");
+                }
+            }
+            if request_reauth {
+                let mut addrs = vec![naddr];
+                match asm.actor_mgr.get_adapters_connected_to_node(&naddr).await {
+                    Ok(adapters) => addrs.extend(adapters),
+                    Err(e) => {
+                        error!(target: EVENT, "failed to list adapters of node {naddr}: {e}");
+                    }
+                }
+                debug!(target: EVENT, "requesting re-authentication of {} actor(s) via node {naddr}", addrs.len());
+                if let Err(e) = vss.request_auths(addrs).await {
+                    error!(target: EVENT, "failed to request_auths on node {naddr}: {e}");
+                }
+            }
+        });
+    }
+}
+
+/// The policy step of a reconciler pass ([satisfy_obligations]): bring nodes,
+/// links, transit and the re-authentication obligation in line with the current
+/// policy. Returns `Ok(false)` when a newer policy was installed during the
+/// attribute refresh (nothing applied; that install's own obligation drives the
+/// next pass). The visa sweep is not part of it: the caller runs it next.
+async fn policy_pass(asm: &Arc<Assembly>) -> Result<bool, ServiceError> {
     /*
     When we get here we have already updated policy.
 
@@ -162,20 +410,25 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
           - TO BE SAFE: expire auth from all services - force re-auth of all existing services (after removing non-existing ones)
      */
 
-    // Grab one consistent policy snapshot and use it for the entire synchronize-to-policy
-    // pass below, so revalidation and per-node link computation all read the same view.
-    let psnap = asm.policy_mgr.get_current_snapshot();
-
-    // PolicyUpdated(vinst) is a trigger, not a guarantee that this handler reconciles that
-    // exact revision. If updates queue faster than we process them we reconcile against the
-    // latest snapshot.
-    let snapshot_vinst = psnap.vinst();
-    if snapshot_vinst != vinst {
-        info!(
-            target: EVENT,
-            "policy update event called with vinst={vinst}, using current snapshot vinst={snapshot_vinst}"
-        );
+    // Which nodes may pass traffic through comes from the current policy
+    // (zl-zipline#255). Transit the policy takes away is withdrawn first, under its own
+    // short topology guard, before anything fallible or slow: an error below leaves
+    // the rest to the next pass, the actor refresh can take long, and until this runs the
+    // router would keep routing through a node the policy no longer lets carry
+    // traffic. Transit the policy grants waits for the link reconciliation in
+    // `policy_pass_locked`. A newer policy's own pass applies its set again, so a
+    // superseded pass does no harm here.
+    {
+        let ops = asm.topo_mgr.ops().await;
+        withdraw_policy_transit(asm, &ops, &asm.policy_mgr.get_current_snapshot()).await;
     }
+
+    // The snapshot for the attribute and hostname reconciliation below. The
+    // topology part of the pass re-reads it under the topology operation lock, and
+    // everything from there on (node validity, links, re-auth obligation, visa sweep)
+    // uses that one consistent view.
+    let psnap = asm.policy_mgr.get_current_snapshot();
+    let snapshot_vinst = psnap.vinst();
 
     // Reconcile attributes before anything reads them. Both consumers below --
     // node revalidation and the visa sweep -- evaluate actors exactly as stored, so
@@ -190,13 +443,14 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // actor in the set, sequentially -- an N x M synchronous fan-out on the event
     // handler's critical path. Once services are network-backed and actor/visa counts
     // are large this is going to be an issue.
-    let connected_node_addrs = asm.actor_mgr.list_node_addrs().await?;
+    // (The live-node set used for topology is read again under the topology lock below.)
     let mut refresh_set = live_visa_actor_addrs(asm).await;
-    refresh_set.extend(connected_node_addrs.iter().copied());
-    let (refreshed, unresolved, failed) = refresh_actors(asm, refresh_set).await;
+    refresh_set.extend(asm.actor_mgr.list_node_addrs().await?);
+    let (refreshed, unresolved, unrefreshed) = refresh_actors(asm, refresh_set).await;
     info!(
         target: EVENT,
-        "policy updated vinst={vinst}: actors refreshed={refreshed} unresolved={unresolved} failed={failed}"
+        "policy pass vinst={snapshot_vinst}: actors refreshed={refreshed} unresolved={unresolved} failed={}",
+        unrefreshed.len()
     );
 
     // Reconcile hostname claims against the new policy's service-name set
@@ -219,67 +473,30 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         error!(target: EVENT, "failed to reconcile hostname claims after policy update: {e}");
     }
 
-    // The new policy may invalidate some existing nodes.
-    let (valid_node_addrs, invalid_node_addrs) =
-        revalidate_nodes(asm, &psnap, connected_node_addrs).await;
-
-    // Disconnect the nodes that are no longer approved by the new policy.
-    for naddr in &invalid_node_addrs {
-        info!(target: EVENT, "connected node {naddr} is no longer approved by policy, disconnecting");
-        // Note that the following disconnect call will also update the topology manager.
-        if let Err(e) = asm
-            .cc
-            .disconnect(asm.clone(), *naddr, DisconnectReason::Admin)
-            .await
-        {
-            error!(target: EVENT, "error processing disconnect of {naddr}: {e}");
-            // In this case we do not send an actor-leaves event.
-            // What is the state of our topology manager now?
-            // Visa service is porbably hosed.
-        }
+    // Topology operation (TopoOps invariant): one guard spans every read that
+    // decides this pass's topology writes -- the policy generation, the live-node set
+    // and node validity -- through the disconnects, the link reconciliation and the
+    // revocations it calls for. A node that disconnects or connects meanwhile is
+    // either fully before or fully after it.
+    let ops = asm.topo_mgr.ops().await;
+    let locked = policy_pass_locked(asm, &ops, snapshot_vinst, &unrefreshed).await;
+    drop(ops);
+    let LockedPass::Applied {
+        psnap,
+        valid_node_addrs,
+        stopped_workers,
+        reconciled,
+    } = locked?
+    else {
+        return Ok(false);
+    };
+    // The VSS workers of the nodes disconnected, or cut off, under the guard are
+    // stopped now that it is released, before any reconciliation error is returned:
+    // those nodes are gone either way. The stop does not wait on the worker (g101).
+    for (vss, naddr) in stopped_workers {
+        crate::connection_control::ConnectionControl::stop_vss_worker(vss, &naddr);
     }
-
-    // Only do these steps if we managed to get a set of connected nodes. If
-    // there actually are no nodes connected at the moment, then topology should
-    // have been (or will soon be) updated via other code paths.  The purpose of
-    // updating the topology when presented with a new policy is to verify that
-    // existing links are still allowed, and send out peer messages.
-    if !valid_node_addrs.is_empty() {
-        info!(target: EVENT, "policy updated vinst={vinst}: revalidating topology ({} nodes)", valid_node_addrs.len());
-        let report = asm
-            .topo_mgr
-            .revalidate_against_policy(&psnap, &valid_node_addrs)
-            .await?;
-        info!(
-            target: EVENT,
-            "topology revalidated vinst={vinst}: removed={} updated={} repaired={} orphaned={}",
-            report.links_removed,
-            report.links_updated,
-            report.links_repaired,
-            report.orphaned_nodes.len()
-        );
-
-        // Queue up setTopology messages in parallel.
-        let futs = valid_node_addrs.iter().filter_map(|naddr| {
-            let peers = psnap.resolved_peers_for_node(naddr);
-            // Same snapshot the peers came from: the worker builds the wire Links and
-            // mints bootstrap visas off it.
-            let policy = psnap.policy_arc();
-            asm.vss_mgr.get_handle(naddr).map(|vss_handle| async move {
-                if let Err(e) = vss_handle.set_topology(peers, policy).await {
-                    error!(target: EVENT, "failed to set topology for node {}: {}", naddr, e);
-                }
-            })
-        });
-        join_all(futs).await;
-
-        // A policy update can change the auth-services list (OIDC providers are
-        // declared in policy). Re-push the current list so surviving nodes stay in
-        // sync.
-        if let Err(e) = push_auth_services_all_nodes(asm).await {
-            error!(target: EVENT, "failed to refresh auth services after policy update: {e}");
-        }
-    }
+    reconciled?;
 
     // Policy install obliges every connected actor to re-authenticate under
     // the new generation (zipline#123). Record the obligation `(V, T)` durably
@@ -293,9 +510,10 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // Codex P1): the sweep discovers obligations only from the state DB, so
     // an unrecorded obligation means non-reauthenticating actors would never
     // be revoked for this generation. Propagating the error means the update
-    // is not reported as successfully enforced; the event worker logs it, and
-    // the next policy-updated event (or VS restart, which replays the current
-    // policy) retries the write against the same snapshot vinst.
+    // is not reported as successfully enforced: the revocation obligation stays
+    // pending, and the next reconciler pass (or a restart's) retries the write
+    // against the then-current snapshot. The nodes still get the new topology and
+    // services list, but no re-auth request.
     let deadline_secs = asm
         .config
         .core
@@ -305,74 +523,250 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         vinst: snapshot_vinst,
         deadline: SystemTime::now() + Duration::from_secs(deadline_secs),
     };
-    if let Err(e) = crate::db::ReauthRepo::new(asm.state_db.clone())
+    let recorded = crate::db::ReauthRepo::new(asm.state_db.clone())
         .add_obligation(&obligation)
-        .await
-    {
-        error!(target: EVENT, "failed to record reauth obligation for vinst {snapshot_vinst}: {e}");
-        return Err(e.into());
-    }
-    request_auths_all_nodes(asm, &valid_node_addrs).await;
-
-    // Re-check existing visas against the new policy. Runs last so route checks
-    // and the nodes' own link state already reflect the updated topology.
-    revalidate_visas(asm, &psnap, SweepReason::PolicyUpdate).await;
-
-    Ok(())
-}
-
-/// Fan the `requestAuthentication` VSS call out to every listed node
-/// (zipline#123), mirroring [set_services_all_nodes]. Each node's address list
-/// is its own address (meaning "re-authenticate yourself to the VS") plus its
-/// docked adapters. Failures are logged: the deadline rule in `auth_sweep`
-/// re-sends to whoever still owes, so a missed request costs one sweep period,
-/// not the obligation.
-async fn request_auths_all_nodes(asm: &Arc<Assembly>, node_addrs: &[IpAddr]) {
-    stream::iter(node_addrs)
-        .for_each_concurrent(None, |naddr| {
-            let asm = asm.clone();
-            async move {
-                let mut addrs = vec![*naddr];
-                match asm.actor_mgr.get_adapters_connected_to_node(naddr).await {
-                    Ok(adapters) => addrs.extend(adapters),
-                    Err(e) => {
-                        error!(target: EVENT, "failed to list adapters of node {naddr} for reauth fan-out: {e}");
-                    }
-                }
-                debug!(target: EVENT, "requesting re-authentication of {} actor(s) via node {naddr}", addrs.len());
-                if let Some(vss_h) = asm.vss_mgr.get_handle(naddr) {
-                    if let Err(e) = vss_h.request_auths(addrs).await {
-                        error!(target: EVENT, "failed to request_auths on node {naddr}: {e}");
-                    }
-                }
-            }
-        })
         .await;
+    if let Err(e) = &recorded {
+        error!(target: EVENT, "failed to record reauth obligation for vinst {snapshot_vinst}: {e}");
+    }
+    push_policy_to_nodes(asm, &psnap, &valid_node_addrs, recorded.is_ok()).await;
+    recorded?;
+
+    // The visa sweep the caller runs next re-checks every live visa against this
+    // policy, including one requested between the install and this pass: it was
+    // judged on the services its endpoints stored under the previous policy, which
+    // this pass may since have recalculated (zl-zipline#273).
+    Ok(true)
 }
 
-/// A trusted service's attribute data changed (eg, an admin refreshed it). The
-/// new data may invalidate visas that were issued under the old data, so
-/// reconcile in two phases: refresh and persist the actors behind live visas,
-/// then re-check those visas.
+/// What the guarded part of a policy pass ([policy_pass_locked]) did.
+enum LockedPass {
+    /// A newer policy was installed during the attribute refresh; nothing applied.
+    Deferred,
+    /// Applied under the current policy `psnap`.
+    Applied {
+        psnap: PolicySnapshot,
+        /// Connected nodes still valid under `psnap` and still reachable by the visa
+        /// service: the nodes the caller pushes the new policy to.
+        valid_node_addrs: Vec<IpAddr>,
+        /// VSS workers of the nodes disconnected or cut off under the guard, for the
+        /// caller to stop once it has released it.
+        stopped_workers: Vec<(Option<crate::vss_mgr::VssHandle>, IpAddr)>,
+        /// Link reconciliation result, returned after the workers are stopped.
+        reconciled: Result<(), ServiceError>,
+    },
+}
+
+/// The topology part of a policy pass, under the caller's [TopoOps]: re-read the
+/// policy (installs commit under the same lock, so it stays current until the guard
+/// is dropped), read the live-node set, recalculate each node's services under the
+/// policy ([restamp_node_services]), judge each node on it, disconnect the
+/// invalid ones, reconcile links, revoke visas over links taken down and set apart
+/// the nodes those links cut off from the visa service ([nodes_cut_off]).
 ///
-/// Phase order matters: the sweep re-reads actors from the store, so their
-/// attributes have to be reconciled and written back first.
+/// `unrefreshed` are the actors whose attribute refresh failed: their claims are
+/// indeterminate, so their services are not recalculated (a policy condition a
+/// missing key satisfies must not grant one) and they are judged on their stored
+/// services.
 ///
-/// Note this only reconciles actors that hold a live visa. Everyone else is
-/// handled lazily on their next visa request by the revision check in
-/// `refresh_expired_attributes`.
-async fn handle_trusted_service_change(asm: &Arc<Assembly>) {
-    // One snapshot for the whole pass, same as the policy handler.
+/// `refreshed_vinst` is the policy the caller refreshed actor attributes for. If a
+/// newer policy has been installed since, the actors are stale for it: judging nodes
+/// on them could disconnect one the new policy admits. Then this applies nothing and
+/// returns [LockedPass::Deferred]; the pass that follows for the newer install
+/// (it records a revocation obligation before it commits and kicks after), refreshes
+/// first and applies.
+async fn policy_pass_locked(
+    asm: &Arc<Assembly>,
+    ops: &TopoOps<'_>,
+    refreshed_vinst: u64,
+    unrefreshed: &HashSet<IpAddr>,
+) -> Result<LockedPass, ServiceError> {
     let psnap = asm.policy_mgr.get_current_snapshot();
+    if psnap.vinst() != refreshed_vinst {
+        info!(target: EVENT, "policy pass for vinst={refreshed_vinst} superseded by vinst={} during the attribute refresh: deferring to its pass", psnap.vinst());
+        return Ok(LockedPass::Deferred);
+    }
+    let vinst = psnap.vinst();
 
-    let (refreshed, unresolved, failed) =
-        refresh_actors(asm, live_visa_actor_addrs(asm).await).await;
-    info!(
-        target: EVENT,
-        "trusted service changed: actors refreshed={refreshed} unresolved={unresolved} failed={failed}"
-    );
+    // The new policy may invalidate some existing nodes. Read the live-node set
+    // under the guard, so the pass cannot re-add a node that has disconnected.
+    let connected_node_addrs = asm.actor_mgr.list_node_addrs().await?;
 
-    revalidate_visas(asm, &psnap, SweepReason::AttributeChange).await;
+    // Recalculate each node's services under the new policy before judging it
+    // (zl-zipline#273): a node still offering a service the policy deleted would
+    // otherwise be judged invalid and disconnected. If the recalculation fails, the
+    // node is judged on its stored services -- at worst it is disconnected, never kept
+    // with more than the policy grants. A node whose attribute refresh failed is
+    // judged on its stored services the same way: its claims are indeterminate.
+    let policy = psnap.policy_arc();
+    for naddr in &connected_node_addrs {
+        if unrefreshed.contains(naddr) {
+            warn!(target: EVENT, "policy updated vinst={vinst}: the attributes of node {naddr} could not be refreshed, judging it on its stored services");
+            continue;
+        }
+        if let Err(e) = restamp_node_services(asm, &policy, naddr).await {
+            warn!(target: EVENT, "policy updated vinst={vinst}: failed to recalculate the services of node {naddr}, judging it on its stored services: {e}");
+        }
+    }
+
+    let (mut valid_node_addrs, invalid_node_addrs) =
+        revalidate_nodes(asm, &psnap, connected_node_addrs).await;
+
+    // Disconnect the nodes that are no longer approved by the new policy, under the
+    // guard. Their VSS workers are stopped by the caller after it is released.
+    let mut stopped_workers = Vec::new();
+    for naddr in &invalid_node_addrs {
+        info!(target: EVENT, "connected node {naddr} is no longer approved by policy, disconnecting");
+        let (vss, result) = asm
+            .cc
+            .disconnect_locked(ops, asm, *naddr, DisconnectReason::Admin)
+            .await;
+        stopped_workers.push((vss, *naddr));
+        if let Err(e) = result {
+            error!(target: EVENT, "error processing disconnect of {naddr}: {e}");
+            // In this case we do not send an actor-leaves event.
+            // What is the state of our topology manager now?
+            // Visa service is porbably hosed.
+        }
+    }
+
+    // Only reconcile links if there are connected nodes. If there are none at the
+    // moment, then topology should have been (or will soon be) updated via other
+    // code paths. The purpose of updating the topology when presented with a new
+    // policy is to verify that existing links are still allowed.
+    let mut reconciled: Result<(), ServiceError> = Ok(());
+    if !valid_node_addrs.is_empty() {
+        info!(target: EVENT, "policy updated vinst={vinst}: revalidating topology ({} nodes)", valid_node_addrs.len());
+        match asm
+            .topo_mgr
+            .revalidate_against_policy(ops, &psnap, &valid_node_addrs, &|| {
+                asm.policy_mgr.get_current_snapshot()
+            })
+            .await
+        {
+            Ok(report) => {
+                info!(
+                    target: EVENT,
+                    "topology revalidated vinst={vinst}: removed={} updated={} repaired={} orphaned={}",
+                    report.links_removed,
+                    report.links_updated,
+                    report.links_repaired,
+                    report.orphaned_nodes.len()
+                );
+
+                // The links now match the policy, so its full transit set is applied,
+                // granting what the early step withheld -- before the cut-off check
+                // below, so a node reached through a newly transit-capable node is not
+                // taken for cut off.
+                apply_policy_transit(asm, ops, &psnap).await;
+
+                // Links the reconciliation took down or removed: revoke the visas
+                // crossing them through the ungated link path (zl-zipline#224). The
+                // policy sweep would skip a visa committed under this policy before the
+                // link went down, because its generation gate considers it current. A
+                // visa whose revocation write fails is quarantined and retried per visa.
+                for (a, b) in &report.links_down {
+                    let _ = crate::visa_reconciler::revoke_visas_over_link(asm, a, b).await;
+                }
+
+                // A node those links cut off from the visa service gets nothing more
+                // over them (g101): every call would wait out its RPC timeout. Its VSS
+                // worker is stopped instead. Its VS-API session ran over the same
+                // link, so it rejoins (J10), and the rejoin starts a new worker.
+                let cut_off = nodes_cut_off(asm, &psnap, &report.links_down, &valid_node_addrs);
+                valid_node_addrs.retain(|naddr| {
+                    if !cut_off.contains(naddr) {
+                        return true;
+                    }
+                    info!(target: EVENT, "policy updated vinst={vinst}: node {naddr} is cut off from the visa service, stopping its VSS worker");
+                    stopped_workers.push((asm.vss_mgr.get_handle(naddr), *naddr));
+                    false
+                });
+            }
+            Err(e) => {
+                // Fail closed: the grant is withheld until a later pass (or a restart)
+                // reconciles the links.
+                warn!(target: EVENT, "policy updated vinst={vinst}: link reconciliation failed; transit the policy grants is not applied");
+                reconciled = Err(e);
+            }
+        }
+    } else {
+        // No node is connected, so there are no links to reconcile: apply the policy's
+        // full transit set for the nodes that connect later.
+        apply_policy_transit(asm, ops, &psnap).await;
+    }
+
+    Ok(LockedPass::Applied {
+        psnap,
+        valid_node_addrs,
+        stopped_workers,
+        reconciled,
+    })
+}
+
+/// The early transit step of a policy pass: take transit away from every node `psnap`'s
+/// policy no longer lists, and revoke the visas through a node that is not
+/// transit-capable, under the caller's [TopoOps]. A node the policy newly lists is
+/// **not** made transit-capable here: the router still has the old links, and the new
+/// policy may remove or change one of that node's links, so a route through it could
+/// use a link the policy no longer has. [policy_pass_locked] grants it, through
+/// [apply_policy_transit], once the links are reconciled (visaservice#68 review r3).
+async fn withdraw_policy_transit(asm: &Arc<Assembly>, ops: &TopoOps<'_>, psnap: &PolicySnapshot) {
+    asm.topo_mgr.withdraw_transit_nodes(ops, psnap);
+    let _ = crate::visa_reconciler::revoke_visas_through_non_transit(asm).await;
+}
+
+/// Make the router's transit set `psnap`'s (`Policy.transitNodes`, zl-zipline#255) and
+/// revoke every live visa whose path passes through a node that is not
+/// transit-capable, under the caller's [TopoOps]. Applied whether or not any node is
+/// connected, so nodes that connect later route under it.
+///
+/// The revocation checks every visa against the transit set as it now is, not against
+/// what this call changed, so it does not depend on the change being seen once: a
+/// pass that stopped early, or a restart, leaves nothing a later call cannot find.
+/// The revocations go through the ungated path, like `links_down`: the policy sweep
+/// skips a visa committed under this policy before the pass ran. The flag is cleared
+/// before the visas are listed, so a visa committed concurrently is either listed or
+/// fails its commit-time route check. Failed revocations are quarantined and retried
+/// per visa.
+async fn apply_policy_transit(asm: &Arc<Assembly>, ops: &TopoOps<'_>, psnap: &PolicySnapshot) {
+    asm.topo_mgr.apply_transit_nodes(ops, psnap);
+    let _ = crate::visa_reconciler::revoke_visas_through_non_transit(asm).await;
+}
+
+/// The connected nodes the visa service can no longer reach: those with no route from
+/// the node it docks on (the relay). Candidates are the ends of `links_down`, which the
+/// policy pass just took down, and every node of `connected` with a link up: a transit
+/// withdrawal (zl-zipline#255) cuts a node off without taking any link down. A node
+/// with no link up is not a candidate unless a link of it just went down: it is still
+/// joining, or restored and not yet reported (R14), and is not reached over links yet.
+/// If the visa service is not docked, it reaches no node and none is set apart.
+fn nodes_cut_off(
+    asm: &Assembly,
+    psnap: &PolicySnapshot,
+    links_down: &[(IpAddr, IpAddr)],
+    connected: &[IpAddr],
+) -> HashSet<IpAddr> {
+    let Some(dock) = asm
+        .actor_mgr
+        .get_docking_node_for_adapter(&asm.config.get_vs_addr())
+    else {
+        return HashSet::new();
+    };
+    let has_link_up = |naddr: &IpAddr| {
+        psnap
+            .policy()
+            .get_peers_for_node(naddr)
+            .unwrap_or_default()
+            .iter()
+            .any(|peer| asm.topo_mgr.link_up(naddr, &peer.remote_zpr_addr))
+    };
+    links_down
+        .iter()
+        .flat_map(|&(a, b)| [a, b])
+        .chain(connected.iter().copied().filter(has_link_up))
+        .filter(|naddr| *naddr != dock && asm.topo_mgr.get_best_route(&dock, naddr).is_none())
+        .collect()
 }
 
 /// The distinct actor addresses referenced by a live visa (both ends of every visa's
@@ -395,7 +789,7 @@ async fn live_visa_actor_addrs(asm: &Arc<Assembly>) -> HashSet<IpAddr> {
 /// nodes' attributes first; the evaluation below reads the actors as stored.
 ///
 /// This is the attribute-side check only. The authentication side is handled by
-/// the policy-install re-auth obligation (zipline#123): `handle_policy_updated`
+/// the policy-install re-auth obligation (zipline#123): `policy_pass`
 /// records `(V, T)` and fans out `requestAuthentication`, and `auth_sweep`
 /// revokes whoever has not re-authenticated under the new generation by `T`.
 async fn revalidate_nodes(
@@ -464,16 +858,764 @@ mod tests {
     use zpr::policy_types::{JoinPolicy, PFlags, Scope, Service, ServiceType};
     use zpr::write_to::WriteTo;
 
+    /// The pending obligations, read without starting a pass.
+    async fn pending(asm: &Assembly) -> Vec<crate::db::Obligation> {
+        crate::db::RevocationRepo::new(asm.state_db.clone())
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, ob)| ob)
+            .collect()
+    }
+
+    /// What a trusted-service change sets off: an attribute obligation, then a pass.
+    /// The obligations the test's setup left (its policy installs) are dropped first,
+    /// so the pass runs the attribute step only.
+    async fn attribute_pass(asm: &Arc<Assembly>) {
+        let setup: Vec<u64> = asm
+            .revocations
+            .start_pass()
+            .await
+            .unwrap()
+            .iter()
+            .map(|(seq, _)| *seq)
+            .collect();
+        asm.revocations.complete(&setup).await.unwrap();
+        record_attribute_obligation(asm, vec![]).await;
+        reconcile_obligations(asm).await;
+    }
+
+    /// Record an attribute obligation for `actors`, as a writer does before its write.
+    async fn record_attribute_obligation(asm: &Assembly, actors: Vec<IpAddr>) {
+        drop(
+            asm.revocations
+                .begin(Obligation::attributes(actors))
+                .await
+                .unwrap(),
+        );
+    }
+
+    /// zl-zipline#289, replacing p61's `test_failed_reconcile_sweep_is_retried`
+    /// (#63 review, Copilot): a pass whose sweep could not record every verdict
+    /// leaves the obligation pending, and the next pass completes it -- no
+    /// in-memory retry task, nothing to lose on a restart.
+    #[tokio::test]
+    async fn test_failed_sweep_keeps_the_obligation() {
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let (asm, node_a) = crate::test_helpers::build_sweep_asm_on(asm, false).await;
+        let id = create_sweep_visa(&asm, &node_a, 0).await; // the empty policy denies it
+        record_attribute_obligation(&asm, vec![]).await;
+
+        db.set_set_ex_fault(crate::db::FaultMode::Reject);
+        reconcile_obligations(&asm).await;
+        db.set_set_ex_fault(crate::db::FaultMode::None);
+        assert!(
+            !pending(&asm).await.is_empty(),
+            "a sweep that failed must leave its obligation pending"
+        );
+
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty(), "the retry completes it");
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap()
+                .contains(&id)
+        );
+    }
+
+    /// zl-zipline#289, replacing p60's
+    /// `test_policy_pass_failed_ungated_sweep_is_retried_off_the_worker`: a policy
+    /// install whose sweep could not record a revoke leaves the sweep pending; the
+    /// next pass revokes the visa issued on stale services and completes it. The
+    /// policy step itself is not run again: its obligation is replaced by an
+    /// attribute obligation, so a failing sweep does not re-push the policy and
+    /// push the re-authentication deadline out on every retry.
+    #[tokio::test]
+    async fn test_policy_pass_failed_sweep_keeps_the_obligation() {
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let (asm, node_a, node_b, id) = issue_visa_on_stale_services_on(asm).await;
+
+        // ApplyThenError: the visa write errors, link writes are unaffected.
+        db.set_set_ex_fault(crate::db::FaultMode::ApplyThenError);
+        reconcile_obligations(&asm).await;
+        db.set_set_ex_fault(crate::db::FaultMode::None);
+        let left = pending(&asm).await;
+        assert!(
+            !left.is_empty()
+                && left
+                    .iter()
+                    .all(|ob| ob.kind == crate::db::ObligationKind::Attributes),
+            "only the sweep is left pending, not the policy step: {left:?}"
+        );
+
+        assert_pass_revokes(&asm, &node_a, &node_b, id).await;
+    }
+
+    /// zl-zipline#289: a policy pass that fails before its sweep (here the
+    /// re-authentication obligation write) is not lost: the obligation stays
+    /// pending, and once the store recovers the next pass runs the policy step again.
+    #[tokio::test]
+    async fn test_failed_policy_pass_keeps_the_obligation() {
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let asm = Arc::new(asm);
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+
+        // The re-authentication obligation write fails (hset); the revocation
+        // obligation itself is already recorded.
+        db.set_hset_fault(crate::db::FaultMode::Reject);
+        reconcile_obligations(&asm).await;
+        db.set_hset_fault(crate::db::FaultMode::None);
+        assert!(
+            !pending(&asm).await.is_empty(),
+            "a failed policy pass must leave the obligation pending"
+        );
+
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty());
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        assert!(
+            crate::db::ReauthRepo::new(asm.state_db.clone())
+                .list_obligations()
+                .await
+                .unwrap()
+                .iter()
+                .any(|ob| ob.vinst == vinst),
+            "the retried policy pass records the re-authentication obligation"
+        );
+    }
+
+    /// zl-zipline#289 (VS#77 declined P2): an obligation names an actor that no
+    /// longer exists -- a failed Reset whose replacing add cleaned the old actor
+    /// up, or an undo -- so the sweep cannot judge its visas (it skips unresolved
+    /// actors). The reconciler revokes every visa of that actor instead.
+    #[tokio::test]
+    async fn test_visas_of_a_vanished_actor_are_revoked() {
+        use crate::connection_control::tests::{create_zode_files_visa, zode_fixture, zode_login};
+        let cn = "zode-289a.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture(cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let id = create_zode_files_visa(&asm, addr).await;
+        reconcile_obligations(&asm).await; // settle the fixture's own obligations
+
+        record_attribute_obligation(&asm, vec![addr]).await;
+        asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await.unwrap();
+        reconcile_obligations(&asm).await;
+
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&addr)
+                .await
+                .unwrap(),
+            vec![id],
+            "the vanished actor's visa must be revoked"
+        );
+        assert!(pending(&asm).await.is_empty());
+    }
+
+    /// zl-zipline#289 (VS#79 Copilot): a vanished actor's visa whose revoke write
+    /// fails is only quarantined in memory, which a restart loses; the sweep then
+    /// skips the visa (its actor is unresolved). So the pass keeps the obligation
+    /// until the revoke is persisted, and the next pass records it.
+    #[tokio::test]
+    async fn test_failed_revoke_of_a_vanished_actors_visa_keeps_the_obligation() {
+        use crate::connection_control::tests::{
+            create_zode_files_visa, zode_fixture_on, zode_login,
+        };
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let cn = "zode-289d.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let id = create_zode_files_visa(&asm, addr).await;
+        reconcile_obligations(&asm).await; // settle the fixture's own obligations
+
+        record_attribute_obligation(&asm, vec![addr]).await;
+        asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await.unwrap();
+        db.set_set_ex_fault(crate::db::FaultMode::Reject); // the revoke write fails
+        reconcile_obligations(&asm).await;
+        db.set_set_ex_fault(crate::db::FaultMode::None);
+        assert!(
+            !pending(&asm).await.is_empty(),
+            "an unpersisted revoke must leave the obligation pending"
+        );
+
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty(), "the retry completes it");
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&addr)
+                .await
+                .unwrap()
+                .contains(&id)
+        );
+    }
+
+    /// zl-zipline#289 (VS#79 Copilot): an actor whose refreshed attributes could
+    /// not be persisted keeps its old claims in the store, so the sweep judges it on
+    /// them and may allow a visa that the refresh would have revoked. The pass keeps
+    /// the obligation, so the refresh and sweep run again once the store recovers.
+    #[tokio::test]
+    async fn test_failed_refresh_keeps_the_obligation() {
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let (asm, node_a) = crate::test_helpers::build_sweep_asm_on(asm, false).await;
+        reconcile_obligations(&asm).await; // settle the setup's own obligations
+        create_sweep_visa(&asm, &node_a, 0).await;
+        let svc = register_ts(&asm, &[(TS_KEY, "engineering")]);
+        seed_source_attr(&asm, "fd5a:5052:4000::a", TS_KEY, "sales").await;
+        {
+            use crate::trusted_services::TrustedServiceInterface;
+            svc.flush().await.unwrap();
+        }
+        record_attribute_obligation(&asm, vec![]).await;
+
+        db.set_hset_fault(crate::db::FaultMode::Reject); // the refreshed actor's write fails
+        reconcile_obligations(&asm).await;
+        db.set_hset_fault(crate::db::FaultMode::None);
+        assert!(
+            !pending(&asm).await.is_empty(),
+            "a refresh that could not be persisted must leave the obligation pending"
+        );
+
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty(), "the retry completes it");
+        assert_eq!(
+            stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
+            Some("engineering".to_string())
+        );
+    }
+
+    /// zl-zipline#289: obligations are durable. A logout that recorded its
+    /// obligation and wrote, then the visa service stopped before any pass: a new
+    /// assembly over the same state DB (a restart) reconciles it.
+    #[tokio::test]
+    async fn test_restart_reconciles_a_pending_obligation() {
+        use crate::connection_control::tests::{
+            create_zode_files_visa, zode_fixture_on, zode_login, zode_logout,
+        };
+        let (asm, _event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let cn = "zode-289b.zpr";
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let id = create_zode_files_visa(&asm, addr).await;
+        reconcile_obligations(&asm).await;
+        zode_logout(&asm, &cc, addr, &privkey, cn).await;
+        drop(asm); // the "crash": no pass ran after the logout
+
+        let (restarted, _event_rx) = crate::assembly::tests::new_assembly_on_db(db).await;
+        let restarted = Arc::new(restarted);
+        assert!(
+            !pending(&restarted).await.is_empty(),
+            "the obligation survived"
+        );
+        reconcile_obligations(&restarted).await;
+        assert!(pending(&restarted).await.is_empty());
+        assert!(
+            restarted
+                .visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&addr)
+                .await
+                .unwrap()
+                .contains(&id),
+            "the restarted visa service must revoke the visa"
+        );
+    }
+
+    // ---- zl-zipline#290: durable disconnect revocation, policy catch-up ----
+
+    /// The Zode fixture logged in, holding a visa to `files`, with every setup
+    /// obligation settled. Returns the assembly, the Zode's address, the visa and
+    /// the fake DB.
+    async fn zode_with_visa(cn: &str) -> (Arc<Assembly>, IpAddr, u64, Arc<crate::db::FakeDb>) {
+        use crate::connection_control::tests::{
+            create_zode_files_visa, zode_fixture_on, zode_login,
+        };
+        let (asm, event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        std::mem::forget(event_rx);
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        let id = create_zode_files_visa(&asm, addr).await;
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty(), "setup settled");
+        (asm, addr, id, db)
+    }
+
+    /// Whether the visa `id` is marked for revocation on `node`.
+    async fn revoke_pending(asm: &Assembly, node: &IpAddr, id: u64) -> bool {
+        asm.visa_mgr
+            .get_pending_revoke_visa_ids_for_node(node)
+            .await
+            .unwrap()
+            .contains(&id)
+    }
+
+    /// Test 1 (zl-zipline#290): a disconnect whose visa revoke cannot be written
+    /// leaves the revoke only in the in-memory quarantine, and the visa service
+    /// then restarts. The disconnect recorded an obligation naming the departed
+    /// node, so the restarted visa service revokes the visa.
+    #[tokio::test]
+    async fn test_disconnect_with_a_failed_revoke_survives_a_restart() {
+        let (asm, addr, id, db) = zode_with_visa("zode-290a.zpr").await;
+
+        db.set_key_fault("visa:", crate::db::FaultMode::Reject); // visa writes only
+        asm.cc
+            .disconnect(asm.clone(), addr, DisconnectReason::Admin)
+            .await
+            .unwrap();
+        db.set_key_fault("visa:", crate::db::FaultMode::None);
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .is_none(),
+            "the actor is gone"
+        );
+        assert!(!revoke_pending(&asm, &addr, id).await, "the revoke failed");
+        drop(asm); // the "crash": the quarantine is lost
+
+        let (restarted, _event_rx) = crate::assembly::tests::new_assembly_on_db(db).await;
+        let restarted = Arc::new(restarted);
+        reconcile_obligations(&restarted).await;
+        assert!(
+            revoke_pending(&restarted, &addr, id).await,
+            "the restarted visa service must revoke the departed node's visa"
+        );
+        assert!(pending(&restarted).await.is_empty());
+    }
+
+    /// zl-zipline#248 (codex pass 3, P1, operator decision "persist the hold"): a request
+    /// reads its state, a disconnect and its pass then finish, and the request stores its
+    /// visa -- one no pass will see, as its actor is gone. The visa service crashes before
+    /// the commit check, which would have refused it. After the restart the visa must not
+    /// be deliverable.
+    #[tokio::test]
+    async fn test_uncommitted_visa_of_a_vanished_actor_is_not_delivered_after_a_restart() {
+        use crate::connection_control::tests::{
+            create_zode_files_visa_read_at, zode_fixture_on, zode_login,
+        };
+        use crate::visareq_worker::race_gate;
+        let cn = "zode-248-crash.zpr";
+        let (asm, event_rx, db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        std::mem::forget(event_rx);
+        let (asm, cc, addr, privkey) = zode_fixture_on(Arc::new(asm), cn).await;
+        zode_login(&asm, &cc, addr, &privkey, cn).await;
+        reconcile_obligations(&asm).await;
+
+        // The request has read its state; the disconnect and its pass run.
+        let generation = asm.revocations.generation();
+        asm.cc
+            .disconnect(asm.clone(), addr, DisconnectReason::Admin)
+            .await
+            .unwrap();
+        reconcile_obligations(&asm).await;
+        assert!(
+            pending(&asm).await.is_empty(),
+            "the disconnect is satisfied"
+        );
+
+        // The request stores its visa, and the visa service crashes before the commit
+        // check.
+        let (parked, _resume) = race_gate::arm(addr, race_gate::Point::AfterStore);
+        let request = tokio::spawn({
+            let asm = asm.clone();
+            async move { create_zode_files_visa_read_at(&asm, addr, generation).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the request reaches the store");
+        race_gate::disarm(&addr);
+        request.abort();
+        let _ = request.await;
+        let ids = asm.visa_mgr.list_all_visa_ids().await.unwrap();
+        assert_eq!(ids.len(), 1, "precondition: the visa was stored");
+        drop(asm); // the "crash"
+
+        let (restarted, _event_rx) = crate::assembly::tests::new_assembly_on_db(db).await;
+        let restarted = Arc::new(restarted);
+        restarted.visa_mgr.revoke_uncommitted_visas().await;
+        reconcile_obligations(&restarted).await;
+        assert!(
+            restarted
+                .visa_mgr
+                .get_pending_visas_for_node(&addr)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the uncommitted visa must not be deliverable after the restart"
+        );
+    }
+
+    /// Test 2 (zl-zipline#290, VS#79 Copilot): the policy pass disconnects a node
+    /// the new policy rejects, and the node's visa revoke cannot be written. The
+    /// policy obligation completes, but the disconnect's own obligation stays
+    /// pending, and once the store recovers the next pass revokes the visa.
+    #[tokio::test]
+    async fn test_policy_pass_disconnect_with_a_failed_revoke_stays_pending() {
+        use crate::test_helpers::policy_with_peerings_and_node_cns;
+        let (asm, addr, id, db) = zode_with_visa("zode-290b.zpr").await;
+        // The only join policy admits another node.
+        let other: IpAddr = "fd5a:5052::2".parse().unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(policy_with_peerings_and_node_cns(
+                &[],
+                &[(other, "node-other")],
+            ))
+            .await
+            .unwrap();
+
+        db.set_key_fault("visa:", crate::db::FaultMode::Reject);
+        reconcile_obligations(&asm).await;
+        db.set_key_fault("visa:", crate::db::FaultMode::None);
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .is_none(),
+            "the policy pass disconnected the node"
+        );
+        let left = pending(&asm).await;
+        assert!(
+            left.iter().any(|ob| ob.actors.contains(&addr)),
+            "the disconnect's obligation naming the node stays pending: {left:?}"
+        );
+
+        reconcile_obligations(&asm).await;
+        assert!(revoke_pending(&asm, &addr, id).await);
+        assert!(pending(&asm).await.is_empty());
+    }
+
+    /// Test 3 (zl-zipline#290): the disconnect records its obligation before it
+    /// removes the actor and holds the guard across the removal, so a pass that
+    /// lists the obligation never finds the actor still there (it would sweep,
+    /// skip nothing and complete before the removal lands).
+    #[tokio::test]
+    async fn test_disconnect_holds_its_guard_across_the_actor_removal() {
+        use crate::visareq_worker::race_gate;
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = "fd5a:5052::290".parse().unwrap();
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp("fd5a:5052::290", "node-290", "[fd5a:5052::1290]:1234"),
+                false,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let setup: Vec<u64> = asm
+            .revocations
+            .start_pass()
+            .await
+            .unwrap()
+            .iter()
+            .map(|(seq, _)| *seq)
+            .collect();
+        asm.revocations.complete(&setup).await.unwrap();
+
+        let (parked, resume) = race_gate::arm(node, race_gate::Point::BeforeActorRemoval);
+        let disconnect = tokio::spawn({
+            let asm = asm.clone();
+            async move {
+                asm.cc
+                    .disconnect(asm.clone(), node, DisconnectReason::Admin)
+                    .await
+            }
+        });
+        // Recorded, not yet removed.
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the disconnect must reach the actor removal");
+        race_gate::disarm(&node);
+        let pass = tokio::spawn({
+            let asm = asm.clone();
+            async move { asm.revocations.start_pass().await.unwrap().to_vec() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !pass.is_finished(),
+            "a pass must wait for the disconnect's guard"
+        );
+
+        resume.notify_one();
+        let listed = pass.await.unwrap();
+        assert!(
+            listed.iter().any(|(_, ob)| ob.actors.contains(&node)),
+            "the pass lists the disconnect's obligation"
+        );
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&node)
+                .await
+                .unwrap()
+                .is_none(),
+            "by then the actor record is gone"
+        );
+        disconnect.await.unwrap().unwrap();
+    }
+
+    /// zl-zipline#290 (local codex P1): a departed node can rejoin before the pass for
+    /// its disconnect has run. Its new bootstrap visas are minted from the relay's
+    /// peering before it has an actor, so the vanished-actor step leaves them alone
+    /// (the sweep re-checks them against the peering) while it revokes the departed
+    /// actor's own visas; revoking them would cut the joiner off from the visa
+    /// service it is authenticating with.
+    #[tokio::test]
+    async fn test_vanished_actor_step_spares_a_rejoining_nodes_bootstrap_visas() {
+        use libeval::eval_result::Direction;
+        let (asm, addr, id, _db) = zode_with_visa("zode-290d.zpr").await;
+        asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await.unwrap();
+
+        // The node rejoins through a relay: bootstrap visas, no actor yet.
+        let relay: IpAddr = "fd5a:5052::1".parse().unwrap();
+        let policy = asm.policy_mgr.get_current();
+        let bootstrap = asm
+            .visa_mgr
+            .mint_bootstrap_visa(&asm, &policy, &addr, &relay, Direction::Forward)
+            .await
+            .unwrap()
+            .issuer_id;
+
+        assert_eq!(
+            asm.visa_mgr
+                .remove_visas_for_vanished_actors(&[addr])
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            revoke_pending(&asm, &addr, id).await,
+            "the old visa is revoked"
+        );
+        assert!(
+            !revoke_pending(&asm, &relay, bootstrap).await
+                && !revoke_pending(&asm, &addr, bootstrap).await,
+            "the joiner's bootstrap visa must stay"
+        );
+    }
+
+    /// Test 4 (zl-zipline#290, gate q4): a disconnect whose obligation cannot be
+    /// recorded still tears the actor down (logged): it fails closed on the node,
+    /// and its visas wait for their expiry.
+    #[tokio::test]
+    async fn test_disconnect_tears_down_when_its_obligation_cannot_be_recorded() {
+        let (asm, addr, _id, db) = zode_with_visa("zode-290c.zpr").await;
+
+        db.set_key_fault("revoke:", crate::db::FaultMode::Reject);
+        asm.cc
+            .disconnect(asm.clone(), addr, DisconnectReason::Admin)
+            .await
+            .unwrap();
+        db.set_key_fault("revoke:", crate::db::FaultMode::None);
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .is_none(),
+            "the actor is torn down anyway"
+        );
+        assert!(pending(&asm).await.is_empty(), "no obligation was recorded");
+    }
+
+    /// The sweep assembly under a node join policy (vinst 2) that keeps both nodes,
+    /// with a visa seeded at that vinst -- so a sweep under vinst 2 considers it
+    /// current and keeps it -- and every setup obligation settled. A newer policy's
+    /// sweep re-checks the visa and revokes it (the policy has no communication
+    /// rule). Returns the assembly, node A, the visa and the fake DB.
+    async fn swept_visa_under_node_policy() -> (Arc<Assembly>, IpAddr, u64, Arc<crate::db::FakeDb>)
+    {
+        let (asm, node_a, db) = crate::test_helpers::build_sweep_asm_with_db(false).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+        reconcile_obligations(&asm).await;
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        let id = create_sweep_visa(&asm, &node_a, vinst).await;
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty(), "setup settled");
+        assert!(
+            !revoke_pending(&asm, &node_a, id).await,
+            "the visa is current"
+        );
+        (asm, node_a, id, db)
+    }
+
+    /// Whether a re-authentication obligation for `vinst` is recorded.
+    async fn reauth_recorded(asm: &Assembly, vinst: u64) -> bool {
+        crate::db::ReauthRepo::new(asm.state_db.clone())
+            .list_obligations()
+            .await
+            .unwrap()
+            .iter()
+            .any(|ob| ob.vinst == vinst)
+    }
+
+    /// The stored policy's vinst.
+    async fn stored_vinst(asm: &Assembly) -> u64 {
+        crate::db::PolicyRepo::new(asm.state_db.clone())
+            .get_current_identifier()
+            .await
+            .unwrap()
+            .unwrap()
+            .vinst
+    }
+
+    /// Install the next policy while the policy write is faulted with `mode`; the
+    /// install fails. Returns the vinst it was assigned.
+    async fn install_with_policy_fault(
+        asm: &Assembly,
+        db: &crate::db::FakeDb,
+        mode: crate::db::FaultMode,
+    ) -> u64 {
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst() + 1;
+        db.set_key_fault("policy:current", mode);
+        let installed = asm
+            .policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy_version(None, 2))
+            .await;
+        db.set_key_fault("policy:current", crate::db::FaultMode::None);
+        assert!(installed.is_err(), "the install reports failure");
+        vinst
+    }
+
+    /// Test 5 (zl-zipline#290, VS#79 Copilot): the policy write lands but its reply
+    /// is lost, so the install fails without publishing. The pass catches up with
+    /// the stored policy and runs the policy pass for it: the visa the new policy
+    /// denies is revoked, its re-authentication obligation is recorded, and nothing
+    /// is left pending.
+    #[tokio::test]
+    async fn test_policy_write_landed_unpublished_is_caught_up() {
+        let (asm, node_a, id, db) = swept_visa_under_node_policy().await;
+        let vinst =
+            install_with_policy_fault(&asm, &db, crate::db::FaultMode::ApplyThenError).await;
+        assert_eq!(stored_vinst(&asm).await, vinst, "the write landed");
+        assert_eq!(asm.policy_mgr.get_current_snapshot().vinst(), vinst - 1);
+
+        reconcile_obligations(&asm).await;
+        assert_eq!(
+            asm.policy_mgr.get_current_snapshot().vinst(),
+            vinst,
+            "the stored policy is published"
+        );
+        assert!(revoke_pending(&asm, &node_a, id).await, "its sweep ran");
+        assert!(reauth_recorded(&asm, vinst).await, "its policy pass ran");
+        assert!(pending(&asm).await.is_empty());
+    }
+
+    /// Test 6 (zl-zipline#290): as test 5, but the visa service restarts before any
+    /// pass. The restart loads the stored policy, and the pass for it runs (green
+    /// before the fix too: the startup half of the catch-up rule).
+    #[tokio::test]
+    async fn test_policy_write_landed_unpublished_then_restart() {
+        let (asm, node_a, id, db) = swept_visa_under_node_policy().await;
+        let vinst =
+            install_with_policy_fault(&asm, &db, crate::db::FaultMode::ApplyThenError).await;
+        drop(asm);
+
+        let (restarted, _event_rx) = crate::assembly::tests::new_assembly_on_db(db).await;
+        let restarted = Arc::new(restarted);
+        assert_eq!(restarted.policy_mgr.get_current_snapshot().vinst(), vinst);
+        reconcile_obligations(&restarted).await;
+        assert!(revoke_pending(&restarted, &node_a, id).await);
+        assert!(reauth_recorded(&restarted, vinst).await);
+        assert!(pending(&restarted).await.is_empty());
+    }
+
+    /// Test 6b (zl-zipline#290, VS#79 Copilot): as test 5, then a pass, then a
+    /// restart. The pass must have run the policy pass for the stored policy: the
+    /// restarted visa service has no obligation left to run it.
+    #[tokio::test]
+    async fn test_policy_write_landed_unpublished_pass_then_restart() {
+        let (asm, node_a, id, db) = swept_visa_under_node_policy().await;
+        let vinst =
+            install_with_policy_fault(&asm, &db, crate::db::FaultMode::ApplyThenError).await;
+        reconcile_obligations(&asm).await;
+        drop(asm);
+
+        let (restarted, _event_rx) = crate::assembly::tests::new_assembly_on_db(db).await;
+        let restarted = Arc::new(restarted);
+        reconcile_obligations(&restarted).await;
+        assert!(
+            reauth_recorded(&restarted, vinst).await,
+            "the policy pass for the stored policy ran"
+        );
+        assert!(revoke_pending(&restarted, &node_a, id).await);
+        assert!(pending(&restarted).await.is_empty());
+    }
+
+    /// Test 7 (zl-zipline#290): the policy write never landed. Its obligation
+    /// changed nothing: the pass drops it without a policy pass (no
+    /// re-authentication obligation, so no deadline moved), and the published
+    /// policy stays.
+    #[tokio::test]
+    async fn test_policy_write_never_landed_drops_the_obligation() {
+        let (asm, node_a, id, db) = swept_visa_under_node_policy().await;
+        let vinst = install_with_policy_fault(&asm, &db, crate::db::FaultMode::Reject).await;
+        assert_eq!(
+            stored_vinst(&asm).await,
+            vinst - 1,
+            "the write never landed"
+        );
+        assert!(!pending(&asm).await.is_empty());
+
+        reconcile_obligations(&asm).await;
+        assert!(pending(&asm).await.is_empty());
+        assert_eq!(asm.policy_mgr.get_current_snapshot().vinst(), vinst - 1);
+        assert!(!reauth_recorded(&asm, vinst).await, "no policy pass ran");
+        assert!(!revoke_pending(&asm, &node_a, id).await);
+    }
+
+    /// Test 8 (zl-zipline#290): a catch-up that cannot read the stored policy
+    /// keeps every obligation pending, and the next pass catches up.
+    #[tokio::test]
+    async fn test_policy_catch_up_read_error_keeps_the_obligation() {
+        let (asm, node_a, id, db) = swept_visa_under_node_policy().await;
+        let vinst =
+            install_with_policy_fault(&asm, &db, crate::db::FaultMode::ApplyThenError).await;
+
+        db.set_key_fault("policy:current", crate::db::FaultMode::Reject); // reads fail
+        reconcile_obligations(&asm).await;
+        db.set_key_fault("policy:current", crate::db::FaultMode::None);
+        assert!(!pending(&asm).await.is_empty(), "kept pending");
+        assert_eq!(asm.policy_mgr.get_current_snapshot().vinst(), vinst - 1);
+        assert!(!reauth_recorded(&asm, vinst).await);
+
+        reconcile_obligations(&asm).await;
+        assert_eq!(asm.policy_mgr.get_current_snapshot().vinst(), vinst);
+        assert!(revoke_pending(&asm, &node_a, id).await);
+        assert!(pending(&asm).await.is_empty());
+    }
+
     /// Build a policy container whose single join policy marks connections as
     /// nodes. `provides` is the set of services a node must offer to stay valid
     /// (`None` = no service requirement). Conditions are empty, so the policy
     /// matches any actor's claims.
     fn make_node_join_policy(provides: Option<Vec<Service>>) -> Vec<u8> {
+        make_node_join_policy_version(provides, 1)
+    }
+
+    /// As [make_node_join_policy], at policy `version`: a different container
+    /// with the same rules.
+    fn make_node_join_policy_version(provides: Option<Vec<Service>>, version: u64) -> Vec<u8> {
         let mut msg = capnp::message::Builder::new_default();
         {
             let mut policy_bldr = msg.init_root::<capnp_policy::policy::Builder>();
             policy_bldr.set_created("2024-01-01T00:00:00Z");
-            policy_bldr.set_version(1);
+            policy_bldr.set_version(version);
             policy_bldr.set_metadata("");
             let mut jp_list = policy_bldr.reborrow().init_join_policies(1);
             let mut jp_bldr = jp_list.reborrow().get(0);
@@ -667,7 +1809,7 @@ mod tests {
             svc.flush().await.unwrap();
         }
 
-        handle_trusted_service_change(&asm).await;
+        attribute_pass(&asm).await;
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
@@ -692,13 +1834,719 @@ mod tests {
         seed_source_attr(&asm, "fd5a:5052:4000::a", TS_KEY, "sales").await;
 
         svc.fail.store(true, std::sync::atomic::Ordering::SeqCst);
-        handle_trusted_service_change(&asm).await;
+        attribute_pass(&asm).await;
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
             None,
             "unreachable service must not leave stale attributes in place"
         );
+    }
+
+    /// A policy update revalidates the topology and revokes visas over links it takes
+    /// down under the topology operation lock (TopoOps), so it cannot interleave with a
+    /// link-state report, disconnect or authentication.
+    #[tokio::test]
+    async fn test_policy_update_waits_for_the_topology_operation_lock() {
+        let (asm, _node_a) = build_sweep_asm(false).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let held = asm.topo_mgr.ops().await;
+                let update = tokio::task::spawn_local({
+                    let asm = asm.clone();
+                    async move { policy_pass(&asm).await }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(!update.is_finished(), "policy pass must wait for the lock");
+                drop(held);
+                update.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    /// A policy install commits under the topology operation lock (round 13, Codex
+    /// P1): while a topology operation holds it, the current policy cannot change, so
+    /// a policy pass that reads the policy under the lock judges nodes and links on the
+    /// policy that is current for its whole run -- it can never disconnect a node, or
+    /// remove a link, on a policy superseded mid-pass.
+    #[tokio::test]
+    async fn test_policy_install_waits_for_the_topology_operation_lock() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let before = asm.policy_mgr.get_current_snapshot().vinst();
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let held = asm.topo_mgr.ops().await;
+                let install = tokio::task::spawn_local({
+                    let asm = asm.clone();
+                    async move {
+                        asm.policy_mgr
+                            .update_policy_from_container_bytes(make_node_join_policy(None))
+                            .await
+                    }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(!install.is_finished(), "install must wait for the lock");
+                assert_eq!(asm.policy_mgr.get_current_snapshot().vinst(), before);
+                drop(held);
+                install.await.unwrap().unwrap();
+            })
+            .await;
+
+        assert_eq!(asm.policy_mgr.get_current_snapshot().vinst(), before + 1);
+    }
+
+    /// Round 14 (Copilot): a policy installed during the pass's attribute refresh
+    /// makes the guarded part defer -- it judges no node and disconnects nothing --
+    /// because the actors were refreshed for the old policy. The newer policy's own
+    /// pass, queued behind it, refreshes and applies.
+    #[tokio::test]
+    async fn test_policy_pass_superseded_during_refresh_defers() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+        let a: IpAddr = "fd5a:5052::1".parse().unwrap();
+        // A offers "svc-y": fine under the first policy, not under the second.
+        let mut node_a = make_node_actor_defexp("fd5a:5052::1", "node-a", "[fd5a:5052::101]:1234");
+        node_a
+            .add_attribute(
+                Attribute::builder(key::SERVICES)
+                    .expires_in(Duration::from_secs(3600))
+                    .value("svc-y"),
+            )
+            .unwrap();
+        asm.actor_mgr
+            .add_node(&node_a, false, &Default::default())
+            .await
+            .unwrap();
+        asm.topo_mgr.add_node(a).unwrap();
+        // The pass refreshed under this policy...
+        let refreshed_vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        // ...and a newer one, under which A is invalid, landed before its guard.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(Some(vec![svc("svc-x")])))
+            .await
+            .unwrap();
+
+        let outcome = {
+            let ops = asm.topo_mgr.ops().await;
+            policy_pass_locked(&asm, &ops, refreshed_vinst, &HashSet::new())
+                .await
+                .unwrap()
+        };
+        assert!(matches!(outcome, LockedPass::Deferred));
+        assert_eq!(asm.actor_mgr.list_node_addrs().await.unwrap(), vec![a]);
+        assert!(asm.topo_mgr.has_node(&a));
+    }
+
+    /// The live-node set is read under the topology operation lock (round 13, Codex
+    /// P2): a node that disconnects before the pass takes the lock is not put back
+    /// into the router by the pass.
+    #[tokio::test]
+    async fn test_policy_pass_does_not_resurrect_a_disconnected_node() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+        let a: IpAddr = "fd5a:5052::1".parse().unwrap();
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp("fd5a:5052::1", "node-a", "[fd5a:5052::101]:1234"),
+                false,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        asm.topo_mgr.add_node(a).unwrap();
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let held = asm.topo_mgr.ops().await;
+                let pass = tokio::task::spawn_local({
+                    let asm = asm.clone();
+                    async move { policy_pass(&asm).await }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // A disconnects while the pass waits: the same steps as
+                // ConnectionControl::disconnect, under the lock this test holds.
+                asm.actor_mgr.remove_actor_by_zpr_addr(&a).await.unwrap();
+                asm.actor_mgr.remove_node(&a).await.unwrap();
+                asm.topo_mgr.remove_node(&held, &a).await;
+                drop(held);
+                pass.await.unwrap().unwrap();
+            })
+            .await;
+
+        assert!(
+            !asm.topo_mgr.has_node(&a),
+            "disconnected node must stay out of the router"
+        );
+    }
+
+    // ---- zl-zipline#273: a policy install recalculates a node's services. ----
+
+    /// Store a connected node at `addr` (CN `cn`) providing `services`, in both the
+    /// actor store and the router: the state a connect leaves behind.
+    async fn add_live_node_with_services(
+        asm: &Assembly,
+        addr: &str,
+        cn: &str,
+        services: &[&str],
+    ) -> IpAddr {
+        let mut node = make_node_actor_defexp(addr, cn, "[fd5a:5052::101]:1234");
+        node.set_services(services.iter().map(|s| s.to_string()).collect());
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        let naddr: IpAddr = addr.parse().unwrap();
+        asm.topo_mgr.add_node(naddr).unwrap();
+        naddr
+    }
+
+    /// The services the stored actor at `naddr` provides.
+    async fn stored_services(asm: &Assembly, naddr: &IpAddr) -> HashSet<String> {
+        let actor = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(naddr)
+            .await
+            .unwrap()
+            .expect("the actor must still be stored");
+        actor.services_iter().map(str::to_string).collect()
+    }
+
+    /// Run the guarded part of a policy pass under the current policy, as
+    /// `policy_pass` does once its attribute refresh is done, and return
+    /// the nodes it judged valid. Panics if the pass deferred.
+    async fn run_locked_pass(asm: &Arc<Assembly>) -> Vec<IpAddr> {
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        let ops = asm.topo_mgr.ops().await;
+        match policy_pass_locked(asm, &ops, vinst, &HashSet::new())
+            .await
+            .unwrap()
+        {
+            LockedPass::Applied {
+                valid_node_addrs, ..
+            } => valid_node_addrs,
+            LockedPass::Deferred => panic!("the pass must apply under the current policy"),
+        }
+    }
+
+    /// The set of service names in `names`.
+    fn service_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Deleting a service a node hosts must not disconnect the node: the pass
+    /// recalculates the node's services from the new policy before judging it, so it
+    /// stays connected, provides nothing, and no longer owns the service entry.
+    #[tokio::test]
+    async fn test_policy_pass_keeps_a_node_whose_hosted_service_was_deleted() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a = add_live_node_with_services(&asm, "fd5a:5052::1", "node-a", &["svc-x"]).await;
+        assert!(
+            asm.actor_mgr
+                .get_service_detail("svc-x")
+                .await
+                .unwrap()
+                .is_some(),
+            "setup: the node owns the svc-x entry"
+        );
+        // The new policy still admits the node but grants it no service.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+
+        let valid = run_locked_pass(&asm).await;
+
+        assert_eq!(valid, vec![a], "the node must be judged valid");
+        assert_eq!(asm.actor_mgr.list_node_addrs().await.unwrap(), vec![a]);
+        assert!(
+            asm.topo_mgr.has_node(&a),
+            "the node must stay in the router"
+        );
+        assert!(stored_services(&asm, &a).await.is_empty());
+        assert!(
+            asm.actor_mgr
+                .get_service_detail("svc-x")
+                .await
+                .unwrap()
+                .is_none(),
+            "the deleted service's entry must no longer name the node"
+        );
+    }
+
+    /// Only the service the new policy dropped is removed; the one it still grants
+    /// stays.
+    #[tokio::test]
+    async fn test_policy_pass_prunes_only_the_deleted_service() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a =
+            add_live_node_with_services(&asm, "fd5a:5052::1", "node-a", &["svc-x", "svc-y"]).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(Some(vec![svc("svc-x")])))
+            .await
+            .unwrap();
+
+        let valid = run_locked_pass(&asm).await;
+
+        assert_eq!(valid, vec![a]);
+        assert_eq!(stored_services(&asm, &a).await, service_set(&["svc-x"]));
+    }
+
+    /// A service the new policy grants a node is added to it by the pass, as a
+    /// connect or re-authentication under that policy would.
+    #[tokio::test]
+    async fn test_policy_pass_adds_a_newly_granted_service() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a = add_live_node_with_services(&asm, "fd5a:5052::1", "node-a", &[]).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(Some(vec![svc("svc-x")])))
+            .await
+            .unwrap();
+
+        let valid = run_locked_pass(&asm).await;
+
+        assert_eq!(valid, vec![a]);
+        assert_eq!(stored_services(&asm, &a).await, service_set(&["svc-x"]));
+    }
+
+    /// A node whose attribute refresh failed is not recalculated (Copilot on
+    /// zl-zpr-visaservice#76): its claims are indeterminate, and a policy condition a
+    /// missing key satisfies must not grant it a service. It is judged on its stored
+    /// services instead.
+    #[tokio::test]
+    async fn test_policy_pass_does_not_recalculate_a_node_whose_refresh_failed() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a = add_live_node_with_services(&asm, "fd5a:5052::1", "node-a", &[]).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(Some(vec![svc("svc-x")])))
+            .await
+            .unwrap();
+        // A trusted service the node has never been refreshed from, and it is down.
+        let ts = register_ts(&asm, &[]);
+        ts.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        policy_pass(&asm).await.unwrap();
+
+        assert_eq!(
+            stored_services(&asm, &a).await,
+            service_set(&[]),
+            "indeterminate claims must not grant a service"
+        );
+        assert!(
+            asm.topo_mgr.has_node(&a),
+            "the node is judged on its stored services"
+        );
+    }
+
+    /// The recalculation does not save a node the new policy no longer admits at
+    /// all: one whose CN no join policy matches is still disconnected.
+    #[tokio::test]
+    async fn test_policy_pass_still_disconnects_a_node_no_join_policy_matches() {
+        use crate::test_helpers::policy_with_peerings_and_node_cns;
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a = add_live_node_with_services(&asm, "fd5a:5052::1", "node-a", &["svc-x"]).await;
+        // The only join policy admits another node.
+        let other: IpAddr = "fd5a:5052::2".parse().unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(policy_with_peerings_and_node_cns(
+                &[],
+                &[(other, "node-other")],
+            ))
+            .await
+            .unwrap();
+
+        let valid = run_locked_pass(&asm).await;
+
+        assert!(valid.is_empty(), "the node must be judged invalid");
+        assert!(asm.actor_mgr.list_node_addrs().await.unwrap().is_empty());
+        assert!(!asm.topo_mgr.has_node(&a), "the node must leave the router");
+    }
+
+    /// The pass that keeps a node whose hosted service was deleted still revokes the
+    /// visas to that service: the visa sweep runs last in the same pass.
+    #[tokio::test]
+    async fn test_policy_pass_revokes_visas_to_a_deleted_service() {
+        use libeval::eval_result::{Direction, Hit};
+        use libeval::route::Route;
+        use zpr::vsapi_types::PacketDesc;
+
+        let (asm, node_a) = build_sweep_asm(false).await;
+        // Node B hosts "web" on TCP 80, and adapter `::4000::a` holds a visa to it.
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let mut host = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&node_b)
+            .await
+            .unwrap()
+            .unwrap();
+        host.set_services(service_set(&["web"]));
+        asm.actor_mgr
+            .update_actor(&host, &Default::default())
+            .await
+            .unwrap();
+        let pdesc =
+            PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:3000::2", 1234, 80).unwrap();
+        let id = asm
+            .visa_mgr
+            .create_visa(
+                &asm,
+                &node_a,
+                &pdesc,
+                &Hit::new_no_signal(0, Direction::Forward),
+                &Route::new_direct(node_a.into()),
+                "",
+                0,
+                0,
+                SystemTime::now() + Duration::from_secs(3600),
+                asm.revocations.generation(),
+            )
+            .await
+            .unwrap()
+            .visa
+            .issuer_id;
+
+        // "web" is deleted: the new policy admits every node and grants no service.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+        reconcile_obligations(&asm).await;
+
+        assert!(
+            asm.actor_mgr
+                .list_node_addrs()
+                .await
+                .unwrap()
+                .contains(&node_b),
+            "the host must stay connected"
+        );
+        assert!(stored_services(&asm, &node_b).await.is_empty());
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap()
+                .contains(&id),
+            "the visa to the deleted service must be revoked"
+        );
+    }
+
+    /// Set up the window between a policy install and its pass (local Codex P1 on
+    /// zl-zipline#273): node B stores "web" on TCP 80 from the previous policy; the new
+    /// policy keeps both nodes and the A--B link (reported up by both ends, R14) and
+    /// keeps allowing access to "web", but grants it to nobody. A visa from adapter
+    /// `::4000::a` to B on port 80 is then requested through the real request path:
+    /// it is allowed on B's stale services and carries the new generation. Returns
+    /// (asm, A, B, the visa's id).
+    async fn issue_visa_on_stale_services() -> (Arc<Assembly>, IpAddr, IpAddr, u64) {
+        // The assembly build_sweep_asm uses: its event queue stays open.
+        let (asm, event_rx, _db) =
+            crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        std::mem::forget(event_rx);
+        issue_visa_on_stale_services_on(asm).await
+    }
+
+    /// [issue_visa_on_stale_services] on the given assembly.
+    async fn issue_visa_on_stale_services_on(
+        asm: Assembly,
+    ) -> (Arc<Assembly>, IpAddr, IpAddr, u64) {
+        use crate::test_helpers::{make_peering, policy_with_peerings_cns_and_tcp_services};
+        use crate::visareq_worker::{VisaDecision, process_visa_request_for_test};
+        use zpr::vsapi_types::{LinkState, LinkStateReport, PacketDesc};
+
+        let (asm, node_a) = crate::test_helpers::build_sweep_asm_on(asm, true).await;
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let mut host = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&node_b)
+            .await
+            .unwrap()
+            .unwrap();
+        host.set_services(service_set(&["web"]));
+        asm.actor_mgr
+            .update_actor(&host, &Default::default())
+            .await
+            .unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(policy_with_peerings_cns_and_tcp_services(
+                &[make_peering(node_a, node_b, "l", vec![])],
+                &[(node_a, "na"), (node_b, "nb")],
+                &[("web", 80)],
+            ))
+            .await
+            .unwrap();
+
+        let cn_of = |n: &IpAddr| {
+            [(node_a, "na"), (node_b, "nb")]
+                .iter()
+                .find(|(addr, _)| addr == n)
+                .map(|(_, cn)| cn.to_string())
+        };
+        for (reporter, peer_cn) in [(node_a, "nb"), (node_b, "na")] {
+            asm.topo_mgr.record_link_states_with_cns(
+                &asm.topo_mgr.ops_now(),
+                &reporter,
+                None,
+                vec![LinkStateReport {
+                    peer_cn: peer_cn.to_string(),
+                    state: LinkState::Up,
+                }],
+                &cn_of,
+            );
+        }
+
+        let pkt = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:3000::2", 1234, 80).unwrap();
+        let VisaDecision::Allow(visa, _) = process_visa_request_for_test(asm.clone(), node_a, pkt)
+            .await
+            .unwrap()
+        else {
+            panic!("precondition: the stale services allow the visa");
+        };
+        (asm, node_a, node_b, visa.issuer_id)
+    }
+
+    /// Run the policy pass for the current policy and assert that it kept the A--B
+    /// link and that the visa `id` held by `node_a` is revoked.
+    async fn assert_pass_revokes(asm: &Arc<Assembly>, node_a: &IpAddr, node_b: &IpAddr, id: u64) {
+        reconcile_obligations(asm).await;
+        assert!(
+            pending(asm).await.is_empty(),
+            "the pass completes the obligation"
+        );
+        assert!(
+            asm.topo_mgr.link_up(node_a, node_b),
+            "the A--B link stays up"
+        );
+        assert!(stored_services(asm, node_b).await.is_empty());
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(node_a)
+                .await
+                .unwrap()
+                .contains(&id),
+            "the visa issued on stale services must be revoked"
+        );
+    }
+
+    /// The pass that recalculates the host's services revokes a visa issued on its
+    /// stale services, although the generation-gated policy sweep skips that visa.
+    #[tokio::test]
+    async fn test_policy_pass_revokes_a_visa_issued_on_stale_services() {
+        let (asm, node_a, node_b, id) = issue_visa_on_stale_services().await;
+        assert_pass_revokes(&asm, &node_a, &node_b, id).await;
+    }
+
+    /// Local Codex P2 on zl-zipline#273: a pass that recalculated the host's services
+    /// and then failed leaves nothing for its retry to recalculate. The retry must
+    /// still revoke the visa issued on the stale services. The failed pass's
+    /// recalculation is played here by recalculating B directly.
+    #[tokio::test]
+    async fn test_policy_pass_retry_revokes_a_visa_issued_on_stale_services() {
+        let (asm, node_a, node_b, id) = issue_visa_on_stale_services().await;
+        let policy = asm.policy_mgr.get_current();
+        assert!(restamp_node_services(&asm, &policy, &node_b).await.unwrap());
+        assert_pass_revokes(&asm, &node_a, &node_b, id).await;
+    }
+
+    /// zl-zipline#255: the policy pass sets the router's transit set from the policy,
+    /// and revokes a visa through a node that lost transit -- including one committed
+    /// under the new policy before the pass ran, which the sweep's generation gate
+    /// would skip.
+    #[tokio::test]
+    async fn test_policy_pass_applies_transit_and_revokes_visas_through_lost_nodes() {
+        use crate::test_helpers::{
+            build_transit_asm, create_sweep_visa_on_route, report_transit_asm_links, transit_policy,
+        };
+        let (asm, a, b, c) = build_transit_asm().await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[c]))
+            .await
+            .unwrap();
+        policy_pass(&asm).await.unwrap();
+        // Under R14 the links are up once both ends report them.
+        report_transit_asm_links(&asm, true);
+        let via_c = asm
+            .topo_mgr
+            .get_routes(&a, &b, None)
+            .into_iter()
+            .find(|r| r.links.len() == 2)
+            .expect("the pass made C transit-capable");
+
+        // C loses transit. In the window between the install and its pass the router
+        // still has the old flags, so a visa through C commits under the new policy.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[]))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        let id = create_sweep_visa_on_route(&asm, &a, vinst, &via_c).await;
+        policy_pass(&asm).await.unwrap();
+
+        assert!(
+            asm.topo_mgr
+                .get_routes(&a, &b, None)
+                .iter()
+                .all(|r| r.links.len() == 1),
+            "no route through C any more"
+        );
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&a)
+                .await
+                .unwrap()
+                .contains(&id),
+            "the visa through C is revoked"
+        );
+    }
+
+    /// visaservice#68 review r3 (Codex P1): the early transit step of a policy pass only
+    /// takes transit away. A node the new policy makes transit-capable becomes so only
+    /// once the pass has reconciled the links, so no route is built through it over a
+    /// link the new policy may have removed.
+    #[tokio::test]
+    async fn test_the_early_transit_step_withdraws_but_never_grants() {
+        use crate::test_helpers::{build_transit_asm, transit_policy};
+        let (asm, a, b, c) = build_transit_asm().await;
+
+        // C is not transit-capable; the new policy grants it: not yet.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[c]))
+            .await
+            .unwrap();
+        withdraw_policy_transit(
+            &asm,
+            &asm.topo_mgr.ops().await,
+            &asm.policy_mgr.get_current_snapshot(),
+        )
+        .await;
+        assert!(!asm.topo_mgr.interior_is_transit(&[a, c, b]), "no grant");
+
+        // C is transit-capable; the new policy takes it away: at once.
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[]))
+            .await
+            .unwrap();
+        withdraw_policy_transit(
+            &asm,
+            &asm.topo_mgr.ops().await,
+            &asm.policy_mgr.get_current_snapshot(),
+        )
+        .await;
+        assert!(!asm.topo_mgr.interior_is_transit(&[a, c, b]), "withdrawn");
+    }
+
+    /// Review r2 (Codex): the policy's transit set is applied, and the visas through a
+    /// node that lost it revoked, before any fallible step of the handler. Here the
+    /// live-node read fails (the event worker only logs that, with no retry); the
+    /// router must still stop routing through C.
+    #[tokio::test]
+    async fn test_policy_update_applies_transit_before_any_fallible_step() {
+        use crate::test_helpers::{
+            build_transit_asm_with_db, create_sweep_visa_on_route, transit_policy,
+        };
+        let (asm, a, b, c, db) = build_transit_asm_with_db().await;
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        let via_c = asm
+            .topo_mgr
+            .get_routes(&a, &b, None)
+            .into_iter()
+            .find(|r| r.links.len() == 2)
+            .unwrap();
+        let id = create_sweep_visa_on_route(&asm, &a, 0, &via_c).await;
+
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[]))
+            .await
+            .unwrap();
+        db.set_scan_fault(crate::db::FaultMode::Reject);
+        assert!(policy_pass(&asm).await.is_err());
+        db.set_scan_fault(crate::db::FaultMode::None);
+
+        assert!(
+            asm.topo_mgr
+                .get_routes(&a, &b, None)
+                .iter()
+                .all(|r| r.links.len() == 1),
+            "no route through C any more"
+        );
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&a)
+                .await
+                .unwrap()
+                .contains(&id),
+            "the visa through C is revoked"
+        );
+    }
+
+    /// Review r1 (Copilot): applying a policy's transit set and revoking the visas
+    /// through the nodes that lost transit is one step, so no later failure in the
+    /// pass (the node list read, link reconciliation) can consume the transit change
+    /// without the revocations.
+    #[tokio::test]
+    async fn test_apply_policy_transit_revokes_in_the_same_step() {
+        use crate::test_helpers::{build_transit_asm, create_sweep_visa_on_route};
+        let (asm, a, b, c) = build_transit_asm().await;
+        asm.topo_mgr.set_transit_nodes(&[c]);
+        let via_c = asm
+            .topo_mgr
+            .get_routes(&a, &b, None)
+            .into_iter()
+            .find(|r| r.links.len() == 2)
+            .unwrap();
+        let id = create_sweep_visa_on_route(&asm, &a, 0, &via_c).await;
+
+        // The current (empty) policy lists no transit node.
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        apply_policy_transit(&asm, &asm.topo_mgr.ops().await, &psnap).await;
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&a)
+                .await
+                .unwrap()
+                .contains(&id)
+        );
+    }
+
+    /// zl-zipline#255: the pass applies the transit set even when no node is connected
+    /// (it then skips link reconciliation), so nodes that connect later route under it.
+    #[tokio::test]
+    async fn test_policy_pass_applies_transit_without_connected_nodes() {
+        use crate::test_helpers::{TRANSIT_NODE_C, transit_policy};
+        use libeval::route::LinkId;
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let c: IpAddr = TRANSIT_NODE_C.parse().unwrap();
+        for n in [a, b, c] {
+            asm.topo_mgr.add_node(n).unwrap();
+        }
+        asm.topo_mgr
+            .add_link(a, c, LinkId("ac".into()), vec![], 1)
+            .unwrap();
+        asm.topo_mgr
+            .add_link(c, b, LinkId("cb".into()), vec![], 1)
+            .unwrap();
+        assert!(asm.topo_mgr.get_best_route(&a, &b).is_none());
+
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[c]))
+            .await
+            .unwrap();
+        policy_pass(&asm).await.unwrap();
+        assert!(asm.topo_mgr.get_best_route(&a, &b).is_some());
     }
 
     /// A policy update reconciles the actors behind live visas before it sweeps them.
@@ -719,8 +2567,7 @@ mod tests {
         // What the actor holds from the previous store's data.
         seed_source_attr(&asm, "fd5a:5052:4000::a", TS_KEY, "sales").await;
 
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(&asm, vinst).await.unwrap();
+        policy_pass(&asm).await.unwrap();
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
@@ -743,8 +2590,7 @@ mod tests {
         // No visa anywhere, so the node is in scope only via the node-address list.
         seed_source_attr(&asm, "fd5a:5052:3000::1", TS_KEY, "sales").await;
 
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(&asm, vinst).await.unwrap();
+        policy_pass(&asm).await.unwrap();
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:3000::1", TS_KEY).await,
@@ -784,7 +2630,7 @@ mod tests {
         // every connected actor carrying a listed identity pair.
         asm.ts_mgr.forget_source_revision(&listed, TS_SOURCE);
 
-        handle_trusted_service_change(&asm).await;
+        attribute_pass(&asm).await;
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
@@ -807,7 +2653,7 @@ mod tests {
         seed_source_attr(&asm, "fd5a:5052:4000::a", TS_KEY, "sales").await;
 
         // No visa created, so no actor is in scope for the refresh.
-        handle_trusted_service_change(&asm).await;
+        attribute_pass(&asm).await;
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
@@ -897,7 +2743,7 @@ mod tests {
         create_routed_sweep_visa(&asm, &node_a, 0).await;
 
         change_host_attrs(&svc, &[(HOST_KEY, HOST_VALUE)]).await;
-        handle_trusted_service_change(&asm).await;
+        attribute_pass(&asm).await;
 
         assert!(stored_provides(&asm, HOST_ADDR, HOSTED_SVC).await);
         assert!(
@@ -919,7 +2765,7 @@ mod tests {
         let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
 
         change_host_attrs(&svc, &[]).await;
-        handle_trusted_service_change(&asm).await;
+        attribute_pass(&asm).await;
 
         assert!(
             !stored_provides(&asm, HOST_ADDR, HOSTED_SVC).await,
@@ -1032,8 +2878,7 @@ mod tests {
             .update_policy_from_container_bytes(make_node_join_policy(Some(vec![svc("svc-x")])))
             .await
             .unwrap();
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        handle_policy_updated(&asm, vinst).await.unwrap();
+        policy_pass(&asm).await.unwrap();
 
         assert_eq!(
             repo.get_zpr_addr_for_hostname("svc-x").await.unwrap(),
@@ -1044,6 +2889,284 @@ mod tests {
             repo.get_zpr_addr_for_hostname("keep-name").await.unwrap(),
             Some(addr),
             "reconciliation must not cost the actor its other names"
+        );
+    }
+
+    /// The next command a test VSS handle receives, or `None` if none arrives within
+    /// a second (or the channel closed).
+    async fn next_cmd(rx: &mut mpsc::Receiver<crate::vss::VssCmd>) -> Option<crate::vss::VssCmd> {
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// g101 (zl-zipline#252): a node whose VSS never answers -- here a test handle
+    /// nobody serves, standing in for a node behind a dead link, whose every RPC waits
+    /// out its timeout -- must not hold up the policy pass. Otherwise the next
+    /// install's pass, queued behind it on the event queue, never applies. The pass
+    /// still pushes to that node, per node and off the policy path.
+    #[tokio::test]
+    async fn test_policy_pass_does_not_wait_on_a_hung_vss() {
+        let (asm, node_a) = build_sweep_asm(false).await;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<crate::vss::VssCmd>(16);
+        asm.vss_mgr.insert_test_handle(node_a, cmd_tx);
+
+        let mut applied = Vec::new();
+        for _ in 0..2 {
+            asm.policy_mgr
+                .update_policy_from_container_bytes(make_node_join_policy(None))
+                .await
+                .unwrap();
+            let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+            tokio::time::timeout(Duration::from_secs(5), policy_pass(&asm))
+                .await
+                .expect("the policy pass must not wait on a node's VSS")
+                .unwrap();
+            applied.push(vinst);
+        }
+
+        // Both passes ran to the end: each recorded its re-auth obligation.
+        let mut recorded: Vec<u64> = crate::db::ReauthRepo::new(asm.state_db.clone())
+            .list_obligations()
+            .await
+            .unwrap()
+            .iter()
+            .map(|o| o.vinst)
+            .collect();
+        recorded.sort();
+        assert_eq!(recorded, applied);
+        // The hung node still got its topology push.
+        let first = tokio::time::timeout(Duration::from_secs(1), cmd_rx.recv())
+            .await
+            .expect("the node's push runs off the policy path")
+            .unwrap();
+        assert!(matches!(first, crate::vss::VssCmd::SetTopology(..)));
+    }
+
+    /// g101 (zl-zipline#252): a policy that removes the only link between the node the
+    /// visa service docks on (the relay) and a Zode cuts the Zode off from the visa
+    /// service. The pass sends it nothing over the link it just removed -- no
+    /// topology, services or re-auth request -- and stops its VSS worker; the Zode
+    /// rejoins (J10). The relay, still reachable, gets its pushes.
+    #[tokio::test]
+    async fn test_policy_pass_sends_nothing_to_a_node_it_cut_off() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let relay: IpAddr = "fd5a:5052::2".parse().unwrap();
+        let zode: IpAddr = "fd5a:5052::3".parse().unwrap();
+        let cns = [(relay, "relay"), (zode, "zb")];
+        for (addr, cn) in cns {
+            asm.actor_mgr
+                .add_node(
+                    &make_node_actor_defexp(&addr.to_string(), cn, "10.0.0.1:1"),
+                    false,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            asm.topo_mgr.add_node(addr).unwrap();
+        }
+        asm.actor_mgr
+            .hack_set_vs_docking_node(&relay)
+            .await
+            .unwrap();
+        // The link is up in the router; the new policy no longer describes it.
+        asm.topo_mgr
+            .add_link(
+                relay,
+                zode,
+                libeval::route::LinkId("relay-zb".into()),
+                vec![],
+                1,
+            )
+            .unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(
+                crate::test_helpers::policy_with_peerings_and_node_cns(&[], &cns),
+            )
+            .await
+            .unwrap();
+        let (relay_tx, mut relay_rx) = mpsc::channel::<crate::vss::VssCmd>(16);
+        asm.vss_mgr.insert_test_handle(relay, relay_tx);
+        let (zode_tx, mut zode_rx) = mpsc::channel::<crate::vss::VssCmd>(16);
+        asm.vss_mgr.insert_test_handle(zode, zode_tx);
+
+        tokio::time::timeout(Duration::from_secs(5), policy_pass(&asm))
+            .await
+            .expect("the policy pass must not wait on a node's VSS")
+            .unwrap();
+
+        assert!(
+            matches!(
+                next_cmd(&mut zode_rx).await,
+                Some(crate::vss::VssCmd::Stop())
+            ),
+            "the cut-off Zode's VSS worker is stopped"
+        );
+        assert!(
+            next_cmd(&mut zode_rx).await.is_none(),
+            "and nothing is pushed to it over the removed link"
+        );
+        assert!(
+            matches!(
+                next_cmd(&mut relay_rx).await,
+                Some(crate::vss::VssCmd::SetTopology(..))
+            ),
+            "the relay, still reachable, gets its topology"
+        );
+    }
+
+    /// A relay (docking the visa service), a Zode `zb` and a node `zc`, all connected,
+    /// with the links `relay_links` (pairs of indices into [relay, zb, zc]) in the
+    /// router, reported up by both ends (R14). The Zode's VSS is captured. Returns
+    /// (asm, [relay, zb, zc], the Zode's command receiver).
+    async fn relay_zb_zc_asm(
+        relay_links: &[(usize, usize)],
+    ) -> (
+        Arc<Assembly>,
+        [IpAddr; 3],
+        mpsc::Receiver<crate::vss::VssCmd>,
+    ) {
+        use libeval::route::LinkId;
+        use zpr::vsapi_types::{LinkState, LinkStateReport};
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let nodes: [IpAddr; 3] =
+            ["fd5a:5052::2", "fd5a:5052::3", "fd5a:5052::4"].map(|n| n.parse().unwrap());
+        let cns = ["relay", "zb", "zc"];
+        for (addr, cn) in nodes.iter().zip(cns) {
+            asm.actor_mgr
+                .add_node(
+                    &make_node_actor_defexp(&addr.to_string(), cn, "10.0.0.1:1"),
+                    false,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            asm.topo_mgr.add_node(*addr).unwrap();
+        }
+        asm.actor_mgr
+            .hack_set_vs_docking_node(&nodes[0])
+            .await
+            .unwrap();
+        for &(i, j) in relay_links {
+            let id = format!("{}-{}", cns[i], cns[j]);
+            asm.topo_mgr
+                .add_link(nodes[i], nodes[j], LinkId(id), vec![], 1)
+                .unwrap();
+        }
+        // Under R14 a link is up while both ends report it up.
+        let cn_of = move |n: &IpAddr| {
+            nodes
+                .iter()
+                .position(|a| a == n)
+                .map(|i| cns[i].to_string())
+        };
+        for (i, reporter) in nodes.iter().enumerate() {
+            let peers = relay_links
+                .iter()
+                .filter_map(|&(a, b)| match (a == i, b == i) {
+                    (true, _) => Some(b),
+                    (_, true) => Some(a),
+                    _ => None,
+                })
+                .map(|k| LinkStateReport {
+                    peer_cn: cns[k].to_string(),
+                    state: LinkState::Up,
+                })
+                .collect();
+            asm.topo_mgr.record_link_states_with_cns(
+                &asm.topo_mgr.ops_now(),
+                reporter,
+                None,
+                peers,
+                &cn_of,
+            );
+        }
+        let (zode_tx, zode_rx) = mpsc::channel::<crate::vss::VssCmd>(16);
+        asm.vss_mgr.insert_test_handle(nodes[1], zode_tx);
+        (asm, nodes, zode_rx)
+    }
+
+    /// The policy for [relay_zb_zc_asm]: the peerings `links` (index pairs, link ids as
+    /// there), a CN per node, and `transitNodes` = `transit`.
+    fn relay_zb_zc_policy(
+        nodes: [IpAddr; 3],
+        links: &[(usize, usize)],
+        transit: &[IpAddr],
+    ) -> Vec<u8> {
+        let cns = ["relay", "zb", "zc"];
+        let peerings: Vec<_> = links
+            .iter()
+            .map(|&(i, j)| {
+                crate::test_helpers::make_peering(
+                    nodes[i],
+                    nodes[j],
+                    &format!("{}-{}", cns[i], cns[j]),
+                    vec![],
+                )
+            })
+            .collect();
+        let node_cns: Vec<(IpAddr, &str)> = nodes.iter().copied().zip(cns).collect();
+        crate::test_helpers::policy_with_peerings_cns_services_and_transit(
+            &peerings,
+            &node_cns,
+            &[],
+            transit,
+        )
+    }
+
+    /// Local review (Codex P2) of visaservice#68 r3: a policy that removes the relay's
+    /// link to a Zode while making C transit-capable, with relay-C and C-Zode up, does
+    /// not cut the Zode off: the grant is applied before the pass asks which nodes the
+    /// removed links cut off, so the Zode is still reached through C.
+    #[tokio::test]
+    async fn test_a_transit_grant_counts_before_the_cut_off_check() {
+        let (asm, nodes, mut zode_rx) = relay_zb_zc_asm(&[(0, 1), (0, 2), (2, 1)]).await;
+        // The new policy drops relay-zb, keeps the other two, and makes C transit.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(relay_zb_zc_policy(
+                nodes,
+                &[(0, 2), (2, 1)],
+                &[nodes[2]],
+            ))
+            .await
+            .unwrap();
+        policy_pass(&asm).await.unwrap();
+
+        assert!(
+            matches!(
+                next_cmd(&mut zode_rx).await,
+                Some(crate::vss::VssCmd::SetTopology(..))
+            ),
+            "the Zode is still reached through C: it gets its topology, not a Stop"
+        );
+    }
+
+    /// Local review (Codex P2): a policy that takes transit away from C, with the Zode
+    /// reached only through C and no link changed, cuts the Zode off as surely as a
+    /// removed link: its VSS worker is stopped and it is sent nothing more.
+    #[tokio::test]
+    async fn test_a_transit_withdrawal_can_cut_a_node_off() {
+        let links = [(0, 2), (2, 1)];
+        let (asm, nodes, mut zode_rx) = relay_zb_zc_asm(&links).await;
+        asm.topo_mgr.set_transit_nodes(&[nodes[2]]);
+        assert!(asm.topo_mgr.get_best_route(&nodes[0], &nodes[1]).is_some());
+        asm.policy_mgr
+            .update_policy_from_container_bytes(relay_zb_zc_policy(nodes, &links, &[]))
+            .await
+            .unwrap();
+        policy_pass(&asm).await.unwrap();
+
+        assert!(
+            matches!(
+                next_cmd(&mut zode_rx).await,
+                Some(crate::vss::VssCmd::Stop())
+            ),
+            "the cut-off Zode's VSS worker is stopped"
+        );
+        assert!(
+            next_cmd(&mut zode_rx).await.is_none(),
+            "and nothing is pushed to it"
         );
     }
 
@@ -1064,8 +3187,7 @@ mod tests {
         // No nodes connected: everything before the obligation write is a
         // no-op, so the injected hset fault hits exactly the obligation add.
         db.set_hset_fault(FaultMode::Reject);
-        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
-        let result = handle_policy_updated(&asm, vinst).await;
+        let result = policy_pass(&asm).await;
         db.set_hset_fault(FaultMode::None);
 
         assert!(

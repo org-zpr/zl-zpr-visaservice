@@ -130,6 +130,8 @@ pub struct RouterLink {
     pub id: LinkId,
     pub attributes: Vec<Attribute>,
     pub cost: u32,
+    /// False while link-state reports say the link is down; see [Router::set_link_up].
+    pub up: bool,
 }
 
 /// One link to install as part of an [Router::apply_link_batch] reconciliation.
@@ -139,6 +141,10 @@ pub struct LinkSpec {
     pub id: LinkId,
     pub attributes: Vec<Attribute>,
     pub cost: u32,
+    /// Up/down flag for the installed link. A reconcile that rebuilds an existing
+    /// link carries its current flag over, so a policy change cannot bring up a link
+    /// that link-state reports say is down.
+    pub up: bool,
 }
 
 pub struct Router {
@@ -229,6 +235,9 @@ impl Router {
     /// - If a or b do not exist returns [TopologyError::NodeNotFound]
     /// - If link id already exists then this returns [TopologyError::LinkExists]
     ///
+    /// Test helper: production code adds links through [Self::add_link_with_state] or
+    /// [Self::apply_link_batch] under the topology operation lock.
+    #[cfg(test)]
     pub fn add_link(
         &self,
         zpr_addr_a: IpAddr,
@@ -236,6 +245,21 @@ impl Router {
         id: LinkId,
         attributes: Vec<Attribute>,
         cost: u32,
+    ) -> Result<(), TopologyError> {
+        self.add_link_with_state(zpr_addr_a, zpr_addr_b, id, attributes, cost, true)
+    }
+
+    /// As [Router::add_link], but installs the link with the given up/down flag under
+    /// the same write lock, so a link that link-state reports already veto is never
+    /// usable, not even between the install and a later [Router::set_link_up].
+    pub fn add_link_with_state(
+        &self,
+        zpr_addr_a: IpAddr,
+        zpr_addr_b: IpAddr,
+        id: LinkId,
+        attributes: Vec<Attribute>,
+        cost: u32,
+        up: bool,
     ) -> Result<(), TopologyError> {
         let mut inner = self.inner.write().unwrap();
         let a: NodeId = zpr_addr_a.into();
@@ -247,31 +271,62 @@ impl Router {
         inner.route_cache.clear();
         inner.link_to_cache_keys.clear();
 
-        inner.topology.add_link(a, b, id, attributes, cost)?;
+        inner
+            .topology
+            .add_link(a, b, id.clone(), attributes, cost)?;
+        if !up {
+            inner.topology.set_link_up(&id, false);
+        }
         inner.topo_generation += 1;
         Ok(())
     }
 
     /// Atomically apply a batch of link removals followed by additions under a single
-    /// write lock, so no concurrent route observes a partially-rewritten graph.
+    /// write lock, so no concurrent route observes a partially-rewritten graph. If an
+    /// addition fails, every change is undone -- added links removed, removed links
+    /// restored with their flags -- and the error returned.
     pub fn apply_link_batch(
         &self,
         removals: &[LinkId],
         additions: Vec<LinkSpec>,
     ) -> Result<(), TopologyError> {
         let mut inner = self.inner.write().unwrap();
+        // Keep what was removed, so a failed addition can put the graph back exactly.
+        let mut removed: Vec<(LinkId, Link)> = Vec::with_capacity(removals.len());
         for id in removals {
-            inner.topology.remove_link(id);
+            if let Some(link) = inner.topology.remove_link(id) {
+                removed.push((id.clone(), link));
+            }
         }
         let mut added: Vec<LinkId> = Vec::with_capacity(additions.len());
         for spec in additions {
-            if let Err(e) =
-                inner
-                    .topology
-                    .add_link(spec.a, spec.b, spec.id.clone(), spec.attributes, spec.cost)
-            {
+            let added_result = inner.topology.add_link(
+                spec.a,
+                spec.b,
+                spec.id.clone(),
+                spec.attributes,
+                spec.cost,
+            );
+            if added_result.is_ok() && !spec.up {
+                inner.topology.set_link_up(&spec.id, false);
+            }
+            if let Err(e) = added_result {
+                // Undo the batch: drop what was added, then restore what was removed
+                // (with its up/down flag), so a rejected reconcile leaves the live
+                // topology untouched.
                 for done in added.iter().rev() {
                     inner.topology.remove_link(done);
+                }
+                for (id, link) in removed {
+                    let up = link.up;
+                    if inner
+                        .topology
+                        .add_link(link.a, link.b, id.clone(), link.attributes, link.cost)
+                        .is_ok()
+                        && !up
+                    {
+                        inner.topology.set_link_up(&id, false);
+                    }
                 }
                 inner.route_cache.clear();
                 inner.link_to_cache_keys.clear();
@@ -364,6 +419,108 @@ impl Router {
         inner.topo_generation += 1;
     }
 
+    /// Mark a link usable (`up`) or not. A down link stays in the graph -- its id,
+    /// attributes and cost are kept, and so is its persisted adjacency -- but neither
+    /// route query uses it. Link-state reports drive this (zl-zipline#224): the edge
+    /// is up only while both ends report it up.
+    ///
+    /// Returns true if the flag changed. An unknown link id, or a flag that already
+    /// has the requested value, is a no-op that returns false.
+    pub fn set_link_up(&self, id: &LinkId, up: bool) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if !inner.topology.set_link_up(id, up) {
+            return false;
+        }
+        // Down removes routes and up can create routes between pairs that never
+        // touched this link, so flush the whole cache, as add_link does.
+        inner.route_cache.clear();
+        inner.link_to_cache_keys.clear();
+        inner.topo_generation += 1;
+        true
+    }
+
+    /// The ZPR addresses of the nodes currently transit-capable ([Router::set_transit_nodes]).
+    pub fn transit_nodes(&self) -> HashSet<IpAddr> {
+        let inner = self.inner.read().unwrap();
+        inner.topology.transit.iter().map(|nid| nid.0).collect()
+    }
+
+    /// Replace the set of transit-capable nodes: the only nodes a route may pass
+    /// through (`Policy.transitNodes`, zl-zipline#255). Any node may still start or end
+    /// a route. Starts empty (fail closed).
+    ///
+    /// If the set changed, best routes are recomputed and the route cache is flushed
+    /// under the same write lock. Returns the nodes that lost transit, sorted, for the
+    /// log and tests.
+    pub fn set_transit_nodes(&self, transit: HashSet<IpAddr>) -> Vec<IpAddr> {
+        let mut inner = self.inner.write().unwrap();
+        let transit: HashSet<NodeId> = transit.iter().map(NodeId::from).collect();
+        if transit == inner.topology.transit {
+            return Vec::new();
+        }
+        let lost = inner.topology.set_transit(transit);
+        // Transit changes which routes exist between arbitrary pairs, so flush the
+        // whole cache, as add_link does.
+        inner.route_cache.clear();
+        inner.link_to_cache_keys.clear();
+        inner.topo_generation += 1;
+        lost
+    }
+
+    /// True if every link in `ids` exists and is up. An empty list (a route that
+    /// stays on one node) is trivially up. Used to check, when a visa is committed,
+    /// that its route has not lost a link since it was chosen.
+    pub fn links_up(&self, ids: &[LinkId]) -> bool {
+        let inner = self.inner.read().unwrap();
+        ids.iter()
+            .all(|id| inner.topology.edges.get(id).is_some_and(|l| l.up))
+    }
+
+    /// True if a stored visa's route is still exactly what it was chosen as: every link
+    /// in `ids` exists, is up, and joins two adjacent nodes of `path` (the visa's
+    /// recorded node path), one link per hop, in either direction; and every interior
+    /// node of `path` is still transit-capable ([Router::set_transit_nodes]). Checking ids alone
+    /// is not enough: policy reconciliation can move a link id to another edge.
+    pub fn route_matches(&self, ids: &[LinkId], path: &[IpAddr]) -> bool {
+        let hops: HashSet<(IpAddr, IpAddr)> = path
+            .windows(2)
+            .map(|w| {
+                if w[0] <= w[1] {
+                    (w[0], w[1])
+                } else {
+                    (w[1], w[0])
+                }
+            })
+            .collect();
+        if hops.len() != ids.len() {
+            return false;
+        }
+        let inner = self.inner.read().unwrap();
+        // Every interior node must still be transit-capable (zl-zipline#255): policy can
+        // take a node's transit flag away after the route was chosen.
+        if !inner.topology.interior_is_transit(path) {
+            return false;
+        }
+        ids.iter().all(|id| {
+            inner.topology.edges.get(id).is_some_and(|l| {
+                let (a, b) = (l.a.0, l.b.0);
+                let pair = if a <= b { (a, b) } else { (b, a) };
+                l.up && hops.contains(&pair)
+            })
+        })
+    }
+
+    /// True if every interior node of `path` (a visa's recorded node path) is
+    /// transit-capable: the transit half of [Self::route_matches], for a visa restored
+    /// from the store, which records no link ids.
+    pub fn interior_is_transit(&self, path: &[IpAddr]) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .topology
+            .interior_is_transit(path)
+    }
+
     /// Current link between two node addrs, in either order (edges are undirected).
     /// Returns `None` if no link connects them.
     pub fn link_between(&self, a: &IpAddr, b: &IpAddr) -> Option<RouterLink> {
@@ -378,6 +535,7 @@ impl Router {
             id,
             attributes: link.attributes.clone(),
             cost: link.cost,
+            up: link.up,
         })
     }
 
@@ -394,6 +552,7 @@ impl Router {
                 id: id.clone(),
                 attributes: link.attributes.clone(),
                 cost: link.cost,
+                up: link.up,
             })
             .collect()
     }
@@ -450,7 +609,8 @@ impl Router {
             .collect()
     }
 
-    /// "Best" route is defined as the route with the lowest cost. If there is a tie, one is picked arbitrarily.
+    /// "Best" route is defined as the route with the lowest cost. A tie goes to the
+    /// route with fewer hops, then to the smaller last-link id (see `dijkstra_from`).
     /// These routes are cached and only updated when topology changes.
     ///
     /// Note `addr_a` and `addr_b` are NODE addresses (not adapters).
@@ -572,6 +732,8 @@ struct Link {
     b: NodeId,
     attributes: Vec<Attribute>,
     cost: u32,
+    /// Route queries skip a link that is not up. New links start up.
+    up: bool,
 }
 
 #[derive(Debug, Default)]
@@ -579,6 +741,10 @@ struct Graph {
     nodes: HashMap<NodeId, Node>,
     edges: HashMap<LinkId, Link>,
     best_routes: HashMap<(NodeId, NodeId), (Vec<LinkId>, u32)>,
+    /// Nodes that may be an interior hop of a route (`Policy.transitNodes`,
+    /// zl-zipline#255). Every other node may only start or end one. Empty by default:
+    /// fail closed, so a router nobody has told about transit routes only over one link.
+    transit: HashSet<NodeId>,
 }
 
 impl Graph {
@@ -650,6 +816,7 @@ impl Graph {
                 b: b.clone(),
                 attributes,
                 cost,
+                up: true,
             },
         );
 
@@ -720,8 +887,9 @@ impl Graph {
             return Err(TopologyError::LinkExists(new_id.0));
         }
 
-        // Validated: swap the edge in place, then recompute once.
-        self.remove_link_impl(&old_id);
+        // Validated: swap the edge in place, then recompute once. The up/down flag
+        // comes from link-state reports, not policy, so the new edge keeps it.
+        let was_up = self.remove_link_impl(&old_id).map_or(true, |old| old.up);
         self.edges.insert(
             new_id.clone(),
             Link {
@@ -729,6 +897,7 @@ impl Graph {
                 b: b.clone(),
                 attributes,
                 cost,
+                up: was_up,
             },
         );
         self.nodes.get_mut(a).unwrap().edges.insert(new_id.clone());
@@ -741,6 +910,17 @@ impl Graph {
     #[allow(dead_code)]
     fn link_mut(&mut self, id: &LinkId) -> Option<&mut Link> {
         self.edges.get_mut(id)
+    }
+
+    /// Set a link's up flag and recompute best routes if it changed. Returns true if
+    /// the flag changed; false for an unknown link or an unchanged flag.
+    fn set_link_up(&mut self, id: &LinkId, up: bool) -> bool {
+        match self.edges.get_mut(id) {
+            Some(link) if link.up != up => link.up = up,
+            _ => return false,
+        }
+        self.recompute();
+        true
     }
 
     /// Returns all nodes directly connected to `node_id` by a single link, or `None` if the node does not exist.
@@ -793,7 +973,33 @@ impl Graph {
         result
     }
 
-    /// Get the lowest cost path from a to b. If there are multiple this should return one of them.
+    /// Whether a route may pass *through* `node_id` (enter it on one link and leave on
+    /// another). Any node may be a route's first or last node.
+    fn is_transit(&self, node_id: &NodeId) -> bool {
+        self.transit.contains(node_id)
+    }
+
+    /// True if every interior node of `path` -- all but its first and last -- is
+    /// transit-capable. A path of one or two nodes has no interior.
+    fn interior_is_transit(&self, path: &[IpAddr]) -> bool {
+        let interior = path.get(1..path.len().saturating_sub(1)).unwrap_or(&[]);
+        interior.iter().all(|n| self.is_transit(&NodeId::from(n)))
+    }
+
+    /// Replace the transit set and recompute best routes if it changed. Returns the
+    /// nodes that were transit-capable before and are not now, sorted.
+    fn set_transit(&mut self, transit: HashSet<NodeId>) -> Vec<IpAddr> {
+        if transit == self.transit {
+            return Vec::new();
+        }
+        let mut lost: Vec<IpAddr> = self.transit.difference(&transit).map(|nid| nid.0).collect();
+        lost.sort();
+        self.transit = transit;
+        self.recompute();
+        lost
+    }
+
+    /// Get the lowest cost path from a to b, with ties broken as in `dijkstra_from`.
     fn get_low_cost_path(&self, a: &NodeId, b: &NodeId) -> Option<(Vec<LinkId>, u32)> {
         self.best_routes.get(&(a.clone(), b.clone())).cloned()
     }
@@ -857,6 +1063,9 @@ impl Graph {
             let Some(link) = self.edges.get(&link_id) else {
                 continue;
             };
+            if !link.up {
+                continue;
+            }
             let neighbor = if &link.a == &current {
                 &link.b
             } else {
@@ -873,6 +1082,12 @@ impl Graph {
                 let mut full_path = path.clone();
                 full_path.push(link_id);
                 results.push((full_path, new_cost));
+                continue;
+            }
+
+            // Only a transit-capable node may be passed through (zl-zipline#255); any
+            // other node is a dead end unless it is the destination, handled above.
+            if !self.is_transit(neighbor) {
                 continue;
             }
 
@@ -908,17 +1123,34 @@ impl Graph {
     }
 
     /// Run Dijkstra from `start` and return, for each reachable destination, the
-    /// ordered sequence of link ids on the shortest path and its total cost.
+    /// ordered sequence of link ids on the shortest path and its total cost. Only
+    /// transit-capable nodes are passed through ([Graph::is_transit]).
+    ///
+    /// Ties are broken deterministically (zl-zipline#224), in this order:
+    /// 1. lower total cost;
+    /// 2. fewer hops -- so a direct link beats a multi-hop path of equal cost;
+    /// 3. the lexicographically smaller id of the last link into the node.
+    ///
+    /// Without (2) and (3) the winner of a tie would depend on heap pop order and on
+    /// `HashSet` iteration order, so the same graph could route differently.
     fn dijkstra_from(&self, start: &NodeId) -> HashMap<NodeId, (Vec<LinkId>, u32)> {
-        let mut dist: HashMap<NodeId, u64> = HashMap::new();
+        // Best known (cost, hops) per node.
+        let mut dist: HashMap<NodeId, (u64, u32)> = HashMap::new();
         let mut prev: HashMap<NodeId, LinkId> = HashMap::new();
-        let mut heap: BinaryHeap<Reverse<(u64, NodeId)>> = BinaryHeap::new();
+        let mut heap: BinaryHeap<Reverse<(u64, u32, NodeId)>> = BinaryHeap::new();
 
-        dist.insert(start.clone(), 0);
-        heap.push(Reverse((0, start.clone())));
+        dist.insert(start.clone(), (0, 0));
+        heap.push(Reverse((0, 0, start.clone())));
 
-        while let Some(Reverse((cost, node))) = heap.pop() {
-            if cost > *dist.get(&node).unwrap_or(&u64::MAX) {
+        while let Some(Reverse((cost, hops, node))) = heap.pop() {
+            if (cost, hops) > *dist.get(&node).unwrap_or(&(u64::MAX, u32::MAX)) {
+                continue;
+            }
+
+            // A node that is not transit-capable is reached (it may be a destination)
+            // but never expanded: no route leaves it again unless it is the start
+            // (zl-zipline#255).
+            if &node != start && !self.is_transit(&node) {
                 continue;
             }
 
@@ -929,12 +1161,21 @@ impl Graph {
                 let Some(link) = self.edges.get(link_id) else {
                     continue;
                 };
+                if !link.up {
+                    continue;
+                }
                 let neighbor = if link.a == node { &link.b } else { &link.a };
-                let next_cost = cost + link.cost as u64;
-                if next_cost < *dist.get(neighbor).unwrap_or(&u64::MAX) {
-                    dist.insert(neighbor.clone(), next_cost);
+                let candidate = (cost + link.cost as u64, hops + 1);
+                let best = *dist.get(neighbor).unwrap_or(&(u64::MAX, u32::MAX));
+                if candidate < best {
+                    dist.insert(neighbor.clone(), candidate);
                     prev.insert(neighbor.clone(), link_id.clone());
-                    heap.push(Reverse((next_cost, neighbor.clone())));
+                    heap.push(Reverse((candidate.0, candidate.1, neighbor.clone())));
+                } else if candidate == best && prev.get(neighbor).is_some_and(|p| link_id.0 < p.0) {
+                    // Same cost and hops: keep the smaller last-link id. The node's
+                    // distance is unchanged, so nothing needs re-queueing; paths
+                    // through it are rebuilt from `prev` at the end.
+                    prev.insert(neighbor.clone(), link_id.clone());
                 }
             }
         }
@@ -957,7 +1198,10 @@ impl Graph {
             }
             debug_assert_eq!(&cur, start, "prev chain must terminate at start");
             path.reverse();
-            result.insert(dest.clone(), (path, dist[dest].min(u32::MAX as u64) as u32));
+            result.insert(
+                dest.clone(),
+                (path, dist[dest].0.min(u32::MAX as u64) as u32),
+            );
         }
         result
     }
@@ -971,7 +1215,16 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// Three nodes, no links, every node transit-capable: the tests written before
+    /// transit existed (zl-zipline#255) route through any node.
     fn make_router_abc() -> (Router, IpAddr, IpAddr, IpAddr) {
+        let (r, a, b, c) = make_router_abc_no_transit();
+        all_transit(&r, &[a, b, c]);
+        (r, a, b, c)
+    }
+
+    /// Three nodes, no links, and the router's default transit set: empty.
+    fn make_router_abc_no_transit() -> (Router, IpAddr, IpAddr, IpAddr) {
         let a = ip("10.0.0.1");
         let b = ip("10.0.0.2");
         let c = ip("10.0.0.3");
@@ -980,6 +1233,17 @@ mod tests {
         r.add_node(b).unwrap();
         r.add_node(c).unwrap();
         (r, a, b, c)
+    }
+
+    /// Mark every node in `nodes` transit-capable.
+    fn all_transit(r: &Router, nodes: &[IpAddr]) {
+        r.set_transit_nodes(nodes.iter().copied().collect());
+    }
+
+    /// Graph-level equivalent of [all_transit].
+    fn graph_all_transit(g: &mut Graph) {
+        let all = g.nodes.keys().cloned().collect();
+        g.set_transit(all);
     }
 
     fn no_hint() -> RouteHint {
@@ -1182,6 +1446,7 @@ mod tests {
         r.add_node(a).unwrap();
         r.add_node(b).unwrap();
         r.add_node(c).unwrap();
+        all_transit(&r, &[a, b, c]);
         r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
         r.add_link(b, c, LinkId("bc".into()), vec![], 1).unwrap();
         let hint = no_hint();
@@ -1263,6 +1528,7 @@ mod tests {
         r.add_node(y).unwrap();
         r.add_node(a).unwrap();
         r.add_node(b).unwrap();
+        all_transit(&r, &[x, y, a, b]);
         // Direct x-y link and dormant legs x-a and b-y; no a-b yet.
         r.add_link(x, y, LinkId("xy".into()), vec![], 10).unwrap();
         r.add_link(x, a, LinkId("xa".into()), vec![], 1).unwrap();
@@ -1486,11 +1752,13 @@ mod tests {
         LinkId(s.into())
     }
 
+    /// Three nodes, all transit-capable (see [make_router_abc]).
     fn make_graph_abc() -> Graph {
         let mut g = Graph::default();
         g.add_node(ip("10.0.0.1")).unwrap();
         g.add_node(ip("10.0.0.2")).unwrap();
         g.add_node(ip("10.0.0.3")).unwrap();
+        graph_all_transit(&mut g);
         g
     }
 
@@ -1793,6 +2061,7 @@ mod tests {
         g.add_node(ip("10.0.0.2")).unwrap();
         g.add_node(ip("10.0.0.3")).unwrap();
         g.add_node(ip("10.0.0.4")).unwrap();
+        graph_all_transit(&mut g);
         g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
             .unwrap();
         g.add_link(ip("10.0.0.1"), ip("10.0.0.3"), lid("ac"), vec![], 1)
@@ -1819,6 +2088,7 @@ mod tests {
         g.add_node(ip("10.0.0.2")).unwrap();
         g.add_node(ip("10.0.0.3")).unwrap();
         g.add_node(ip("10.0.0.4")).unwrap();
+        graph_all_transit(&mut g);
         g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
             .unwrap();
         g.add_link(ip("10.0.0.2"), ip("10.0.0.3"), lid("bc"), vec![], 1)
@@ -1834,5 +2104,388 @@ mod tests {
         assert!(paths.contains(&vec![lid("ab"), lid("bc")]));
         assert!(paths.contains(&vec![lid("ac")]));
         assert!(paths.contains(&vec![lid("da"), lid("cd")]));
+    }
+
+    // --- Link up/down flag and deterministic tie-break (zl-zipline#224) ---
+
+    /// Triangle a-b, b-c, a-c, all cost 1, for the link-state tests.
+    fn make_triangle() -> (Router, IpAddr, IpAddr, IpAddr) {
+        let (r, a, b, c) = make_router_abc();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(b, c, LinkId("bc".into()), vec![], 1).unwrap();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        (r, a, b, c)
+    }
+
+    #[test]
+    fn test_down_link_is_skipped_by_best_route_and_all_routes() {
+        let (r, a, _b, c) = make_triangle();
+        assert_eq!(
+            r.get_best_route(&a, &c).unwrap().links,
+            vec![LinkId("ac".into())]
+        );
+
+        assert!(r.set_link_up(&LinkId("ac".into()), false));
+
+        let best = r.get_best_route(&a, &c).unwrap();
+        assert_eq!(best.links, vec![LinkId("ab".into()), LinkId("bc".into())]);
+        assert_eq!(best.cost, 2);
+        let all = r.get_routes(&a, &c, Some(&no_hint()));
+        assert!(
+            all.iter()
+                .all(|rt| !rt.links.contains(&LinkId("ac".into())))
+        );
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_link_back_up_restores_the_direct_route() {
+        let (r, a, _b, c) = make_triangle();
+        // Warm the all-routes cache so the flag change must invalidate it.
+        assert_eq!(r.get_routes(&a, &c, Some(&no_hint())).len(), 2);
+        r.set_link_up(&LinkId("ac".into()), false);
+        assert_eq!(r.get_routes(&a, &c, Some(&no_hint())).len(), 1);
+        assert!(r.set_link_up(&LinkId("ac".into()), true));
+        assert_eq!(
+            r.get_best_route(&a, &c).unwrap().links,
+            vec![LinkId("ac".into())]
+        );
+        assert_eq!(r.get_routes(&a, &c, Some(&no_hint())).len(), 2);
+    }
+
+    #[test]
+    fn test_set_link_up_reports_change_only() {
+        let (r, _a, _b, _c) = make_triangle();
+        assert!(
+            !r.set_link_up(&LinkId("ac".into()), true),
+            "already up: no change"
+        );
+        assert!(r.set_link_up(&LinkId("ac".into()), false));
+        assert!(
+            !r.set_link_up(&LinkId("ac".into()), false),
+            "already down: no change"
+        );
+        assert!(
+            !r.set_link_up(&LinkId("nope".into()), false),
+            "unknown link: no change"
+        );
+    }
+
+    #[test]
+    fn test_link_flag_visible_and_kept_across_replace() {
+        let (r, a, _b, c) = make_triangle();
+        r.set_link_up(&LinkId("ac".into()), false);
+        assert!(!r.link_between(&a, &c).unwrap().up);
+        r.replace_link_between(&a, &c, LinkId("ac".into()), vec![], 7)
+            .unwrap();
+        let link = r.link_between(&a, &c).unwrap();
+        assert!(!link.up, "replacing a link's cost must not bring it up");
+        assert_eq!(link.cost, 7);
+        let snap = r.link_snapshot();
+        assert!(snap.iter().any(|l| l.id == LinkId("ac".into()) && !l.up));
+        assert!(snap.iter().any(|l| l.id == LinkId("ab".into()) && l.up));
+    }
+
+    #[test]
+    fn test_default_costs_prefer_direct_link_over_two_hops() {
+        // Direct endpoint link vs the two-hop path through a relay, all at the
+        // default cost 1: the direct link wins on cost alone.
+        let (r, a, _b, c) = make_triangle();
+        assert_eq!(
+            r.get_best_route(&a, &c).unwrap().links,
+            vec![LinkId("ac".into())]
+        );
+    }
+
+    #[test]
+    fn test_equal_cost_tie_prefers_fewer_hops() {
+        // Direct link cost 2 vs two hops of cost 1: equal cost, the direct link wins.
+        let (r, a, b, c) = make_router_abc();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(b, c, LinkId("bc".into()), vec![], 1).unwrap();
+        r.add_link(a, c, LinkId("zz-direct".into()), vec![], 2)
+            .unwrap();
+        let best = r.get_best_route(&a, &c).unwrap();
+        assert_eq!(best.links, vec![LinkId("zz-direct".into())]);
+        assert_eq!(best.cost, 2);
+    }
+
+    #[test]
+    fn test_equal_cost_tie_prefers_fewer_hops_regardless_of_node_order() {
+        // a-b-d-c (3 hops, cost 3) vs a-e-c (2 hops, cost 3). d and e both reach
+        // distance 2; d sorts before e, so plain Dijkstra settles c through d. The
+        // tie-break must pick the 2-hop path.
+        let a = ip("10.0.0.1");
+        let b = ip("10.0.0.2");
+        let c = ip("10.0.0.3");
+        let d = ip("10.0.0.4");
+        let e = ip("10.0.0.5");
+        let r = Router::new();
+        for n in [a, b, c, d, e] {
+            r.add_node(n).unwrap();
+        }
+        all_transit(&r, &[a, b, c, d, e]);
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(b, d, LinkId("bd".into()), vec![], 1).unwrap();
+        r.add_link(d, c, LinkId("dc".into()), vec![], 1).unwrap();
+        r.add_link(a, e, LinkId("ae".into()), vec![], 2).unwrap();
+        r.add_link(e, c, LinkId("ec".into()), vec![], 1).unwrap();
+        let best = r.get_best_route(&a, &c).unwrap();
+        assert_eq!(best.cost, 3);
+        assert_eq!(best.links, vec![LinkId("ae".into()), LinkId("ec".into())]);
+    }
+
+    #[test]
+    fn test_equal_cost_equal_hops_tie_is_deterministic() {
+        // Two two-hop paths a-x-b and a-y-b of equal cost: the one whose last link
+        // id is smaller wins, every time the graph is rebuilt (HashSet order varies).
+        let a = ip("10.0.0.1");
+        let b = ip("10.0.0.2");
+        let x = ip("10.0.0.3");
+        let y = ip("10.0.0.4");
+        for _ in 0..100 {
+            let r = Router::new();
+            for n in [a, b, x, y] {
+                r.add_node(n).unwrap();
+            }
+            all_transit(&r, &[a, b, x, y]);
+            r.add_link(a, x, LinkId("ax".into()), vec![], 1).unwrap();
+            r.add_link(x, b, LinkId("xb".into()), vec![], 1).unwrap();
+            r.add_link(a, y, LinkId("ay".into()), vec![], 1).unwrap();
+            r.add_link(y, b, LinkId("yb".into()), vec![], 1).unwrap();
+            let best = r.get_best_route(&a, &b).unwrap();
+            assert_eq!(best.links, vec![LinkId("ax".into()), LinkId("xb".into())]);
+        }
+    }
+
+    #[test]
+    fn test_apply_link_batch_keeps_spec_down_flag() {
+        // A reconcile that rebuilds a down link (e.g. its policy cost changed) must
+        // install it down, not silently bring it back up.
+        let (r, a, _b, c) = make_triangle();
+        r.set_link_up(&LinkId("ac".into()), false);
+        r.apply_link_batch(
+            &[LinkId("ac".into())],
+            vec![LinkSpec {
+                a,
+                b: c,
+                id: LinkId("ac".into()),
+                attributes: vec![],
+                cost: 5,
+                up: false,
+            }],
+        )
+        .unwrap();
+        let link = r.link_between(&a, &c).unwrap();
+        assert!(!link.up);
+        assert_eq!(link.cost, 5);
+        assert_eq!(
+            r.get_best_route(&a, &c).unwrap().cost,
+            2,
+            "route avoids the down link"
+        );
+    }
+
+    #[test]
+    fn test_add_link_with_state_installs_down_atomically() {
+        // A link installed down is never usable, not even briefly.
+        let (r, a, _b, c) = make_router_abc();
+        r.add_link_with_state(a, c, LinkId("ac".into()), vec![], 1, false)
+            .unwrap();
+        assert!(!r.link_between(&a, &c).unwrap().up);
+        assert!(r.get_best_route(&a, &c).is_none());
+        r.add_link_with_state(a, ip("10.0.0.2"), LinkId("ab".into()), vec![], 1, true)
+            .unwrap();
+        assert!(r.link_between(&a, &ip("10.0.0.2")).unwrap().up);
+    }
+
+    #[test]
+    fn test_links_up_requires_every_link_present_and_up() {
+        let (r, _a, _b, _c) = make_triangle();
+        let ab = LinkId("ab".into());
+        let bc = LinkId("bc".into());
+        assert!(r.links_up(&[ab.clone(), bc.clone()]));
+        r.set_link_up(&bc, false);
+        assert!(!r.links_up(&[ab.clone(), bc]));
+        assert!(
+            !r.links_up(&[ab, LinkId("gone".into())]),
+            "a missing link is not up"
+        );
+        assert!(r.links_up(&[]), "no links (direct route) is trivially up");
+    }
+
+    #[test]
+    fn test_apply_link_batch_restores_removed_links_when_an_addition_fails() {
+        // A failed addition must leave the graph as it was, including the links the
+        // batch removed first (and their up/down flags).
+        let (r, a, b, _c) = make_triangle();
+        r.set_link_up(&LinkId("ab".into()), false);
+        let err = r.apply_link_batch(
+            &[LinkId("ab".into())],
+            vec![LinkSpec {
+                a,
+                b: ip("10.9.9.9"), // not a node: this addition fails
+                id: LinkId("ax".into()),
+                attributes: vec![],
+                cost: 1,
+                up: true,
+            }],
+        );
+        assert!(err.is_err());
+        let ab = r.link_between(&a, &b).expect("removed link restored");
+        assert_eq!(ab.id, LinkId("ab".into()));
+        assert!(!ab.up, "restored with its flag");
+        assert_eq!(r.link_snapshot().len(), 3);
+    }
+
+    #[test]
+    fn test_route_matches_requires_each_link_to_join_path_hops() {
+        // A link id moved to another edge (policy reconciliation can do that) must not
+        // pass for the edge the path recorded.
+        let (r, a, b, c) = make_triangle();
+        let ab = LinkId("ab".into());
+        let bc = LinkId("bc".into());
+        let path = [a, b, c];
+        assert!(r.route_matches(&[ab.clone(), bc.clone()], &path));
+        assert!(
+            r.route_matches(&[bc.clone(), ab.clone()], &[c, b, a]),
+            "either direction"
+        );
+
+        // Move id "bc" from b-c to a-c: ids still exist and are up, the route does not.
+        r.apply_link_batch(
+            &[bc.clone(), LinkId("ac".into())],
+            vec![LinkSpec {
+                a,
+                b: c,
+                id: bc.clone(),
+                attributes: vec![],
+                cost: 1,
+                up: true,
+            }],
+        )
+        .unwrap();
+        assert!(r.links_up(&[ab.clone(), bc.clone()]));
+        assert!(!r.route_matches(&[ab.clone(), bc.clone()], &path));
+
+        // A down link fails too, and so does a hop count mismatch.
+        let (r, a, b, c) = make_triangle();
+        r.set_link_up(&LinkId("bc".into()), false);
+        assert!(!r.route_matches(&[ab.clone(), LinkId("bc".into())], &[a, b, c]));
+        assert!(!r.route_matches(&[ab], &[a, b, c]));
+    }
+
+    // --- Non-transit nodes (zl-zipline#255) ---
+
+    /// The issue's case at router level: A and B have a direct link that is down, and
+    /// the only other way between them is through C, which policy does not mark
+    /// transit-capable. There is no route: neither the best route nor any route.
+    #[test]
+    fn test_no_route_through_a_non_transit_node() {
+        let (r, a, b, c) = make_router_abc_no_transit();
+        let ab = LinkId("ab".into());
+        r.add_link(a, b, ab.clone(), vec![], 1).unwrap();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        r.add_link(c, b, LinkId("cb".into()), vec![], 1).unwrap();
+        r.set_link_up(&ab, false);
+        assert!(r.get_best_route(&a, &b).is_none());
+        assert!(r.get_routes(&a, &b, None).is_empty());
+    }
+
+    /// The same graph with C transit-capable routes through C.
+    #[test]
+    fn test_route_through_a_transit_node() {
+        let (r, a, b, c) = make_router_abc_no_transit();
+        let ab = LinkId("ab".into());
+        r.add_link(a, b, ab.clone(), vec![], 1).unwrap();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        r.add_link(c, b, LinkId("cb".into()), vec![], 1).unwrap();
+        r.set_link_up(&ab, false);
+        r.set_transit_nodes([c].into_iter().collect());
+        let best = r.get_best_route(&a, &b).unwrap();
+        assert_eq!(best.links, vec![LinkId("ac".into()), LinkId("cb".into())]);
+        assert_eq!(r.get_routes(&a, &b, None).len(), 1);
+    }
+
+    /// A cheaper path through a non-transit node loses to a costlier path through a
+    /// transit-capable one.
+    #[test]
+    fn test_costlier_transit_path_beats_cheaper_non_transit_path() {
+        let a = ip("10.0.0.1");
+        let b = ip("10.0.0.2");
+        let endpoint = ip("10.0.0.3");
+        let relay = ip("10.0.0.4");
+        let r = Router::new();
+        for n in [a, b, endpoint, relay] {
+            r.add_node(n).unwrap();
+        }
+        r.add_link(a, endpoint, LinkId("a-e".into()), vec![], 1)
+            .unwrap();
+        r.add_link(endpoint, b, LinkId("e-b".into()), vec![], 1)
+            .unwrap();
+        r.add_link(a, relay, LinkId("a-r".into()), vec![], 10)
+            .unwrap();
+        r.add_link(relay, b, LinkId("r-b".into()), vec![], 10)
+            .unwrap();
+        r.set_transit_nodes([relay].into_iter().collect());
+
+        let best = r.get_best_route(&a, &b).unwrap();
+        assert_eq!(best.links, vec![LinkId("a-r".into()), LinkId("r-b".into())]);
+        let all = r.get_routes(&a, &b, None);
+        assert_eq!(
+            all.len(),
+            1,
+            "the path through the endpoint must not be offered"
+        );
+        assert_eq!(all[0].links, best.links);
+    }
+
+    /// A node that is not transit-capable is still reachable as either end of a route.
+    #[test]
+    fn test_non_transit_node_is_reachable_as_an_end() {
+        let (r, a, b, c) = make_router_abc_no_transit();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        r.add_link(c, b, LinkId("cb".into()), vec![], 1).unwrap();
+        // A -> C and C -> B are one hop each; C is an end, not an interior hop.
+        assert!(r.get_best_route(&a, &c).is_some());
+        assert!(r.get_best_route(&c, &b).is_some());
+        assert_eq!(r.get_routes(&c, &a, None).len(), 1);
+        // A -> B would need C as an interior hop.
+        assert!(r.get_best_route(&a, &b).is_none());
+    }
+
+    /// Changing the transit set invalidates cached routes, and reports the nodes that
+    /// lost transit; setting the same set again changes nothing.
+    #[test]
+    fn test_transit_change_invalidates_cache_and_reports_lost_nodes() {
+        let (r, a, b, c) = make_router_abc_no_transit();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        r.add_link(c, b, LinkId("cb".into()), vec![], 1).unwrap();
+        assert!(r.set_transit_nodes([c].into_iter().collect()).is_empty());
+        assert_eq!(r.get_routes(&a, &b, None).len(), 1); // cached now
+        assert!(r.set_transit_nodes([c].into_iter().collect()).is_empty());
+
+        let lost = r.set_transit_nodes(HashSet::new());
+        assert_eq!(lost, vec![c]);
+        assert!(
+            r.get_routes(&a, &b, None).is_empty(),
+            "stale cached route served"
+        );
+        assert!(r.get_best_route(&a, &b).is_none());
+    }
+
+    /// A recorded path whose interior node has lost transit no longer matches.
+    #[test]
+    fn test_route_matches_fails_when_an_interior_node_lost_transit() {
+        let (r, a, b, c) = make_router_abc_no_transit();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        r.add_link(c, b, LinkId("cb".into()), vec![], 1).unwrap();
+        r.set_transit_nodes([c].into_iter().collect());
+        let ids = [LinkId("ac".into()), LinkId("cb".into())];
+        assert!(r.route_matches(&ids, &[a, c, b]));
+        r.set_transit_nodes(HashSet::new());
+        assert!(!r.route_matches(&ids, &[a, c, b]));
+        // A one-hop path has no interior node.
+        assert!(r.route_matches(&[LinkId("ac".into())], &[a, c]));
     }
 }

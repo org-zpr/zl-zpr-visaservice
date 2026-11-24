@@ -43,7 +43,6 @@ use crate::counters::CounterType;
 use crate::error::ServiceError;
 use crate::logging::targets::VREQ;
 use crate::packet::describe_five_tuple;
-use crate::visa_bootstrap;
 use crate::visa_mgr::VisaWithMetadata;
 use crate::visa_policy::{
     PolicyOutcome, evaluate_against_policy, resolve_docking_node, route_for_allow,
@@ -209,19 +208,11 @@ async fn process_visa_request_job(asm: Arc<Assembly>, job: VisaRequestJob) {
 
 /// Run visa request.
 async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaRequestResult {
+    // The revocation generation, read before anything the decision rests on (actors,
+    // policy, docking): the commit check after the store compares against it
+    // (zl-zipline#248, see VisaMgr::check_commit_generation).
+    let commit_generation = asm.revocations.generation();
     let (source_actor, dest_actor) = get_actors(&asm, job).await?;
-
-    // An endpoint with no actor may be a peer that has not connected yet, on either end of a
-    // VSAPI flow: the peer's own SYN, or the reply direction of it. Policy cannot answer
-    // either; the pre-minted bootstrap visa can.
-    if source_actor.is_none() || dest_actor.is_none() {
-        if let Some(decision) =
-            visa_bootstrap::visa_for_future_peer_request(&asm, job, &source_actor, &dest_actor)
-                .await
-        {
-            return Ok(decision);
-        }
-    }
 
     let (mut source_actor, mut dest_actor) =
         match resolve_actors_or_deny(&asm, job, source_actor, dest_actor).await {
@@ -284,7 +275,7 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         return Ok(VisaDecision::Deny(DenyCode::NoMatch));
     }
 
-    // If necessary, refresh any expired attributes
+    // If necessary, refresh any expired or about-to-expire attributes
     if let Err(e) = refresh_and_persist_actor(&asm, &mut source_actor).await {
         error!(target: VREQ, "failed to update source actor after refreshing attributes: {}", e);
         return Ok(VisaDecision::Deny(DenyCode::NoReason));
@@ -299,7 +290,7 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
     // mutates the connection table, standing in for a disconnect/reconnect that
     // lands mid-await -- deterministic, no timing games. Compiled out of release.
     #[cfg(test)]
-    race_gate::pause_if_gated(&job.requesting_node).await;
+    race_gate::pause_if_gated(&job.requesting_node, race_gate::Point::AfterRefresh).await;
 
     // Docking-node resolution, routing, and policy eval all live in the shared
     // core (used by the Phase 2 sweep too). Actor resolution above stays
@@ -344,9 +335,14 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
                 );
                 return Ok(VisaDecision::Deny(DenyCode::NoMatch));
             }
+            // Test seam (zl-zipline#248): a revocation landing between the
+            // evaluation and the store. Compiled out of release.
+            #[cfg(test)]
+            race_gate::pause_if_gated(&job.requesting_node, race_gate::Point::AfterEval).await;
             visa_from_allow(
                 asm.clone(),
                 job,
+                commit_generation,
                 &hits,
                 &policy,
                 default_route,
@@ -366,9 +362,9 @@ pub(crate) async fn process_visa_request_for_test(
     asm: Arc<Assembly>,
     requesting_node: IpAddr,
     pkt: PacketDesc,
-) -> VisaDecision {
+) -> VisaRequestResult {
     let (job, _rx) = VisaRequestJob::new(requesting_node, pkt);
-    process_visa_request(asm, &job).await.unwrap()
+    process_visa_request(asm, &job).await
 }
 
 /// Fabricate an AAA actor for an anonymous endpoint at the given address.
@@ -402,10 +398,14 @@ fn fabricate_aaa_actor(anon_addr: &IpAddr, expiration: SystemTime) -> Actor {
 /// Note that an ALLOW decision can still come back as a [VisaDecision::Deny]: if the
 /// authentication or attribute expirations leave less than [config::MIN_VISA_LIFETIME] to
 /// work with, the visa would lapse before the nodes could install and use it, so we deny
-/// rather than issue it.
+/// rather than issue it. The request path refreshes trusted-service attributes ahead of
+/// expiry ([config::ATTRIBUTE_REFRESH_AHEAD]) so this should not happen for them; when it
+/// does (an authentication about to expire, a service vending a short expiry) the deny
+/// is logged at WARN naming what limited the lifetime. The wire code stays `NoReason`.
 async fn visa_from_allow(
     asm: Arc<Assembly>,
     job: &VisaRequestJob,
+    commit_generation: u64,
     hits: &[Hit],
     policy: &Policy,
     default_route: Option<Route>,
@@ -423,14 +423,21 @@ async fn visa_from_allow(
 
     let allowed_route: Route = route_for_allow(hits, default_route)?;
 
-    let expiration = compute_expiration(src_actor, dst_actor, policy, &hits[0])?;
+    let (expiration, gate) = compute_expiration(src_actor, dst_actor, policy, &hits[0])?;
 
     // Too little time left to be usable. Deny rather than issue a visa that cannot be
     // installed before it lapses -- and that the store would silently discard.
-    if expiration < SystemTime::now() + config::MIN_VISA_LIFETIME {
-        debug!(target: VREQ,
-            "visa request from {:?} denied: computed expiration {:?} leaves less than {:?}",
-            job.requesting_node, expiration, config::MIN_VISA_LIFETIME
+    let now = SystemTime::now();
+    if expiration < now + config::MIN_VISA_LIFETIME {
+        let left = expiration.duration_since(now).unwrap_or_default();
+        warn!(target: VREQ,
+            "visa request from node {} denied: flow {} would get a visa living {:?}, \
+             under the minimum {:?} (limited by {})",
+            job.requesting_node,
+            describe_five_tuple(&job.packet_desc),
+            left,
+            config::MIN_VISA_LIFETIME,
+            gate
         );
         return Ok(VisaDecision::Deny(DenyCode::NoReason));
     }
@@ -447,6 +454,7 @@ async fn visa_from_allow(
             policy_version,
             vinst,
             expiration,
+            commit_generation,
         )
         .await?;
 
@@ -465,7 +473,9 @@ async fn visa_from_allow(
     Ok(VisaDecision::Allow(visa, allowed_route))
 }
 
-/// Compute a visa expiration value. The expiration is set to the soonest of:
+/// Compute a visa expiration value, and name what set it (the "gate": a condition
+/// attribute key, `source_actor_auth`, `destination_actor_auth` or `max_visa_lifetime`).
+/// The expiration is set to the soonest of:
 /// - source actor authentication expiration.
 /// - dest actor authentication expiration.
 /// - soonest attribute expiration used in the policy conditions for the hit.
@@ -488,7 +498,7 @@ fn compute_expiration(
     dst_actor: &Actor,
     policy: &Policy,
     hit: &Hit,
-) -> Result<SystemTime, ServiceError> {
+) -> Result<(SystemTime, String), ServiceError> {
     // Both sides come back Some for a valid index -- an empty vec means that side has no
     // conditions -- so a None here is only ever a failed lookup or an undecodable list.
     let (Some(client_keys), Some(service_keys)) =
@@ -516,7 +526,7 @@ fn compute_expiration(
     // Sampled once so the clamp below compares and assigns against the same instant.
     let now = SystemTime::now();
     let mut soonest_expiration = now + libeval::attribute::NEVER_EXPIRES;
-    let mut expiration_gate = String::from("(none)"); // for debugging
+    let mut expiration_gate = String::from("(none)");
 
     for (keys, actor) in [(&client_keys, client_actor), (&service_keys, service_actor)] {
         for key in keys {
@@ -551,7 +561,7 @@ fn compute_expiration(
         "visa request computed expiration {:?} (gate: {})",
         soonest_expiration, expiration_gate
     );
-    Ok(soonest_expiration)
+    Ok((soonest_expiration, expiration_gate))
 }
 
 /// Pushes actualized copies of a visa to all non-requesting nodes on the path.
@@ -795,11 +805,11 @@ async fn get_actors(
     Ok((source_actor, dest_actor))
 }
 
-/// Test-only rendezvous for racing docking-state changes against an in-flight
-/// request (zipline#183 review, Codex P1). A test arms a gate for its (unique)
-/// requesting-node address; `process_visa_request` parks at the gate after the
-/// attribute-refresh awaits, the test mutates docking state, then resumes it.
-/// Keyed by requesting node so concurrently-running tests never trip each
+/// Test-only rendezvous for racing state changes against an in-flight request
+/// or write (zipline#183 review, Codex P1; zl-zipline#248). A test arms a gate
+/// for its (unique) node address at one named [Point]; the code under test parks
+/// when it reaches that point for that node, the test mutates state, then
+/// resumes it. Keyed by node so concurrently-running tests never trip each
 /// other's gates. Compiled only into test builds.
 #[cfg(test)]
 pub(crate) mod race_gate {
@@ -809,7 +819,34 @@ pub(crate) mod race_gate {
 
     use tokio::sync::Notify;
 
+    /// Where a gated request or write parks.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Point {
+        /// `process_visa_request`, after the actors are read and refreshed.
+        AfterRefresh,
+        /// `process_visa_request`, after the policy evaluation allowed the flow.
+        AfterEval,
+        /// `VisaMgr::create_visa`, right after the visa is stored.
+        AfterStore,
+        /// The `visaRequest` and `registerVss` handlers, after the visas are
+        /// prepared and before `VisaMgr::grant_copy` decides to hand them out.
+        BeforeGrant,
+        /// `VisaMgr::grant_copy`, after its first withheld check and before the install
+        /// CAS.
+        InsideGrant,
+        /// `VisaMgr::visas_for_node_by_ids`, after a copy passed the fetch check and
+        /// before it is built.
+        AfterFetchCheck,
+        /// `reauthorize_actor`, right after the actor write.
+        AfterActorWrite,
+        /// A disconnect, between recording its obligation and removing the actor.
+        BeforeActorRemoval,
+        /// `VisaMgr::get_pending_visas_for_node`, after the pending rows are read.
+        AfterPendingSnapshot,
+    }
+
     struct Gate {
+        point: Point,
         parked: Arc<Notify>,
         resume: Arc<Notify>,
     }
@@ -819,16 +856,17 @@ pub(crate) mod race_gate {
         GATES.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// Arm a gate for requests from `node`. Returns `(parked, resume)`: await
-    /// `parked.notified()` to learn the request has reached the gate, then
+    /// Arm a gate at `point` for `node`. Returns `(parked, resume)`: await
+    /// `parked.notified()` to learn the code has reached the gate, then
     /// `resume.notify_one()` to let it continue. Single-permit `Notify`
     /// semantics make both directions race-free regardless of arrival order.
-    pub(crate) fn arm(node: IpAddr) -> (Arc<Notify>, Arc<Notify>) {
+    pub(crate) fn arm(node: IpAddr, point: Point) -> (Arc<Notify>, Arc<Notify>) {
         let parked = Arc::new(Notify::new());
         let resume = Arc::new(Notify::new());
         gates().lock().unwrap().insert(
             node,
             Gate {
+                point,
                 parked: parked.clone(),
                 resume: resume.clone(),
             },
@@ -841,13 +879,14 @@ pub(crate) mod race_gate {
         gates().lock().unwrap().remove(node);
     }
 
-    /// Called from `process_visa_request`: if a gate is armed for this
-    /// requesting node, signal the test and wait to be resumed. No-op (and
-    /// lock-only cost) for every other request.
-    pub(crate) async fn pause_if_gated(node: &IpAddr) {
+    /// Called at `point`: if a gate is armed there for `node`, signal the test
+    /// and wait to be resumed. No-op (and lock-only cost) otherwise.
+    pub(crate) async fn pause_if_gated(node: &IpAddr, point: Point) {
         let armed = {
             let map = gates().lock().unwrap();
-            map.get(node).map(|g| (g.parked.clone(), g.resume.clone()))
+            map.get(node)
+                .filter(|g| g.point == point)
+                .map(|g| (g.parked.clone(), g.resume.clone()))
         };
         if let Some((parked, resume)) = armed {
             parked.notify_one();
@@ -966,7 +1005,7 @@ mod tests {
     }
 
     // Verifies that visa_from_allow issues a visa and returns Allow when given a valid hit and route,
-    // and that the stored metadata records the installed policy vinst as both created/checked_vinst.
+    // and that the stored metadata records the installed policy vinst as created_vinst.
     #[tokio::test]
     async fn visa_from_allow_issues_visa_on_allow() {
         let asm = Arc::new(new_assembly_for_tests(None).await);
@@ -986,6 +1025,7 @@ mod tests {
         let result = visa_from_allow(
             asm.clone(),
             &job,
+            asm.revocations.generation(),
             &hits,
             &policy,
             Some(route),
@@ -1005,7 +1045,6 @@ mod tests {
             .unwrap()
             .expect("metadata should be stored");
         assert_eq!(md.created_vinst, 7);
-        assert_eq!(md.checked_vinst, 7);
     }
 
     // An actor whose authentication expires almost immediately leaves less than
@@ -1038,6 +1077,7 @@ mod tests {
         let result = visa_from_allow(
             asm.clone(),
             &job,
+            asm.revocations.generation(),
             &hits,
             &policy,
             Some(route),
@@ -1066,8 +1106,9 @@ mod tests {
         let hit = Hit::new_no_signal(0, Direction::Forward);
 
         let expected = src.get_attribute("user.role").unwrap().get_expires();
-        let exp = compute_expiration(&src, &dst, &policy, &hit).unwrap();
+        let (exp, gate) = compute_expiration(&src, &dst, &policy, &hit).unwrap();
         assert_eq!(exp, expected);
+        assert_eq!(gate, "user.role");
     }
 
     // Client conditions apply to the source on a Forward hit and to the dest on a Reverse
@@ -1093,8 +1134,20 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(fwd, src.get_attribute("user.role").unwrap().get_expires());
-        assert_eq!(rev, dst.get_attribute("user.role").unwrap().get_expires());
+        assert_eq!(
+            fwd,
+            (
+                src.get_attribute("user.role").unwrap().get_expires(),
+                "user.role".to_string()
+            )
+        );
+        assert_eq!(
+            rev,
+            (
+                dst.get_attribute("user.role").unwrap().get_expires(),
+                "user.role".to_string()
+            )
+        );
     }
 
     // The zpr.services attribute selected the policy, so its expiration bounds the visa even
@@ -1115,7 +1168,7 @@ mod tests {
             &Hit::new_no_signal(0, Direction::Forward),
         )
         .unwrap();
-        assert_eq!(fwd, expected);
+        assert_eq!(fwd, (expected, key::SERVICES.to_string()));
 
         // Reverse: the source provides the service.
         let rev = compute_expiration(
@@ -1125,7 +1178,7 @@ mod tests {
             &Hit::new_no_signal(0, Direction::Reverse),
         )
         .unwrap();
-        assert_eq!(rev, expected);
+        assert_eq!(rev, (expected, key::SERVICES.to_string()));
     }
 
     // With no condition attributes and no authentication expiration, the expiration falls
@@ -1138,7 +1191,8 @@ mod tests {
         let hit = Hit::new_no_signal(0, Direction::Forward);
 
         let before = SystemTime::now();
-        let exp = compute_expiration(&src, &dst, &policy, &hit).unwrap();
+        let (exp, gate) = compute_expiration(&src, &dst, &policy, &hit).unwrap();
+        assert_eq!(gate, "max_visa_lifetime");
         assert!(exp >= before + config::MAX_VISA_LIFETIME);
         assert!(exp <= SystemTime::now() + config::MAX_VISA_LIFETIME);
     }
@@ -1444,6 +1498,64 @@ mod tests {
         assert!(matches!(result, VisaDecision::Deny(DenyCode::NoRoute)));
     }
 
+    /// zl-zipline#255 acceptance: the direct link between the two docks is down, and
+    /// the only other way is through C, which policy does not mark transit-capable.
+    /// The visa request is denied `NoRoute`; it is not routed through C.
+    #[tokio::test]
+    async fn process_visa_request_denied_no_route_through_a_non_transit_node() {
+        use crate::test_helpers::{build_transit_asm, report_transit_asm_links, transit_policy};
+        let (asm, _a, _b, _c) = build_transit_asm().await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[]))
+            .await
+            .unwrap();
+        asm.topo_mgr.apply_transit_nodes(
+            &asm.topo_mgr.ops().await,
+            &asm.policy_mgr.get_current_snapshot(),
+        );
+        report_transit_asm_links(&asm, false);
+
+        let requesting_node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let pkt = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 1234, 80).unwrap();
+        let (job, _rx) = VisaRequestJob::new(requesting_node, pkt);
+        let result = process_visa_request(asm, &job).await.unwrap();
+        assert!(
+            matches!(result, VisaDecision::Deny(DenyCode::NoRoute)),
+            "expected NoRoute"
+        );
+    }
+
+    /// The same, with C in `Policy.transitNodes`: the request is routed through C (and
+    /// then denied `NoMatch` by the empty communication policy, which shows routing
+    /// succeeded).
+    #[tokio::test]
+    async fn process_visa_request_routes_through_a_transit_node() {
+        use crate::test_helpers::{build_transit_asm, report_transit_asm_links, transit_policy};
+        use libeval::route::LinkId;
+        let (asm, a, b, c) = build_transit_asm().await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(transit_policy(&[c]))
+            .await
+            .unwrap();
+        asm.topo_mgr.apply_transit_nodes(
+            &asm.topo_mgr.ops().await,
+            &asm.policy_mgr.get_current_snapshot(),
+        );
+        report_transit_asm_links(&asm, false);
+        assert_eq!(
+            asm.topo_mgr.get_best_route(&a, &b).unwrap().links,
+            vec![LinkId("ac".into()), LinkId("cb".into())]
+        );
+
+        let pkt = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 1234, 80).unwrap();
+        let (job, _rx) = VisaRequestJob::new(a, pkt);
+        let result = process_visa_request(asm, &job).await.unwrap();
+        assert!(
+            matches!(result, VisaDecision::Deny(DenyCode::NoMatch)),
+            "expected routing to succeed (NoMatch from the empty policy)"
+        );
+    }
+
     // An AAA destination actor with the AAA table pre-populated reaches policy evaluation.
     // Deny(NoMatch) confirms the actor was resolved and routing succeeded.
     #[tokio::test]
@@ -1734,7 +1846,7 @@ mod tests {
         let pkt =
             PacketDesc::new_tcp("fd5a:5052:4100::a", "fd5a:5052:4100::b", 12345, 8080).unwrap();
 
-        let (parked, resume) = race_gate::arm(n1);
+        let (parked, resume) = race_gate::arm(n1, race_gate::Point::AfterRefresh);
 
         // Request from N1, which docks source A at submission time, for a
         // policy-allowed flow.
@@ -1789,6 +1901,61 @@ mod tests {
                     .is_empty(),
                 "nothing may be queued for {node} by a request whose requester undocked"
             );
+        }
+    }
+
+    // zl-zipline#275 end to end: the client's com-policy condition attribute comes
+    // from a trusted service and has 20 s left, under MIN_VISA_LIFETIME (30 s). The
+    // request path must refresh it ahead of expiry, so the flow is allowed with a visa
+    // that outlives MIN_VISA_LIFETIME, instead of being denied because the stale copy
+    // would cap the visa at 20 s.
+    #[tokio::test]
+    async fn visa_request_refreshes_a_condition_attribute_about_to_expire() {
+        use crate::test_helpers::{
+            TS_KEY, TS_SOURCE, make_allow_policy_for_tcp_service_with_client_cond, register_ts,
+            seed_source_attr_expiring,
+        };
+        use crate::trusted_services::TrustedServiceInterface;
+        const CLIENT_A: &str = "fd5a:5052:4000::a";
+
+        let asm = build_binding_test_asm().await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_allow_policy_for_tcp_service_with_client_cond(
+                "svc:web",
+                8080,
+                TS_KEY,
+                "engineering",
+            ))
+            .await
+            .unwrap();
+        let ts = register_ts(&asm, &[(TS_KEY, "engineering")]);
+        seed_source_attr_expiring(
+            &asm,
+            CLIENT_A,
+            TS_KEY,
+            "engineering",
+            SystemTime::now() + Duration::from_secs(20),
+        )
+        .await;
+        // Both actors are current with the service's revision, so only the TTL can make
+        // the source due for a refresh. (A refresh of provider B would restamp its
+        // fixture-set zpr.services under a policy with no join policy granting it.)
+        for addr in [CLIENT_A, "fd5a:5052:4000::b"] {
+            asm.ts_mgr
+                .record_revision(&addr.parse().unwrap(), TS_SOURCE, ts.current_revision());
+        }
+
+        let requesting_node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let (job, _rx) = VisaRequestJob::new(requesting_node, binding_allowed_pkt());
+        let floor = SystemTime::now() + config::MIN_VISA_LIFETIME;
+        match process_visa_request(asm, &job).await {
+            Ok(VisaDecision::Allow(visa, _)) => assert!(
+                visa.expires > floor,
+                "the visa must outlive MIN_VISA_LIFETIME, expires {:?}",
+                visa.expires
+            ),
+            Ok(VisaDecision::Deny(code)) => panic!("expected Allow, got Deny({code:?})"),
+            Err(e) => panic!("expected Allow, got Err({e:?})"),
         }
     }
 }

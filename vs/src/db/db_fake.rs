@@ -35,6 +35,10 @@ pub struct FakeDb {
     set_ex_fault: std::sync::Mutex<FaultMode>,
     del_fault: std::sync::Mutex<FaultMode>,
     hset_fault: std::sync::Mutex<FaultMode>,
+    exists_fault: std::sync::Mutex<FaultMode>,
+    scan_fault: std::sync::Mutex<FaultMode>,
+    /// Sticky fault on keys starting with a prefix ([FakeDb::set_key_fault]).
+    key_fault: std::sync::Mutex<Option<(String, FaultMode)>>,
 }
 
 #[allow(dead_code)]
@@ -60,6 +64,9 @@ impl FakeDb {
             set_ex_fault: std::sync::Mutex::new(FaultMode::None),
             del_fault: std::sync::Mutex::new(FaultMode::None),
             hset_fault: std::sync::Mutex::new(FaultMode::None),
+            exists_fault: std::sync::Mutex::new(FaultMode::None),
+            scan_fault: std::sync::Mutex::new(FaultMode::None),
+            key_fault: std::sync::Mutex::new(None),
         }
     }
 
@@ -75,10 +82,60 @@ impl FakeDb {
         *self.del_fault.lock().unwrap() = mode;
     }
 
+    /// Inject a fault on the next (and subsequent) `exists` calls: a read
+    /// fault (any mode other than `None` fails the read).
+    #[allow(dead_code)]
+    pub fn set_exists_fault(&self, mode: FaultMode) {
+        *self.exists_fault.lock().unwrap() = mode;
+    }
+
+    /// Inject a fault on the next (and subsequent) `scan_match_all` calls: a read
+    /// fault (any mode other than `None` fails the read).
+    #[allow(dead_code)]
+    pub fn set_scan_fault(&self, mode: FaultMode) {
+        *self.scan_fault.lock().unwrap() = mode;
+    }
+
     /// Inject a fault mode on the next (and subsequent) `hset` calls.
     #[allow(dead_code)]
     pub fn set_hset_fault(&self, mode: FaultMode) {
         *self.hset_fault.lock().unwrap() = mode;
+    }
+
+    /// Inject a fault mode on every key starting with `prefix`, until a call with
+    /// [FaultMode::None] clears it (zl-zipline#290). Honoured by `set_ex`,
+    /// `hset_nx` (`Reject` only), by
+    /// `atomic_pipeline` when any of its ops touches a matching key (`Reject` fails
+    /// the whole pipeline before any op applies, `ApplyThenError` applies all of
+    /// it, then errors) and by `hget` (`Reject` only, a failed read). So a
+    /// test can fail one kind of write -- the visa records, the policy -- while
+    /// the rest of the store keeps working.
+    #[allow(dead_code)]
+    pub fn set_key_fault(&self, prefix: &str, mode: FaultMode) {
+        *self.key_fault.lock().unwrap() = match mode {
+            FaultMode::None => None,
+            mode => Some((prefix.to_string(), mode)),
+        };
+    }
+
+    /// The fault injected on `key` by [FakeDb::set_key_fault], if any.
+    fn key_fault_for(&self, key: &str) -> FaultMode {
+        match &*self.key_fault.lock().unwrap() {
+            Some((prefix, mode)) if key.starts_with(prefix.as_str()) => *mode,
+            _ => FaultMode::None,
+        }
+    }
+}
+
+/// The key `op` writes, for [FakeDb::set_key_fault].
+fn op_key(op: &DbOp) -> &str {
+    match op {
+        DbOp::Del(key)
+        | DbOp::SetBin { key, .. }
+        | DbOp::Expire { key, .. }
+        | DbOp::SRem { set_key: key, .. }
+        | DbOp::HSet { hash_key: key, .. }
+        | DbOp::HSetMultiple { hash_key: key, .. } => key,
     }
 }
 
@@ -218,6 +275,9 @@ impl DbConnection for FakeDb {
     /// True if the key exists (and not expired).  As a side effect this removes the
     /// key if it is expired before returning false.
     async fn exists(&self, key: &str) -> DbResult<bool> {
+        if *self.exists_fault.lock().unwrap() != FaultMode::None {
+            return Err(injected_fault_err());
+        }
         let _rlock = self.lock.read().await;
         self.exists_with_lock(key).await
     }
@@ -234,7 +294,10 @@ impl DbConnection for FakeDb {
 
     /// Set a string value with expiration.
     async fn set_ex(&self, key: &str, value: &str, seconds: u64) -> DbResult<()> {
-        let fault = *self.set_ex_fault.lock().unwrap();
+        let fault = match self.key_fault_for(key) {
+            FaultMode::None => *self.set_ex_fault.lock().unwrap(),
+            keyed => keyed,
+        };
         if fault == FaultMode::Reject {
             return Err(injected_fault_err());
         }
@@ -370,6 +433,9 @@ impl DbConnection for FakeDb {
 
     /// Get a field from a hash.
     async fn hget(&self, key: &str, field: &str) -> DbResult<Option<String>> {
+        if self.key_fault_for(key) == FaultMode::Reject {
+            return Err(injected_fault_err());
+        }
         let _rlock = self.lock.read().await;
         if !self.exists(key).await? {
             return Ok(None);
@@ -448,6 +514,9 @@ impl DbConnection for FakeDb {
     /// Set the hash field only if the field with that name does not already exist.
     /// Returns true when this call set it (mirrors redis HSETNX).
     async fn hset_nx(&self, key: &str, field: &str, value: &str) -> DbResult<bool> {
+        if self.key_fault_for(key) == FaultMode::Reject {
+            return Err(injected_fault_err());
+        }
         let _rlock = self.lock.read().await;
         let entry = self
             .store
@@ -535,7 +604,12 @@ impl DbConnection for FakeDb {
     async fn atomic_pipeline(&self, ops: &[DbOp]) -> DbResult<()> {
         // Models Redis MULTI/EXEC atomicity: a Reject fails the whole pipeline
         // before any op applies, so callers can test the all-or-nothing contract.
-        if *self.set_ex_fault.lock().unwrap() == FaultMode::Reject {
+        let keyed = ops
+            .iter()
+            .map(|op| self.key_fault_for(op_key(op)))
+            .find(|mode| *mode != FaultMode::None)
+            .unwrap_or_default();
+        if keyed == FaultMode::Reject || *self.set_ex_fault.lock().unwrap() == FaultMode::Reject {
             return Err(injected_fault_err());
         }
         let _wlock = self.lock.write().await;
@@ -568,12 +642,17 @@ impl DbConnection for FakeDb {
                 }
             }
         }
-
+        if keyed == FaultMode::ApplyThenError {
+            return Err(injected_fault_err());
+        }
         Ok(())
     }
 
     /// Return the set of keys that match the pattern.
     async fn scan_match_all(&self, pattern: String) -> DbResult<Vec<String>> {
+        if *self.scan_fault.lock().unwrap() != FaultMode::None {
+            return Err(injected_fault_err());
+        }
         let _rlock = self.lock.read().await;
         let mut results = Vec::new();
         let pattern = pattern.replace("*", ".*");

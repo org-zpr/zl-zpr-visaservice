@@ -8,6 +8,7 @@ mod link;
 mod node;
 mod policy;
 mod reauth;
+mod revocation;
 mod visa;
 
 pub use actor::{ActorRepo, Role, ServiceEntry};
@@ -17,7 +18,9 @@ pub use link::LinkRepo;
 pub use node::{Node, NodeRepo};
 pub use policy::PolicyRepo;
 pub use reauth::{ReauthObligation, ReauthRepo};
-pub use visa::{NodeVisaState, VisaMetadata, VisaRepo};
+pub use revocation::{Obligation, ObligationKind, RevocationRepo};
+pub(crate) use visa::PURGE_MIN_INTERVAL;
+pub use visa::{CommitState, NodeVisaState, VisaMetadata, VisaRepo};
 
 #[cfg(test)]
 pub use db_fake::{FakeDb, FaultMode};
