@@ -17,6 +17,7 @@ type DenyRecord struct {
 	DestAddr   string `json:"dest_addr"`
 	Protocol   uint8  `json:"protocol"`
 	DestPort   uint16 `json:"dest_port"` // the ICMP code for ICMP traffic
+	ICMPType   *uint8 `json:"icmp_type"` // the ICMP type for ICMP traffic; nil (JSON null) otherwise
 	Count      uint64 `json:"count"`
 	LastDenyMS uint64 `json:"last_deny_ms"`
 	DenyCode   string `json:"deny_code"` // open string: a new server code must not break decoding

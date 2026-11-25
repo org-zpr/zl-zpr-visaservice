@@ -120,7 +120,7 @@ func denyTable(width int, records []dataplane.DenyRecord, actors []dataplane.Act
 			ansi.Truncate(formatDenyTime(record.LastDenyMS), whenSize, "..."),
 			ansi.Truncate(endpointLabel(record.SourceAddr, actors), sourceSize, "..."),
 			ansi.Truncate(endpointLabel(record.DestAddr, actors), destSize, "..."),
-			ansi.Truncate(denyProtocol(record.Protocol, record.DestPort), protoSize, "..."),
+			ansi.Truncate(denyProtocol(record), protoSize, "..."),
 			ansi.Truncate(orDash(record.DenyCode), reasonSize, "..."),
 			ansi.Truncate(strconv.FormatUint(record.Count, 10), countSize, "..."),
 		)
@@ -140,12 +140,14 @@ func endpointLabel(addr string, actors []dataplane.ActorDescriptor) string {
 	return orDash(addr)
 }
 
-// denyProtocol renders the protocol and its destination port, or ICMP code.
-func denyProtocol(protocol uint8, destPort uint16) string {
-	name := strconv.Itoa(int(protocol))
+// denyProtocol renders a deny's protocol with its destination port, or for
+// ICMP its type and code. The type is left out when the service reports none
+// (a malformed ICMP type it could not represent).
+func denyProtocol(record dataplane.DenyRecord) string {
+	name := strconv.Itoa(int(record.Protocol))
 	icmp := false
 
-	switch protocol {
+	switch record.Protocol {
 	case ipProtoICMP:
 		name, icmp = "ICMP", true
 	case ipProtoTCP:
@@ -156,11 +158,14 @@ func denyProtocol(protocol uint8, destPort uint16) string {
 		name, icmp = "IPV6_ICMP", true
 	}
 
+	if icmp && record.ICMPType != nil {
+		return fmt.Sprintf("%s/type %d code %d", name, *record.ICMPType, record.DestPort)
+	}
 	if icmp {
-		return fmt.Sprintf("%s/code %d", name, destPort)
+		return fmt.Sprintf("%s/code %d", name, record.DestPort)
 	}
 
-	return fmt.Sprintf("%s/%d", name, destPort)
+	return fmt.Sprintf("%s/%d", name, record.DestPort)
 }
 
 // formatDenyTime renders epoch milliseconds as local time. Values too large

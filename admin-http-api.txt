@@ -399,8 +399,9 @@ GET /admin/visas/denies
 -----------------------
   Summary
     Returns the recent visa denies, most recently denied first. Denies are
-    collapsed on (source_addr, dest_addr, protocol, dest_port, deny_code), so a
-    repeat of the same traffic bumps count rather than adding a row.
+    collapsed on (source_addr, dest_addr, protocol, dest_port, icmp_type,
+    deny_code), so a repeat of the same traffic bumps count rather than adding
+    a row.
   Query
     since: number (optional; epoch MILLISECONDS, inclusive)
     limit: number (optional; max entries returned)
@@ -420,8 +421,13 @@ GET /admin/visas/denies
     The window is in memory only and starts empty after a visa service restart.
     Entries are ordered by deny recency, not by last_deny_ms. A system clock
     change can therefore leave timestamps out of order in the returned list.
-    dest_port carries the ICMP code for ICMP traffic, per the visa request's
-    five-tuple. source_port is not part of the key and is not reported.
+    Per protocol: for TCP/UDP, dest_port is the destination port and icmp_type
+    is null. For ICMP (protocol 1) and ICMPv6 (protocol 58), dest_port is the
+    ICMP code and icmp_type is the ICMP type; the visa request's five-tuple
+    carries them in dest_port and source_port. icmp_type is always present,
+    as null when it does not apply (or for a malformed ICMP type above 255).
+    The TCP/UDP source port is not part of the key and is not reported: it is
+    usually ephemeral, and keying on it would flood the window.
     Only actual visa denials are recorded; internal errors and request timeouts
     are not.
 

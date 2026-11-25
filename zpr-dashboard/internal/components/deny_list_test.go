@@ -18,25 +18,31 @@ var denyTestActors = []dataplane.ActorDescriptor{
 	{CName: "", ZprAddress: "fd5a:5052:1000::5"},
 }
 
-// TestDenyProtocol checks named protocols, the decimal fallback, and that a
-// zero port or ICMP code is preserved rather than rendered as "any".
+// TestDenyProtocol checks named protocols, the decimal fallback, that a zero
+// port or ICMP code is preserved rather than rendered as "any", and that an
+// ICMP deny shows its type next to its code when the service reports one.
 func TestDenyProtocol(t *testing.T) {
+	echoRequest, neighborSolicitation := uint8(8), uint8(135)
 	cases := []struct {
 		protocol uint8
 		destPort uint16
+		icmpType *uint8
 		want     string
 	}{
-		{6, 443, "TCP/443"},
-		{17, 53, "UDP/53"},
-		{1, 0, "ICMP/code 0"},
-		{58, 3, "IPV6_ICMP/code 3"},
-		{200, 8080, "200/8080"},
-		{6, 0, "TCP/0"},
+		{6, 443, nil, "TCP/443"},
+		{17, 53, nil, "UDP/53"},
+		{1, 0, &echoRequest, "ICMP/type 8 code 0"},
+		{58, 0, &neighborSolicitation, "IPV6_ICMP/type 135 code 0"},
+		{1, 0, nil, "ICMP/code 0"}, // a malformed type the service could not report
+		{58, 3, nil, "IPV6_ICMP/code 3"},
+		{200, 8080, nil, "200/8080"},
+		{6, 0, nil, "TCP/0"},
 	}
 
 	for _, c := range cases {
-		if got := denyProtocol(c.protocol, c.destPort); got != c.want {
-			t.Errorf("denyProtocol(%d, %d) = %q, want %q", c.protocol, c.destPort, got, c.want)
+		record := dataplane.DenyRecord{Protocol: c.protocol, DestPort: c.destPort, ICMPType: c.icmpType}
+		if got := denyProtocol(record); got != c.want {
+			t.Errorf("denyProtocol(%d, %d, %v) = %q, want %q", c.protocol, c.destPort, c.icmpType, got, c.want)
 		}
 	}
 }

@@ -430,6 +430,7 @@ async fn get_denies(
             dest_addr: e.dest_addr,
             protocol: e.protocol,
             dest_port: e.dest_port,
+            icmp_type: e.icmp_type,
             count: e.count,
             last_deny_ms: e.last_deny_ms,
             deny_code: e.deny_code,
@@ -2010,12 +2011,13 @@ mod tests {
     }
 
     /// Drives `GET /admin/visas/denies` with the given query string and returns
-    /// the status plus the decoded body.
-    async fn fetch_denies(
+    /// the status plus the raw JSON body (`Null` for a non-OK response), so tests
+    /// can check the wire shape, such as a `null` field, not just the decoded type.
+    async fn fetch_denies_json(
         asm: &Arc<Assembly>,
         api_key: &str,
         query: &str,
-    ) -> (StatusCode, Vec<DenyRecord>) {
+    ) -> (StatusCode, serde_json::Value) {
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
         let app = admin_app(shared_state);
         let response = app
@@ -2032,8 +2034,24 @@ mod tests {
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         // A non-OK response has no DenyRecord list body.
-        let records = if status == StatusCode::OK {
+        let json = if status == StatusCode::OK {
             serde_json::from_slice(&body).unwrap()
+        } else {
+            serde_json::Value::Null
+        };
+        (status, json)
+    }
+
+    /// As [fetch_denies_json], decoded into `DenyRecord`s (empty for a non-OK
+    /// response).
+    async fn fetch_denies(
+        asm: &Arc<Assembly>,
+        api_key: &str,
+        query: &str,
+    ) -> (StatusCode, Vec<DenyRecord>) {
+        let (status, json) = fetch_denies_json(asm, api_key, query).await;
+        let records = if status == StatusCode::OK {
+            serde_json::from_value(json).unwrap()
         } else {
             Vec::new()
         };
@@ -2092,6 +2110,40 @@ mod tests {
         assert_eq!(newest.count, 1);
         assert_eq!(newest.last_deny_ms, 3_000);
         assert_eq!(newest.deny_code, "NoMatch");
+        assert!(
+            denies.iter().all(|d| d.icmp_type.is_none()),
+            "TCP denies carry no ICMP type"
+        );
+    }
+
+    /// The wire format carries `icmp_type`: the ICMP type for an ICMP deny, and
+    /// an explicit `null` (not an omitted key) for anything else (zl-zipline#296).
+    #[tokio::test]
+    async fn test_get_denies_reports_icmp_type() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let ns = PacketDesc::new_icmp("fd5a:5052:3000::1", "fd5a:5052:3000::2", 135, 0)
+            .unwrap()
+            .five_tuple;
+        let tcp = PacketDesc::new_tcp("fd5a:5052:3000::1", "fd5a:5052:3000::2", 12345, 80)
+            .unwrap()
+            .five_tuple;
+        asm.deny_log.record_at_ms(&ns, &DenyCode::NoMatch, 1_000);
+        asm.deny_log.record_at_ms(&tcp, &DenyCode::NoMatch, 2_000);
+
+        let (status, json) = fetch_denies_json(&asm, &api_key, "").await;
+        assert_eq!(status, StatusCode::OK);
+        let records = json.as_array().expect("a JSON array of deny records");
+        // Newest first: the TCP deny, then the ICMPv6 one.
+        assert_eq!(records[0]["dest_port"], 80);
+        assert_eq!(
+            records[0].get("icmp_type"),
+            Some(&serde_json::Value::Null),
+            "non-ICMP records must carry an explicit null icmp_type"
+        );
+        assert_eq!(records[1]["protocol"], ip_proto::IPV6_ICMP);
+        assert_eq!(records[1]["icmp_type"], 135);
+        assert_eq!(records[1]["dest_port"], 0);
     }
 
     #[tokio::test]

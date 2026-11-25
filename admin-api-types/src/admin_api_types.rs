@@ -387,12 +387,21 @@ pub struct Stats {
 
 /// One collapsed deny from the visa service's recent-denies window.
 /// `last_deny_ms` is epoch **milliseconds** (not seconds like other endpoints).
+///
+/// Denies are collapsed on
+/// (source_addr, dest_addr, protocol, dest_port, icmp_type, deny_code). The
+/// TCP/UDP source port is not part of the key and is not reported.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DenyRecord {
     pub source_addr: IpAddr,
     pub dest_addr: IpAddr,
+    /// Raw IP protocol number.
     pub protocol: u8,
+    /// Destination port for TCP/UDP; the ICMP **code** for ICMP and ICMPv6.
     pub dest_port: u16,
+    /// The ICMP **type** for ICMP and ICMPv6; JSON `null` for every other
+    /// protocol (and for a malformed ICMP type that does not fit in a byte).
+    pub icmp_type: Option<u8>,
     pub count: u64,
     pub last_deny_ms: u64,
     pub deny_code: String,
