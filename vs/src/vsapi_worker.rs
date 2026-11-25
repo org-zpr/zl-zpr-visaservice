@@ -602,7 +602,7 @@ impl VSHandleImpl {
             }
         };
 
-        debug!(target: API, "preparing visa request from node {} for packet {}", requestor_ip, describe_five_tuple(&pdesc));
+        debug!(target: API, "preparing visa request from node {} for packet {}", requestor_ip, describe_five_tuple(&pdesc.five_tuple));
 
         // Note that we assume that everything above this has taken no time.
         match request_visa_wait_response(&self.asm, requestor_ip, pdesc, timeout).await {

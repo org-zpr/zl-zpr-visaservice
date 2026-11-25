@@ -40,6 +40,7 @@ use zpr::vsapi_types::{DenyCode, PacketDesc, Visa};
 use crate::actor_attributes::refresh_and_persist_actor;
 use crate::assembly::Assembly;
 use crate::counters::CounterType;
+use crate::deny_log::deny_code_name;
 use crate::error::ServiceError;
 use crate::logging::targets::VREQ;
 use crate::packet::describe_five_tuple;
@@ -96,7 +97,8 @@ pub async fn request_visa_wait_response(
     timeout: Duration,
 ) -> Result<VisaDecision, ServiceError> {
     let deadline = tokio::time::Instant::now() + timeout;
-    // Copied out before the job takes ownership of pkt_data; needed for the deny log below.
+    // Copied out before the job takes ownership of pkt_data; needed for the deny log
+    // and its DEBUG line below.
     let five_tuple = pkt_data.five_tuple;
     let (job, response_rx) = VisaRequestJob::new(requesting_node.clone(), pkt_data);
 
@@ -141,6 +143,14 @@ pub async fn request_visa_wait_response(
                 asm.counters.incr(CounterType::VisaRequestsDenied);
                 asm.counters
                     .incr_node(CounterType::VisaRequestsDenied, requesting_node);
+                // Every deny the deny log counts gets one DEBUG line with its full
+                // flow, so the log can identify denied traffic (zl-zipline#296).
+                debug!(target: VREQ,
+                    "visa request from node {} denied ({}): flow {}",
+                    requesting_node,
+                    deny_code_name(code),
+                    describe_five_tuple(&five_tuple)
+                );
                 asm.deny_log.record(&five_tuple, code);
                 vr_result
             }
@@ -268,7 +278,7 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
             "visa request from node {} denied: flow {} is between actors not docked at \
              the requesting node (source docks at {:?}, dest docks at {:?})",
             job.requesting_node,
-            describe_five_tuple(&job.packet_desc),
+            describe_five_tuple(&job.packet_desc.five_tuple),
             src_dock,
             dst_dock
         );
@@ -329,7 +339,7 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
                      flow {} is no longer between actors docked at the requesting node \
                      (source docks at {:?}, dest docks at {:?})",
                     job.requesting_node,
-                    describe_five_tuple(&job.packet_desc),
+                    describe_five_tuple(&job.packet_desc.five_tuple),
                     src_dock,
                     dst_dock
                 );
@@ -434,7 +444,7 @@ async fn visa_from_allow(
             "visa request from node {} denied: flow {} would get a visa living {:?}, \
              under the minimum {:?} (limited by {})",
             job.requesting_node,
-            describe_five_tuple(&job.packet_desc),
+            describe_five_tuple(&job.packet_desc.five_tuple),
             left,
             config::MIN_VISA_LIFETIME,
             gate
@@ -690,7 +700,7 @@ async fn resolve_actors_or_deny(
             // unconnected peer is indistinguishable from a genuine AAA miss.
             warn!(target: VREQ,
                 "visa denied ({deny:?}) for node {}: {anon_addr} has no actor and is not a registered AAA address (peer {candidate_addr}, flow {})",
-                job.requesting_node, describe_five_tuple(&job.packet_desc)
+                job.requesting_node, describe_five_tuple(&job.packet_desc.five_tuple)
             );
             return Err(VisaDecision::Deny(deny));
         }

@@ -120,7 +120,7 @@ func denyTable(width int, records []dataplane.DenyRecord, actors []dataplane.Act
 			ansi.Truncate(formatDenyTime(record.LastDenyMS), whenSize, "..."),
 			ansi.Truncate(endpointLabel(record.SourceAddr, actors), sourceSize, "..."),
 			ansi.Truncate(endpointLabel(record.DestAddr, actors), destSize, "..."),
-			ansi.Truncate(denyProtocol(record.Protocol, record.DestPort), protoSize, "..."),
+			ansi.Truncate(denyProtocol(record), protoSize, "..."),
 			ansi.Truncate(orDash(record.DenyCode), reasonSize, "..."),
 			ansi.Truncate(strconv.FormatUint(record.Count, 10), countSize, "..."),
 		)
@@ -140,12 +140,17 @@ func endpointLabel(addr string, actors []dataplane.ActorDescriptor) string {
 	return orDash(addr)
 }
 
-// denyProtocol renders the protocol and its destination port, or ICMP code.
-func denyProtocol(protocol uint8, destPort uint16) string {
-	name := strconv.Itoa(int(protocol))
+// denyProtocol renders a deny's protocol with its destination port, or for
+// ICMP its type and code, compactly as "ICMPv6/T135 C0". Denies that differ
+// only in ICMP type must stay distinguishable, so the longest form,
+// "ICMPv6/T255 C255", is kept within the 16-character protocol column of a
+// 100-column panel. The type is left out ("ICMPv6/C3") when the service
+// reports none (a malformed ICMP type it could not represent).
+func denyProtocol(record dataplane.DenyRecord) string {
+	name := strconv.Itoa(int(record.Protocol))
 	icmp := false
 
-	switch protocol {
+	switch record.Protocol {
 	case ipProtoICMP:
 		name, icmp = "ICMP", true
 	case ipProtoTCP:
@@ -153,14 +158,17 @@ func denyProtocol(protocol uint8, destPort uint16) string {
 	case ipProtoUDP:
 		name = "UDP"
 	case ipProtoIPv6ICMP:
-		name, icmp = "IPV6_ICMP", true
+		name, icmp = "ICMPv6", true
 	}
 
+	if icmp && record.ICMPType != nil {
+		return fmt.Sprintf("%s/T%d C%d", name, *record.ICMPType, record.DestPort)
+	}
 	if icmp {
-		return fmt.Sprintf("%s/code %d", name, destPort)
+		return fmt.Sprintf("%s/C%d", name, record.DestPort)
 	}
 
-	return fmt.Sprintf("%s/%d", name, destPort)
+	return fmt.Sprintf("%s/%d", name, record.DestPort)
 }
 
 // formatDenyTime renders epoch milliseconds as local time. Values too large

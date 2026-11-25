@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -17,8 +18,8 @@ func TestGetDeniesRequestAndDecode(t *testing.T) {
 		gotPath = r.URL.RequestURI()
 		gotKey = r.Header.Get(apiKeyHeader)
 		w.Write([]byte(`[
-			{"source_addr":"fd5a:5052:1000::1","dest_addr":"fd5a:5052:1000::9","protocol":6,"dest_port":443,"count":2,"last_deny_ms":1785604630203,"deny_code":"NoMatch"},
-			{"source_addr":"fd5a:5052:1000::2","dest_addr":"fd5a:5052:1000::8","protocol":1,"dest_port":0,"count":1,"last_deny_ms":1785604630000,"deny_code":"Denied"}
+			{"source_addr":"fd5a:5052:1000::1","dest_addr":"fd5a:5052:1000::9","protocol":6,"dest_port":443,"icmp_type":null,"count":2,"last_deny_ms":1785604630203,"deny_code":"NoMatch"},
+			{"source_addr":"fd5a:5052:1000::2","dest_addr":"fd5a:5052:1000::8","protocol":1,"dest_port":0,"icmp_type":8,"count":1,"last_deny_ms":1785604630000,"deny_code":"Denied"}
 		]`))
 	}))
 	t.Cleanup(srv.Close)
@@ -38,16 +39,19 @@ func TestGetDeniesRequestAndDecode(t *testing.T) {
 	}
 
 	// Newest request first, which is not the same as timestamp order.
+	// icmp_type is null for TCP and the ICMP type (8, echo request) for ICMP.
+	echoRequest := uint8(8)
 	want := []DenyRecord{
-		{"fd5a:5052:1000::1", "fd5a:5052:1000::9", 6, 443, 2, 1785604630203, "NoMatch"},
-		{"fd5a:5052:1000::2", "fd5a:5052:1000::8", 1, 0, 1, 1785604630000, "Denied"},
+		{SourceAddr: "fd5a:5052:1000::1", DestAddr: "fd5a:5052:1000::9", Protocol: 6, DestPort: 443, ICMPType: nil, Count: 2, LastDenyMS: 1785604630203, DenyCode: "NoMatch"},
+		{SourceAddr: "fd5a:5052:1000::2", DestAddr: "fd5a:5052:1000::8", Protocol: 1, DestPort: 0, ICMPType: &echoRequest, Count: 1, LastDenyMS: 1785604630000, DenyCode: "Denied"},
 	}
 
 	if len(got) != len(want) {
 		t.Fatalf("got %d records, want %d", len(got), len(want))
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		// DeepEqual compares the ICMPType values, not the pointers.
+		if !reflect.DeepEqual(got[i], want[i]) {
 			t.Errorf("record %d: got %+v, want %+v", i, got[i], want[i])
 		}
 	}

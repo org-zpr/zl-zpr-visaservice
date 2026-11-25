@@ -1,6 +1,7 @@
 //! A bounded, in-memory record of recent visa denials.
 //!
-//! Denies are collapsed on a 5-tuple key so a chatty source does not flush the
+//! Denies are collapsed on a key of addresses, protocol, destination port (or
+//! ICMP type and code) and deny code, so a chatty source does not flush the
 //! window; a repeat bumps a count and moves the entry to the newest end.
 //! Not persisted: the log starts empty on every VS restart.
 
@@ -9,17 +10,30 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+use zpr::vsapi_types::vsapi_ip_number as ip_proto;
 use zpr::vsapi_types::{DenyCode, VsapiFiveTuple};
 
 use crate::config::DENY_LOG_SIZE;
 
-/// One collapsed deny, keyed by (source_addr, dest_addr, protocol, dest_port, deny_code).
+/// One collapsed deny, keyed by
+/// (source_addr, dest_addr, protocol, dest_port, icmp_type, deny_code).
+///
+/// The source port of TCP/UDP traffic is deliberately not kept: it is usually
+/// ephemeral, so keying on it would give every connection attempt its own entry
+/// and flood the window.
 #[derive(Clone)]
 pub struct DenyEntry {
     pub source_addr: IpAddr,
     pub dest_addr: IpAddr,
-    pub protocol: u8,   // raw IP proto number
-    pub dest_port: u16, // ICMP code for ICMP, per VsapiFiveTuple
+    /// Raw IP protocol number.
+    pub protocol: u8,
+    /// Destination port for TCP/UDP; the ICMP **code** for ICMP and ICMPv6
+    /// (`VsapiFiveTuple` carries it in `dest_port`).
+    pub dest_port: u16,
+    /// The ICMP **type** for ICMP and ICMPv6 (`VsapiFiveTuple` carries it in
+    /// `source_port`); `None` for every other protocol, and for a malformed
+    /// ICMP tuple whose type does not fit in a byte.
+    pub icmp_type: Option<u8>,
     pub count: u64,
     pub last_deny_ms: u64,
     pub deny_code: String, // stable API spelling produced by deny_code_name
@@ -46,6 +60,16 @@ pub fn deny_code_name(code: &DenyCode) -> &'static str {
     }
 }
 
+/// The ICMP type of an ICMP or ICMPv6 five-tuple, or `None` for any other
+/// protocol. An ICMP type is one byte; a larger value can only come from a
+/// malformed request and is reported as `None` rather than truncated.
+fn icmp_type_of(ft: &VsapiFiveTuple) -> Option<u8> {
+    match ft.l4_protocol {
+        ip_proto::ICMP | ip_proto::IPV6_ICMP => u8::try_from(ft.source_port).ok(),
+        _ => None,
+    }
+}
+
 /// Epoch milliseconds, clamped rather than panicking: a pre-epoch clock reads
 /// as 0 and an absurdly future one saturates at `u64::MAX`.
 fn epoch_ms_now() -> u64 {
@@ -67,6 +91,7 @@ impl DenyLog {
     // the deny rate makes this hot.
     pub(crate) fn record_at_ms(&self, ft: &VsapiFiveTuple, code: &DenyCode, now_ms: u64) {
         let name = deny_code_name(code);
+        let icmp_type = icmp_type_of(ft);
         let mut entries = self.entries.lock().expect("deny log mutex poisoned");
 
         let hit = entries.iter().position(|e| {
@@ -74,6 +99,7 @@ impl DenyLog {
                 && e.dest_addr == ft.dest_addr
                 && e.protocol == ft.l4_protocol
                 && e.dest_port == ft.dest_port
+                && e.icmp_type == icmp_type
                 && e.deny_code == name
         });
 
@@ -92,6 +118,7 @@ impl DenyLog {
                     dest_addr: ft.dest_addr,
                     protocol: ft.l4_protocol,
                     dest_port: ft.dest_port,
+                    icmp_type,
                     count: 1,
                     last_deny_ms: now_ms,
                     deny_code: name.to_string(),
@@ -122,7 +149,7 @@ mod tests {
     use super::*;
 
     use zpr::packet_info::L3Type;
-    use zpr::vsapi_types::vsapi_ip_number as ip_proto;
+    use zpr::vsapi_types::PacketDesc;
 
     /// Builds a five-tuple for tests; source port is deliberately varied to
     /// prove it is not part of the collapsing key.
@@ -135,6 +162,15 @@ mod tests {
             u16::from(proto) + dest_port, // arbitrary, ignored by the key
             dest_port,
         )
+    }
+
+    /// Builds an ICMP five-tuple (ICMPv6 for a v6 source, ICMP for v4) carrying
+    /// `icmp_type` in the source port and `icmp_code` in the dest port, as the
+    /// node's classifier does.
+    fn icmp(src: &str, dst: &str, icmp_type: u8, icmp_code: u8) -> VsapiFiveTuple {
+        PacketDesc::new_icmp(src, dst, icmp_type, icmp_code)
+            .unwrap()
+            .five_tuple
     }
 
     /// Renders the log as (source, deny code, count) triples, newest first.
@@ -322,5 +358,86 @@ mod tests {
             [6_000, 5_000],
             "the 1_000 entry must not terminate the scan"
         );
+    }
+
+    /// ICMP denies with the same code but different types (echo request vs
+    /// neighbor solicitation) are different traffic and must stay separate
+    /// entries, each reporting its type (zl-zipline#296).
+    #[test]
+    fn icmp_types_with_same_code_are_separate_entries() {
+        let log = DenyLog::default();
+        let echo = icmp("fd5a:5052:1000::1", "fd5a:5052:1000::9", 128, 0);
+        let ns = icmp("fd5a:5052:1000::1", "fd5a:5052:1000::9", 135, 0);
+        log.record_at_ms(&echo, &DenyCode::NoMatch, 1_000);
+        log.record_at_ms(&ns, &DenyCode::NoMatch, 2_000);
+
+        let all = log.recent(None, None);
+        assert_eq!(
+            all.len(),
+            2,
+            "two ICMP types must not collapse into one entry"
+        );
+        assert_eq!((all[0].icmp_type, all[0].dest_port), (Some(135), 0));
+        assert_eq!((all[1].icmp_type, all[1].dest_port), (Some(128), 0));
+    }
+
+    /// A repeat of the same ICMP type and code collapses into one entry.
+    #[test]
+    fn icmp_repeat_of_same_type_and_code_collapses() {
+        let log = DenyLog::default();
+        let ns = icmp("fd5a:5052:1000::1", "fd5a:5052:1000::9", 135, 0);
+        log.record_at_ms(&ns, &DenyCode::NoMatch, 1_000);
+        log.record_at_ms(&ns, &DenyCode::NoMatch, 2_000);
+
+        let all = log.recent(None, None);
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].icmp_type, all[0].count), (Some(135), 2));
+    }
+
+    /// IPv4 ICMP (protocol 1) records its type just like ICMPv6.
+    #[test]
+    fn icmpv4_records_its_type() {
+        let log = DenyLog::default();
+        let echo = icmp("10.0.0.1", "10.0.0.9", 8, 0);
+        log.record_at_ms(&echo, &DenyCode::NoMatch, 1_000);
+
+        let all = log.recent(None, None);
+        assert_eq!(all[0].protocol, ip_proto::ICMP);
+        assert_eq!(all[0].icmp_type, Some(8));
+    }
+
+    /// TCP source ports are ephemeral, so they are not keyed: two attempts
+    /// differing only in source port are one entry, with no ICMP type.
+    #[test]
+    fn tcp_source_port_is_not_keyed_and_icmp_type_is_none() {
+        let log = DenyLog::default();
+        let dst: IpAddr = "fd5a:5052:1000::9".parse().unwrap();
+        let src: IpAddr = "fd5a:5052:1000::1".parse().unwrap();
+        for sport in [40_000u16, 40_001] {
+            let t = VsapiFiveTuple::new(L3Type::Ipv6, src, dst, ip_proto::TCP, sport, 443);
+            log.record_at_ms(&t, &DenyCode::Denied, 1_000 + u64::from(sport));
+        }
+
+        let all = log.recent(None, None);
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].icmp_type, all[0].count), (None, 2));
+    }
+
+    /// A malformed ICMP tuple whose type does not fit in a byte records no
+    /// type rather than panicking or truncating it.
+    #[test]
+    fn icmp_type_out_of_range_is_none() {
+        let log = DenyLog::default();
+        let t = VsapiFiveTuple::new(
+            L3Type::Ipv6,
+            "fd5a:5052:1000::1".parse().unwrap(),
+            "fd5a:5052:1000::9".parse().unwrap(),
+            ip_proto::IPV6_ICMP,
+            300,
+            0,
+        );
+        log.record_at_ms(&t, &DenyCode::NoMatch, 1_000);
+
+        assert_eq!(log.recent(None, None)[0].icmp_type, None);
     }
 }
