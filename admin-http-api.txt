@@ -154,6 +154,7 @@ Common Types
 |                 |                                                          |
 | DenyRecord      | { "source_addr": string, "dest_addr": string,            |
 |                 |   "protocol": number, "dest_port": number,               |
+|                 |   "icmp_type": number | null,                           |
 |                 |   "count": number, "last_deny_ms": number,               |
 |                 |   "deny_code": string }                                  |
 |                 |   protocol is the raw IANA IP protocol number (6=TCP,    |

@@ -32,9 +32,9 @@ func TestDenyProtocol(t *testing.T) {
 		{6, 443, nil, "TCP/443"},
 		{17, 53, nil, "UDP/53"},
 		{1, 0, &echoRequest, "ICMP/T8 C0"},
-		{58, 0, &neighborSolicitation, "IPV6_ICMP/T135 C0"},
-		{1, 0, nil, "ICMP/code 0"}, // a malformed type the service could not report
-		{58, 3, nil, "IPV6_ICMP/code 3"},
+		{58, 0, &neighborSolicitation, "ICMPv6/T135 C0"},
+		{1, 0, nil, "ICMP/C0"}, // a malformed type the service could not report
+		{58, 3, nil, "ICMPv6/C3"},
 		{200, 8080, nil, "200/8080"},
 		{6, 0, nil, "TCP/0"},
 	}
@@ -101,7 +101,7 @@ func TestDenyListRendersRows(t *testing.T) {
 		"08-01 22:47:10.203",
 		"node-nyc", "node-lon",
 		"fd5a:5052:1000::7", "fd5a:5052:1000::5",
-		"TCP/443", "ICMP/code 0",
+		"TCP/443", "ICMP/C0",
 		"NoMatch", "Denied",
 	} {
 		if !strings.Contains(out, want) {
@@ -123,7 +123,7 @@ func TestDenyListEmptyState(t *testing.T) {
 	}
 }
 
-// TestDenyListShowsICMPTypeAtNarrowWidth checks that at a 120-column panel two
+// TestDenyListShowsICMPTypeAtNarrowWidth checks that at a 100-column panel two
 // ICMPv6 denies that differ only in type stay distinguishable: the protocol
 // column must show the whole type and code, not truncate them, up to the
 // longest possible label (type 255, code 255).
@@ -135,12 +135,12 @@ func TestDenyListShowsICMPTypeAtNarrowWidth(t *testing.T) {
 		{SourceAddr: "fd5a:5052:1000::1", DestAddr: "fd5a:5052:1000::9", Protocol: 58, DestPort: 255, ICMPType: &widest, Count: 1, LastDenyMS: 1785604620000, DenyCode: "NoMatch"},
 	}
 
-	out := ansi.Strip(DenyList(120, 20, records, denyTestActors, nil))
+	out := ansi.Strip(DenyList(100, 20, records, denyTestActors, nil))
 
 	for _, record := range records {
 		want := denyProtocol(record)
 		if !strings.Contains(out, want) {
-			t.Errorf("expected %q untruncated in the 120-column table:\n%s", want, out)
+			t.Errorf("expected %q untruncated in the 100-column table:\n%s", want, out)
 		}
 	}
 }
